@@ -1,4 +1,3 @@
-version: "3.8"
 
 services:
   backend:
@@ -11,8 +10,6 @@ services:
     volumes:
       - ./backend:/app
       - data_volume:/app/data
-    environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       - juice-shop
       - dvwa
