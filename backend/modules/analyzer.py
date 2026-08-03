@@ -10,7 +10,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 
 class AnalyzerAgent:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-1.5-pro')
+        self.model = genai.GenerativeModel('gemini-2.5-pro')
 
     def analyze_results(self, raw_outputs: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         """

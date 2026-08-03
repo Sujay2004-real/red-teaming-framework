@@ -12,7 +12,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 class PlannerAgent:
     def __init__(self):
         # We use a chat model
-        self.model = genai.GenerativeModel('gemini-1.5-pro')
+        self.model = genai.GenerativeModel('gemini-2.5-pro')
 
     def generate_plan(self, target: str, objective: str, previous_findings: str = "") -> List[Dict[str, Any]]:
         """
