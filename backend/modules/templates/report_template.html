@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Security Assessment Report - {{ target }}</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 40px; color: #333; line-height: 1.6; }
+        h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; }
+        .summary { background: #f8f9fa; padding: 20px; border-left: 5px solid #3498db; margin-bottom: 30px; }
+        .finding { border: 1px solid #ddd; border-radius: 5px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .severity { display: inline-block; padding: 5px 10px; border-radius: 3px; font-weight: bold; color: white; }
+        .sev-Critical { background-color: #e74c3c; }
+        .sev-High { background-color: #e67e22; }
+        .sev-Medium { background-color: #f1c40f; color: #333; }
+        .sev-Low { background-color: #3498db; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: 'Courier New', Courier, monospace; }
+        .section-title { font-weight: bold; margin-top: 15px; color: #555; }
+    </style>
+</head>
+<body>
+
+    <h1>Security Assessment Report</h1>
+    
+    <div class="summary">
+        <p><strong>Target:</strong> {{ target }}</p>
+        <p><strong>Objective:</strong> {{ objective }}</p>
+        <p><strong>Total Findings:</strong> {{ total_findings }}</p>
+    </div>
+
+    <h2>Detailed Findings</h2>
+    
+    {% if findings|length == 0 %}
+        <p>No vulnerabilities found during this assessment.</p>
+    {% else %}
+        {% for finding in findings %}
+        <div class="finding">
+            <h3>{{ finding.title }}</h3>
+            <p><span class="severity sev-{{ finding.severity }}">{{ finding.severity }}</span></p>
+            
+            <p class="section-title">Description:</p>
+            <p>{{ finding.description }}</p>
+            
+            <p class="section-title">Evidence:</p>
+            <pre>{{ finding.evidence }}</pre>
+            
+            <p class="section-title">Remediation:</p>
+            <p>{{ finding.remediation }}</p>
+        </div>
+        {% endfor %}
+    {% endif %}
+
+</body>
+</html>

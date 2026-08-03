@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+**/node_modules/
+venv/
+**/venv/
+.venv/
+**/.venv/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+
+# Environment files & secrets
+.env
+*.env
+.env.local
+.env.*.local
+**/.env
+
+# Databases & logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
