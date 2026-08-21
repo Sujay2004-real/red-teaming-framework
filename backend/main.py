@@ -166,12 +166,18 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     if not executions: raise HTTPException(400, 'Execute at least one approved plan step first')
     raw = [{'tool': e.tool_name, 'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in executions]
     settings = get_settings_row(db)
-    analyzed = analyzer_agent.analyze_results(raw, settings.gemini_api_key, settings.api_base_url, settings.model_name)
+    analyzed, analyzer_mode = analyzer_agent.analyze_results(
+        raw,
+        settings.gemini_api_key,
+        settings.api_base_url,
+        settings.model_name,
+        include_metadata=True,
+    )
     db.query(Finding).filter(Finding.assessment_id == assessment_id).delete()
     for item in analyzed:
         db.add(Finding(assessment_id=assessment_id, fingerprint=item['fingerprint'], title=item.get('title','Unknown finding'), description=item.get('description',''), severity=item['severity'], evidence=item.get('evidence',''), remediation=item.get('remediation',''), risk_score=item['risk_score'], priority_score=item['priority_score'], confidence_score=item['confidence_score'], source_tools=item.get('source_tools',[])))
     row.status = 'analyzed'; row.completed_at = datetime.utcnow(); db.commit()
-    return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': 'gemini' if settings.gemini_api_key else 'deterministic-fallback'}
+    return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode}
 
 @app.post('/assessments/{assessment_id}/report')
 def generate_report(assessment_id: int, db: Session = Depends(get_db)):
