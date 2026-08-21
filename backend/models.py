@@ -1,64 +1,28 @@
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 
-class TargetBase(BaseModel):
-    name: str
-    scope_domain_ip: str
+class TargetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    scope_domain_ip: str = Field(min_length=1, max_length=255)
+    authorized_scopes: List[str] = []
 
-class TargetCreate(TargetBase):
-    pass
-
-class Target(TargetBase):
-    id: int
-    created_at: datetime
-    class Config:
-        orm_mode = True
-
-class AssessmentBase(BaseModel):
+class AssessmentCreate(BaseModel):
     target_id: int
-    objective: str
+    objective: str = Field(min_length=1, max_length=1000)
+    plan: Optional[List[Dict[str, Any]]] = None
+    requirements: Optional[str] = Field(default=None, max_length=30000)
 
-class AssessmentCreate(AssessmentBase):
-    pass
+class SettingsUpdate(BaseModel):
+    gemini_api_key: Optional[str] = None
+    api_base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    proxy_url: Optional[str] = None
+    proxy_username: Optional[str] = None
+    proxy_password: Optional[str] = None
 
-class Assessment(AssessmentBase):
-    id: int
-    status: str
-    plan: Optional[List[Dict[str, Any]]]
-    created_at: datetime
-    class Config:
-        orm_mode = True
+class ExecuteRequest(BaseModel):
+    step_index: int = Field(ge=0)
+    approved: bool = False
 
-class ToolExecutionBase(BaseModel):
-    assessment_id: int
-    tool_name: str
-    command: str
-
-class ToolExecutionCreate(ToolExecutionBase):
-    pass
-
-class ToolExecution(ToolExecutionBase):
-    id: int
-    stdout: Optional[str]
-    stderr: Optional[str]
-    return_code: Optional[int]
-    executed_at: datetime
-    class Config:
-        orm_mode = True
-
-class FindingBase(BaseModel):
-    assessment_id: int
-    title: str
-    description: str
-    severity: str
-    evidence: str
-    remediation: str
-
-class FindingCreate(FindingBase):
-    pass
-
-class Finding(FindingBase):
-    id: int
-    class Config:
-        orm_mode = True
+class PlanUpdate(BaseModel):
+    plan: List[Dict[str, Any]]

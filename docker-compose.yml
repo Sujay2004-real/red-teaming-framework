@@ -26,12 +26,12 @@ services:
       - CHOKIDAR_USEPOLLING=true
 
   juice-shop:
-    image: bkimminich/juice-shop
+    image: docker.io/bkimminich/juice-shop:latest
     ports:
       - "3000:3000"
 
   dvwa:
-    image: vulnerables/web-dvwa
+    image: ghcr.io/digininja/dvwa:latest
     ports:
       - "8080:80"
 

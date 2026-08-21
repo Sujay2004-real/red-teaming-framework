@@ -3,6 +3,11 @@ FROM python:3.10-slim
 # Install system dependencies including nmap and wget for downloading tools
 RUN apt-get update && apt-get install -y \
     nmap \
+    curl \
+    dnsutils \
+    traceroute \
+    whatweb \
+    sslscan \
     wget \
     unzip \
     && rm -rf /var/lib/apt/lists/*
