@@ -8,8 +8,8 @@ class PolicyEngine:
     capabilities = {
         'network_discovery': {
             'tools': {
-                'nmap': {'blocked_flags': {'-oG', '-oX', '-oN', '-oA', '--script', '--script-args', '-iL'}, 'risk': 'low'},
-                'traceroute': {'blocked_flags': {'-F'}, 'risk': 'low'},
+                'nmap': {'blocked_flags': {'-oG', '-oX', '-oN', '-oA', '--script', '--script-args', '-iL', '-iR'}, 'risk': 'low'},
+                'traceroute': {'blocked_flags': {'-F', '-g'}, 'risk': 'low'},
             }
         },
         'dns_enumeration': {
@@ -20,10 +20,10 @@ class PolicyEngine:
         },
         'web_inspection': {
             'tools': {
-                'curl': {'blocked_flags': {'-o', '--output', '-O', '--remote-name', '-T', '--upload-file', '-d', '--data', '--data-raw', '-X', '--request', '--config'}, 'risk': 'low'},
-                'whatweb': {'blocked_flags': {'--log-brief', '--log-verbose', '--log-xml', '--log-json', '--log-sql'}, 'risk': 'low'},
-                'sslscan': {'blocked_flags': {'--xml'}, 'risk': 'low'},
-                'nuclei': {'blocked_flags': {'-o', '-output', '-irr', '-interactsh-server', '-code'}, 'risk': 'moderate'},
+                'curl': {'blocked_flags': {'-o', '--output', '-O', '--remote-name', '-T', '--upload-file', '-d', '--data', '--data-raw', '-X', '--request', '--config', '--resolve', '--connect-to', '-x', '--proxy', '--preproxy', '--unix-socket', '--abstract-unix-socket', '-H', '--header'}, 'risk': 'low'},
+                'whatweb': {'blocked_flags': {'--log-brief', '--log-verbose', '--log-xml', '--log-json', '--log-sql', '-i', '--input-file'}, 'risk': 'low'},
+                'sslscan': {'blocked_flags': {'--xml', '--targets'}, 'risk': 'low'},
+                'nuclei': {'blocked_flags': {'-o', '-output', '-irr', '-interactsh-server', '-code', '-enable-code-templates', '-l', '-list', '-turl', '-template-url'}, 'risk': 'moderate'},
             }
         },
     }
@@ -49,9 +49,10 @@ class PolicyEngine:
                 if host == scope_host or host.endswith('.' + scope_host): return True
         return False
 
-    def extract_targets(self, tokens):
+    def extract_targets(self, tokens, authorized_scopes):
         targets = []
         skip_next = False
+        known_hosts = {self.normalize_host(scope) for scope in authorized_scopes if scope}
         value_flags = {'-p', '--port', '-T', '--timeout', '--connect-timeout', '-H', '--header', '-A', '--user-agent', '-t', '-severity'}
         for token in tokens[1:]:
             if skip_next:
@@ -60,11 +61,11 @@ class PolicyEngine:
                 skip_next = True; continue
             if token.startswith('-') or token.isdigit(): continue
             host = self.normalize_host(token)
-            if host and ('.' in host or ':' in token or host == 'localhost' or re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', host)):
+            if host and (host in known_hosts or '.' in host or ':' in token or host == 'localhost' or re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', host)):
                 targets.append(token)
         return targets
 
-    def validate_command(self, command, authorized_scopes):
+    def validate_command(self, command, authorized_scopes, expected_tool=None):
         if not command or any(char in command for char in self.dangerous_chars):
             return False, 'Shell control characters are not permitted.', None
         try: tokens = shlex.split(command, posix=True)
@@ -72,11 +73,21 @@ class PolicyEngine:
         registry = self.tool_registry()
         if not tokens or tokens[0] not in registry:
             return False, f"Executable is not covered by an enabled capability: {', '.join(sorted(registry))}.", None
+        if expected_tool and tokens[0] != expected_tool:
+            return False, f"Declared tool {expected_tool} does not match command executable {tokens[0]}.", None
         rules = registry[tokens[0]]
-        normalized_flags = {token.split('=', 1)[0] for token in tokens if token.startswith('-')}
-        blocked = normalized_flags & rules['blocked_flags']
+        provided_flags = [token for token in tokens if token.startswith('-')]
+        blocked = {
+            flag for flag in rules['blocked_flags']
+            if any(
+                token == flag
+                or token.startswith(flag + '=')
+                or (flag.startswith('-') and not flag.startswith('--') and len(flag) == 2 and token.startswith(flag))
+                for token in provided_flags
+            )
+        }
         if blocked: return False, f"Blocked flag for {tokens[0]}: {', '.join(sorted(blocked))}.", rules
-        targets = self.extract_targets(tokens)
+        targets = self.extract_targets(tokens, authorized_scopes)
         if not targets: return False, 'The command must contain an explicit target.', rules
         if any(not self.validate_target(target, authorized_scopes) for target in targets):
             return False, 'A command target is outside the authorized scope.', rules

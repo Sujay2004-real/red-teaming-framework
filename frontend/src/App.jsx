@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -11,6 +11,7 @@ function App() {
   const [assessment, setAssessment] = useState({ target_id: '', objective: '', requirements: '' })
   const [requirementFile, setRequirementFile] = useState(null)
   const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: 'https://api.openai.com/v1', model_name: 'gpt-4o-mini', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false })
+  const [loading, setLoading] = useState(true)
 
   const request = async (path, options={}) => {
     const res = await fetch(API + path, { headers: {'Content-Type':'application/json'}, ...options })
@@ -22,9 +23,12 @@ function App() {
     const [t,a,s] = await Promise.all([request('/targets/'), request('/assessments/'), request('/settings')])
     setTargets(t); setAssessments(a); setSettings(v => ({...v,...s}))
   }
-  const openAssessment = async id => setSelected(await request(`/assessments/${id}`))
+  const openAssessment = async id => {
+    try { setSelected(await request(`/assessments/${id}`)) }
+    catch (e) { setNotice(e.message) }
+  }
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(()=>{ refresh().catch(e=>setNotice(e.message)) },[])
+  useEffect(()=>{ refresh().catch(e=>setNotice(e.message)).finally(()=>setLoading(false)) },[])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   const run = async fn => { setBusy(true); setNotice(''); try { await fn() } catch(e){ setNotice(e.message) } finally { setBusy(false) } }
   const saveSettings = e => run(async()=>{ e.preventDefault(); await request('/settings',{method:'PUT',body:JSON.stringify(settings)}); setSettings(v=>({...v,gemini_api_key:'',proxy_password:''})); await refresh(); setNotice('Settings saved. Secrets are masked after storage.') })
@@ -35,11 +39,22 @@ function App() {
   const analyze = () => run(async()=>{ await request(`/assessments/${selected.id}/analyze`,{method:'POST'}); await openAssessment(selected.id); await refresh() })
   const report = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/report`,{method:'POST'}); window.open(API+d.download_url,'_blank'); await openAssessment(selected.id); await refresh() })
   const patchStep = (i,key,value) => setSelected(v=>({...v,plan:v.plan.map((s,n)=>n===i?{...s,[key]:value}:s)}))
+  const executionByStep = useMemo(() => new Map((selected?.executions || []).map(execution => [execution.step_index, execution])), [selected])
+  const enabledSteps = useMemo(() => (selected?.plan || []).map((step, index) => ({ step, index })).filter(({step}) => step.enabled !== false), [selected])
+  const completedSteps = useMemo(() => enabledSteps.filter(({index}) => executionByStep.get(index)?.return_code !== null && executionByStep.get(index)?.return_code !== undefined), [enabledSteps, executionByStep])
+  const planDirty = !!selected?.plan?.some((step, index) => {
+    const execution = executionByStep.get(index)
+    return execution && (execution.command !== step.command || execution.tool_name !== step.tool)
+  })
+  const canAnalyze = !!selected && enabledSteps.length > 0 && completedSteps.length === enabledSteps.length
+  const canReport = selected?.status === 'analyzed' || selected?.status === 'reported'
+
+  if (loading) return <main className="loading-screen"><div className="loading-mark"/><p>Loading control center...</p></main>
 
   return <main>
     <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Plan, approve, execute, correlate, and report—with every decision visible.</p></div><div className="health"><i/> Lab environment</div></header>
     {notice && <div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
-    <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a=>a.status==='reported').length}</b><span>Reports completed</span></div><div><b>{settings.gemini_configured?'AI':'Local'}</b><span>Analyzer mode</span></div></section>
+    <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a=>a.status==='reported').length}</b><span>Reports completed</span></div><div><b>{settings.gemini_configured?'AI':'Local'}</b><span>Configured analyzer</span></div></section>
 
     <div className="workspace">
       <aside>
@@ -57,12 +72,14 @@ function App() {
         <section className="panel"><div className="panel-title"><h2>Assessments</h2><span className="muted">Select a run to inspect</span></div><div className="assessment-list">{assessments.length===0?<div className="empty">Create your first authorized assessment.</div>:assessments.map(a=><button key={a.id} className={`assessment-row ${selected?.id===a.id?'active':''}`} onClick={()=>openAssessment(a.id)}><span><b>#{a.id} · {targets.find(t=>t.id===a.target_id)?.name||'Target'}</b><small>{a.objective}</small></span><span className={`status ${a.status}`}>{a.status.replaceAll('_',' ')}</span></button>)}</div></section>
 
         {selected && <>
-          <section className="panel"><div className="panel-title"><div><span className="eyebrow">ASSESSMENT #{selected.id}</span><h2>Editable command plan</h2></div><button className="secondary compact" onClick={savePlan} disabled={busy||selected.executions?.length}>Save plan</button></div><p className="muted intro">Default commands are suggestions. Add, remove, reorder mentally, disable, or fully rewrite any step before execution. Each enabled step still requires approval and passes policy checks.</p>
-            <div className="plan">{selected.plan.map((step,i)=><div className="step" key={i}><div className="step-head"><span className="step-number">{i+1}</span><select value={step.tool} onChange={e=>patchStep(i,'tool',e.target.value)}><option>nmap</option><option>traceroute</option><option>dig</option><option>nslookup</option><option>curl</option><option>whatweb</option><option>sslscan</option><option>nuclei</option></select><label className="toggle"><input type="checkbox" checked={step.enabled!==false} onChange={e=>patchStep(i,'enabled',e.target.checked)}/><span/> Enabled</label><button className="icon-btn" title="Remove" onClick={()=>setSelected(v=>({...v,plan:v.plan.filter((_,n)=>n!==i)}))}>×</button></div><input className="command" value={step.command} onChange={e=>patchStep(i,'command',e.target.value)}/><input value={step.reason||''} onChange={e=>patchStep(i,'reason',e.target.value)} placeholder="Why this command is needed"/><div className="step-actions"><span>{selected.executions?.some(x=>x.step_index===i)?'Executed and logged':'Awaiting explicit approval'}</span><button disabled={busy||step.enabled===false||selected.executions?.some(x=>x.step_index===i)} onClick={()=>execute(i)}>Approve & execute</button></div></div>)}</div>
-            <button className="secondary" onClick={()=>setSelected(v=>({...v,plan:[...v.plan,emptyStep()]}))} disabled={selected.executions?.length}>+ Add command</button>
+          <section className="panel"><div className="panel-title"><div><span className="eyebrow">ASSESSMENT #{selected.id}</span><h2>Editable command plan</h2></div><button className="secondary compact" onClick={savePlan} disabled={busy||selected.executions?.length}>Save plan</button></div><p className="muted intro">Review every command before execution. Enabled steps require approval and pass policy checks.</p>
+            <div className="plan">{selected.plan.map((step,i)=>{ const execution=executionByStep.get(i); const complete=execution?.return_code !== null && execution?.return_code !== undefined; return <div className={`step ${step.enabled===false?'disabled-step':''}`} key={i}><div className="step-head"><span className="step-number">{i+1}</span><select value={step.tool} onChange={e=>patchStep(i,'tool',e.target.value)} disabled={!!execution}><option>nmap</option><option>traceroute</option><option>dig</option><option>nslookup</option><option>curl</option><option>whatweb</option><option>sslscan</option><option>nuclei</option></select><label className="toggle"><input type="checkbox" checked={step.enabled!==false} onChange={e=>patchStep(i,'enabled',e.target.checked)} disabled={!!execution}/><span/> Enabled</label><button className="icon-btn" title="Remove step" aria-label="Remove step" onClick={()=>setSelected(v=>({...v,plan:v.plan.filter((_,n)=>n!==i)}))} disabled={!!execution}>×</button></div><input className="command" value={step.command} onChange={e=>patchStep(i,'command',e.target.value)} disabled={!!execution}/><input value={step.reason||''} onChange={e=>patchStep(i,'reason',e.target.value)} placeholder="Why this command is needed" disabled={!!execution}/><div className="step-actions"><span className={complete?'step-complete':''}>{complete?'Execution logged':execution?'Execution in progress':'Awaiting explicit approval'}</span><button disabled={busy||step.enabled===false||!!execution||planDirty} onClick={()=>execute(i)}>{execution?'Executed':'Approve & execute'}</button></div></div>})}</div>
+            <button className="secondary" onClick={()=>setSelected(v=>({...v,plan:[...v.plan,emptyStep()]}))} disabled={selected.executions?.length}>Add command</button>
+            {selected.plan.length===0 && <div className="empty">Add at least one command to continue.</div>}
+            {selected.executions?.length > 0 && <small className="plan-note">Execution has started, so this plan is locked.</small>}
           </section>
 
-          <section className="panel action-panel"><div><h2>Analysis & report</h2><p>Correlates outputs, removes duplicate findings, and calculates transparent risk and priority scores.</p></div><div><button className="secondary" onClick={analyze} disabled={busy||!selected.executions?.length}>Analyze results</button><button onClick={report} disabled={busy||!selected.findings?.length}>Generate report</button></div></section>
+          <section className="panel action-panel"><div><h2>Analysis & report</h2><p>Correlates outputs, removes duplicate findings, and calculates transparent risk and priority scores.</p><span className="action-status">{canAnalyze?'All enabled steps complete':`${completedSteps.length}/${enabledSteps.length || 0} enabled steps complete`}</span></div><div><button className="secondary" onClick={analyze} disabled={busy||!canAnalyze}>Analyze results</button><button onClick={report} disabled={busy||!canReport}>Generate report</button></div></section>
 
           {!!selected.findings?.length && <section className="panel"><div className="panel-title"><h2>Prioritized findings</h2><span className="tag good">{selected.findings.length} correlated</span></div><div className="findings">{selected.findings.map(f=><article key={f.id}><div><span className={`severity ${f.severity}`}>{f.severity}</span><h3>{f.title}</h3><p>{f.description}</p></div><div className="scores"><span><b>{f.priority_score}</b>Priority</span><span><b>{f.risk_score}</b>Risk / 125</span><span><b>{f.confidence_score}%</b>Confidence</span></div><details><summary>Evidence and remediation</summary><pre>{f.evidence}</pre><p><b>Fix:</b> {f.remediation}</p></details></article>)}</div></section>}
 

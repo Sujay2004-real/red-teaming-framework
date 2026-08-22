@@ -1,10 +1,11 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 
 from database import AppSettings, Assessment, Finding, Target, ToolExecution, get_db
@@ -17,6 +18,7 @@ from modules.reporter import reporter
 
 app = FastAPI(title='Red Teaming Framework API', version='2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+MAX_PLAN_STEPS = 50
 
 def serialize_target(row):
     return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'created_at': row.created_at}
@@ -30,6 +32,25 @@ def get_settings_row(db):
         row = AppSettings(id=1, gemini_api_key=os.getenv('GEMINI_API_KEY', ''), api_base_url=os.getenv('API_BASE_URL', 'https://api.openai.com/v1'), model_name=os.getenv('MODEL_NAME', 'gpt-4o-mini'))
         db.add(row); db.commit(); db.refresh(row)
     return row
+
+def normalize_plan(plan):
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(422, 'Assessment plan must contain at least one step')
+    if len(plan) > MAX_PLAN_STEPS:
+        raise HTTPException(422, f'Assessment plan cannot contain more than {MAX_PLAN_STEPS} steps')
+    normalized = []
+    for step in plan:
+        if not isinstance(step, dict) or not isinstance(step.get('tool'), str) or not step['tool'].strip() or not isinstance(step.get('command'), str) or not step['command'].strip():
+            raise HTTPException(422, 'Every plan step needs a non-empty tool and command')
+        item = dict(step)
+        item['tool'] = item['tool'].strip()
+        item['command'] = item['command'].strip()
+        if 'enabled' in item and not isinstance(item['enabled'], bool):
+            raise HTTPException(422, 'Plan step enabled must be a boolean')
+        item.setdefault('enabled', True)
+        item.setdefault('reason', 'User-defined assessment command.')
+        normalized.append(item)
+    return normalized
 
 def proxy_environment(settings):
     if not settings.proxy_url:
@@ -55,12 +76,12 @@ async def extract_requirements(file: UploadFile = File(...)):
         elif suffix == '.pdf':
             from pypdf import PdfReader
             import io
-            text = '\\n'.join(page.extract_text() or '' for page in PdfReader(io.BytesIO(content)).pages)
+            text = '\n'.join(page.extract_text() or '' for page in PdfReader(io.BytesIO(content)).pages)
         else:
             from docx import Document
             import io
             doc = Document(io.BytesIO(content))
-            text = '\\n'.join(p.text for p in doc.paragraphs)
+            text = '\n'.join(p.text for p in doc.paragraphs)
     except Exception as exc: raise HTTPException(422, f'Could not read requirement file: {exc}')
     text = text.strip()
     if not text: raise HTTPException(422, 'Requirement file contains no readable text')
@@ -86,8 +107,9 @@ def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
 
 @app.post('/targets/')
 def create_target(payload: TargetCreate, db: Session = Depends(get_db)):
-    scopes = payload.authorized_scopes or [payload.scope_domain_ip]
-    row = Target(name=payload.name, scope_domain_ip=payload.scope_domain_ip, authorized_scopes=scopes)
+    primary_scope = payload.scope_domain_ip.strip()
+    scopes = [scope.strip() for scope in payload.authorized_scopes if scope and scope.strip()] or [primary_scope]
+    row = Target(name=payload.name.strip(), scope_domain_ip=primary_scope, authorized_scopes=scopes)
     db.add(row); db.commit(); db.refresh(row)
     return serialize_target(row)
 
@@ -104,8 +126,7 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     if not plan:
         plan, source = planner_agent.generate_plan(target.scope_domain_ip, payload.objective, settings.gemini_api_key, settings.api_base_url, settings.model_name, requirement_context, policy_engine)
     else: source = 'user'
-    for step in plan:
-        step.setdefault('enabled', True); step.setdefault('reason', 'User-defined assessment command.')
+    plan = normalize_plan(plan)
     row = Assessment(target_id=payload.target_id, objective=payload.objective, plan=plan, status='awaiting_approval')
     db.add(row); db.commit(); db.refresh(row)
     result = serialize_assessment(row); result['plan_source'] = source
@@ -130,10 +151,7 @@ def update_plan(assessment_id: int, payload: PlanUpdate, db: Session = Depends(g
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row: raise HTTPException(404, 'Assessment not found')
     if db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).first(): raise HTTPException(409, 'Plan cannot be edited after execution begins')
-    for step in payload.plan:
-        if not step.get('tool') or not step.get('command'): raise HTTPException(422, 'Every plan step needs a tool and command')
-        step.setdefault('enabled', True); step.setdefault('reason', 'User-defined assessment command.')
-    row.plan = payload.plan; row.status = 'awaiting_approval'; db.commit()
+    row.plan = normalize_plan(payload.plan); row.status = 'awaiting_approval'; db.commit()
     return serialize_assessment(row)
 
 @app.post('/assessments/{assessment_id}/execute')
@@ -145,15 +163,22 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     step = row.plan[payload.step_index]
     if not step.get('enabled', True): raise HTTPException(400, 'This step is disabled')
     target = db.query(Target).filter(Target.id == row.target_id).first()
-    valid, reason, capability = policy_engine.validate_command(step['command'], target.authorized_scopes or [target.scope_domain_ip])
+    if not target: raise HTTPException(404, 'Target not found')
+    valid, reason, capability = policy_engine.validate_command(step['command'], target.authorized_scopes or [target.scope_domain_ip], expected_tool=step['tool'])
     if not valid: raise HTTPException(403, reason)
     settings = get_settings_row(db)
-    row.status = 'running'; db.commit()
+    execution = ToolExecution(assessment_id=row.id, step_index=payload.step_index, tool_name=step['tool'], command=step['command'], stdout='', stderr='', return_code=None, duration_ms=0, approved_by_user=True)
+    db.add(execution); row.status = 'running'
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'This plan step has already been executed')
+    db.refresh(execution)
     result = await executor.execute_command(step['tool'], step['command'], proxy_environment(settings))
-    execution = ToolExecution(assessment_id=row.id, step_index=payload.step_index, tool_name=step['tool'], command=step['command'], stdout=result['stdout'], stderr=result['stderr'], return_code=result['return_code'], duration_ms=result['duration_ms'], approved_by_user=True)
-    db.add(execution)
+    execution.stdout = result['stdout']; execution.stderr = result['stderr']; execution.return_code = result['return_code']; execution.duration_ms = result['duration_ms']
     enabled = [i for i, item in enumerate(row.plan) if item.get('enabled', True)]
-    executed = {e.step_index for e in db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id).all()} | {payload.step_index}
+    executed = {e.step_index for e in db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id, ToolExecution.return_code.is_not(None)).all()} | {payload.step_index}
     if all(index in executed for index in enabled): row.status = 'ready_for_analysis'
     db.commit()
     return {'message': 'Execution finished', 'policy': reason, 'capability': capability, 'result': result}
@@ -162,8 +187,12 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
 def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row: raise HTTPException(404, 'Assessment not found')
-    executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).all()
+    executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id, ToolExecution.return_code.is_not(None)).all()
     if not executions: raise HTTPException(400, 'Execute at least one approved plan step first')
+    enabled_steps = {index for index, step in enumerate(row.plan or []) if step.get('enabled', True)}
+    executed_steps = {execution.step_index for execution in executions}
+    if not enabled_steps.issubset(executed_steps):
+        raise HTTPException(409, 'Execute every enabled plan step before analysis')
     raw = [{'tool': e.tool_name, 'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in executions]
     settings = get_settings_row(db)
     analyzed, analyzer_mode = analyzer_agent.analyze_results(
@@ -176,7 +205,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     db.query(Finding).filter(Finding.assessment_id == assessment_id).delete()
     for item in analyzed:
         db.add(Finding(assessment_id=assessment_id, fingerprint=item['fingerprint'], title=item.get('title','Unknown finding'), description=item.get('description',''), severity=item['severity'], evidence=item.get('evidence',''), remediation=item.get('remediation',''), risk_score=item['risk_score'], priority_score=item['priority_score'], confidence_score=item['confidence_score'], source_tools=item.get('source_tools',[])))
-    row.status = 'analyzed'; row.completed_at = datetime.utcnow(); db.commit()
+    row.status = 'analyzed'; row.completed_at = datetime.now(timezone.utc).replace(tzinfo=None); db.commit()
     return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode}
 
 @app.post('/assessments/{assessment_id}/report')
@@ -184,6 +213,9 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row: raise HTTPException(404, 'Assessment not found')
     target = db.query(Target).filter(Target.id == row.target_id).first()
+    if not target: raise HTTPException(404, 'Target not found')
+    if row.status not in {'analyzed', 'reported'}:
+        raise HTTPException(409, 'Analyze the completed assessment before generating a report')
     findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).order_by(Finding.priority_score.desc()).all()
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).all()
     os.makedirs('./data/reports', exist_ok=True)
