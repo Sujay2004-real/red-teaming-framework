@@ -18,6 +18,7 @@ class Target(Base):
     name = Column(String, nullable=False)
     scope_domain_ip = Column(String, nullable=False)
     authorized_scopes = Column(JSON, default=list)
+    criticality = Column(Integer, default=70)
     created_at = Column(DateTime, default=utcnow)
 
 class AppSettings(Base):
@@ -36,7 +37,7 @@ class Assessment(Base):
     id = Column(Integer, primary_key=True, index=True)
     target_id = Column(Integer, ForeignKey('targets.id'), nullable=False)
     objective = Column(Text, nullable=False)
-    status = Column(String, default='planning')
+    status = Column(String, default='awaiting_approval')
     plan = Column(JSON, default=list)
     approval_required = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
@@ -55,6 +56,7 @@ class ToolExecution(Base):
     return_code = Column(Integer)
     duration_ms = Column(Integer, default=0)
     approved_by_user = Column(Boolean, default=False)
+    attempt = Column(Integer, default=1)
     executed_at = Column(DateTime, default=utcnow)
 
 class Finding(Base):
@@ -80,10 +82,10 @@ def _migrate_sqlite():
         return
     additions = {
         'app_settings': [('api_base_url', "VARCHAR DEFAULT 'https://api.openai.com/v1'"), ('model_name', "VARCHAR DEFAULT 'gpt-4o-mini'")],
-        'targets': [('authorized_scopes', 'JSON DEFAULT ''[]''')],
+        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70')],
         'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME')],
-        'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0')],
-        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', 'JSON DEFAULT ''[]'''), ('created_at', 'DATETIME')],
+        'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1')],
+        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME')],
     }
     with engine.begin() as conn:
         known = inspect(engine)

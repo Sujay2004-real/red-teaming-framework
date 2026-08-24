@@ -5,6 +5,7 @@ class TargetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     scope_domain_ip: str = Field(min_length=1, max_length=255)
     authorized_scopes: List[str] = Field(default_factory=list)
+    criticality: int = Field(default=70, ge=0, le=100)
 
 class AssessmentCreate(BaseModel):
     target_id: int

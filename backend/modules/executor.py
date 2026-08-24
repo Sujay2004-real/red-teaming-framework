@@ -1,33 +1,94 @@
-﻿import asyncio
+import asyncio
+import os
 import shlex
+import signal
 import time
 
 MAX_OUTPUT_CHARS = 200_000
+# Stop accumulating well before memory pressure, but keep draining the pipes so
+# a chatty scanner never blocks on a full buffer and stalls until the timeout.
+MAX_OUTPUT_BYTES = MAX_OUTPUT_CHARS * 4
+EXECUTION_TIMEOUT_SECONDS = 300
+READ_CHUNK_BYTES = 65_536
+# Scanners inherit only what they need to run. Passing the whole parent
+# environment would hand GEMINI_API_KEY and DATABASE_URL to every subprocess.
+INHERITED_ENV_KEYS = (
+    'PATH', 'HOME', 'USERPROFILE', 'LANG', 'LC_ALL', 'TERM',
+    'TMPDIR', 'TEMP', 'TMP', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+)
+
+
+async def _drain(stream, chunks):
+    """Read a pipe to EOF, retaining at most MAX_OUTPUT_BYTES of it."""
+    retained = 0
+    while True:
+        chunk = await stream.read(READ_CHUNK_BYTES)
+        if not chunk:
+            return
+        if retained < MAX_OUTPUT_BYTES:
+            chunks.append(chunk[:MAX_OUTPUT_BYTES - retained])
+            retained += len(chunk)
+
+
+def _truncate(chunks, label):
+    text = b''.join(chunks).decode(errors='ignore')
+    if len(text) > MAX_OUTPUT_CHARS:
+        return text[:MAX_OUTPUT_CHARS] + f'\n[{label} truncated]'
+    return text
+
 
 class Executor:
+    def build_environment(self, proxy_env=None):
+        env = {key: os.environ[key] for key in INHERITED_ENV_KEYS if key in os.environ}
+        env.update(proxy_env or {})
+        return env
+
+    def _terminate(self, process):
+        """Kill the whole process group; nmap and nuclei both spawn children."""
+        try:
+            if os.name == 'posix':
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
     async def execute_command(self, tool, command, proxy_env=None):
         started = time.perf_counter()
+        elapsed = lambda: round((time.perf_counter() - started) * 1000)
+        stdout_chunks, stderr_chunks = [], []
         try:
             tokens = shlex.split(command, posix=True)
-            env = None
-            if proxy_env:
-                import os
-                env = {**os.environ, **proxy_env}
-            process = await asyncio.create_subprocess_exec(*tokens, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+            process = await asyncio.create_subprocess_exec(
+                *tokens,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.build_environment(proxy_env),
+                **({'start_new_session': True} if os.name == 'posix' else {}),
+            )
+            readers = asyncio.gather(
+                _drain(process.stdout, stdout_chunks),
+                _drain(process.stderr, stderr_chunks),
+                process.wait(),
+            )
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+                await asyncio.wait_for(readers, timeout=EXECUTION_TIMEOUT_SECONDS)
+                return_code = process.returncode
+                timed_out = False
             except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
-                return {'tool': tool, 'command': command, 'stdout': '', 'stderr': 'Execution timed out after 300 seconds.', 'return_code': -1, 'duration_ms': 300000}
-            decoded_stdout = stdout.decode(errors='ignore')
-            decoded_stderr = stderr.decode(errors='ignore')
-            if len(decoded_stdout) > MAX_OUTPUT_CHARS:
-                decoded_stdout = decoded_stdout[:MAX_OUTPUT_CHARS] + '\n[stdout truncated]'
-            if len(decoded_stderr) > MAX_OUTPUT_CHARS:
-                decoded_stderr = decoded_stderr[:MAX_OUTPUT_CHARS] + '\n[stderr truncated]'
-            return {'tool': tool, 'command': command, 'stdout': decoded_stdout, 'stderr': decoded_stderr, 'return_code': process.returncode, 'duration_ms': round((time.perf_counter()-started)*1000)}
+                self._terminate(process)
+                await process.wait()
+                return_code = -1
+                timed_out = True
+
+            stdout = _truncate(stdout_chunks, 'stdout')
+            stderr = _truncate(stderr_chunks, 'stderr')
+            if timed_out:
+                notice = f'Execution timed out after {EXECUTION_TIMEOUT_SECONDS} seconds; output below is partial.'
+                stderr = f'{notice}\n{stderr}'.strip()
+            return {'tool': tool, 'command': command, 'stdout': stdout, 'stderr': stderr, 'return_code': return_code, 'duration_ms': elapsed()}
         except Exception as exc:
-            return {'tool': tool, 'command': command, 'stdout': '', 'stderr': str(exc), 'return_code': -1, 'duration_ms': round((time.perf_counter()-started)*1000)}
+            return {'tool': tool, 'command': command, 'stdout': _truncate(stdout_chunks, 'stdout'), 'stderr': str(exc), 'return_code': -1, 'duration_ms': elapsed()}
+
 
 executor = Executor()
