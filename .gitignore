@@ -28,6 +28,18 @@ dist/
 *.sqlite3
 *.log
 
+# Test & coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+**/.pytest_cache/
+
+# Master key for credential encryption at rest
+.secret_key
+**/.secret_key
+
 # Operating System files
 .DS_Store
 Thumbs.db
@@ -40,3 +52,6 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# Empty nested git repo (placeholder)
+red-teaming-framework/

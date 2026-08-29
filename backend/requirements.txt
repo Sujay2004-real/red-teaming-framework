@@ -2,13 +2,11 @@ fastapi
 uvicorn
 sqlalchemy
 pydantic
-python-dotenv
 jinja2
-python-nmap
 requests
 httpx
 pytest
-
+cryptography
 pypdf
 python-docx
 python-multipart

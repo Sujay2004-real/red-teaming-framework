@@ -11,7 +11,7 @@ const emptyStep = tool => ({ tool: tool || 'nmap', command: '', reason: '', enab
 // which one keeps a provider outage from looking like a successful AI plan.
 const PLAN_SOURCE_NOTE = {
   'ai-filtered': 'Plan drafted by the configured AI provider and cleared by policy review.',
-  'default-no-api-key': 'No AI provider is configured, so the built-in default plan was used.',
+  'default-unconfigured': 'No AI provider is configured, so the built-in default plan was used. Add a base URL, model name, and API key to enable AI planning.',
   'default-provider-error': 'The AI provider could not be reached, so the built-in default plan was used.',
   'default-policy-rejected': 'Every AI-suggested command failed policy review, so the built-in default plan was used.',
   user: 'Using the plan you supplied.',
@@ -29,7 +29,9 @@ function App() {
   const [target, setTarget] = useState({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 })
   const [assessment, setAssessment] = useState({ target_id: '', objective: '', requirements: '' })
   const [requirementFile, setRequirementFile] = useState(null)
-  const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: 'https://api.openai.com/v1', model_name: 'gpt-4o-mini', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false })
+  // Blank, not pre-filled: the operator chooses their own provider endpoint and
+  // model. The input placeholders show the expected shape without submitting it.
+  const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: '', model_name: '', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false, proxy_configured: false, provider_ready: false })
   const [loading, setLoading] = useState(true)
 
   const request = async (path, options={}) => {
@@ -51,12 +53,17 @@ function App() {
   useEffect(()=>{ refresh().catch(e=>setNotice(e.message)).finally(()=>setLoading(false)) },[])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   const run = async fn => { setBusy(true); setNotice(''); try { await fn() } catch(e){ setNotice(e.message) } finally { setBusy(false) } }
-  const saveSettings = e => run(async()=>{ e.preventDefault(); await request('/settings',{method:'PUT',body:JSON.stringify({gemini_api_key:settings.gemini_api_key||'',api_base_url:settings.api_base_url||'',model_name:settings.model_name||'',proxy_url:settings.proxy_url||'',proxy_username:settings.proxy_username||'',proxy_password:settings.proxy_password||''})}); setSettings(v=>({...v,gemini_api_key:'',proxy_password:''})); await refresh(); setNotice(settings.proxy_url ? 'Settings saved. Secrets are masked after storage.' : 'Settings saved. Clearing the proxy URL also cleared its stored credentials.') })
+  const saveSettings = e => run(async()=>{ e.preventDefault()
+    // Compare against what was stored before this save. Testing the submitted
+    // proxy_url alone announced "clearing the proxy URL also cleared its stored
+    // credentials" to every operator who had never configured a proxy at all.
+    const clearedProxy = settings.proxy_configured && !settings.proxy_url
+    await request('/settings',{method:'PUT',body:JSON.stringify({gemini_api_key:settings.gemini_api_key||'',api_base_url:settings.api_base_url||'',model_name:settings.model_name||'',proxy_url:settings.proxy_url||'',proxy_username:settings.proxy_username||'',proxy_password:settings.proxy_password||''})}); setSettings(v=>({...v,gemini_api_key:'',proxy_password:''})); await refresh(); setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : 'Settings saved. Secrets are masked after storage.') })
   const addTarget = e => run(async()=>{ e.preventDefault(); await request('/targets/',{method:'POST',body:JSON.stringify({...target,criticality:Math.min(100,Math.max(0,Number(target.criticality)||0)),authorized_scopes:target.authorized_scopes.split(',').map(x=>x.trim()).filter(Boolean)})}); setTarget({name:'',scope_domain_ip:'',authorized_scopes:'',criticality:70}); await refresh() })
   const createAssessment = e => run(async()=>{ e.preventDefault(); let requirements=assessment.requirements; if(requirementFile){ const form=new FormData(); form.append('file', requirementFile); const extracted=await fetch(API+'/requirements/extract',{method:'POST',body:form}); const data=await extracted.json().catch(()=>({})); if(!extracted.ok) throw new Error(detailText(data.detail)||'Could not read requirements'); requirements=data.text } const a=await request('/assessments/',{method:'POST',body:JSON.stringify({...assessment,target_id:Number(assessment.target_id),requirements})}); setAssessment({target_id:'',objective:'',requirements:''}); setRequirementFile(null); await refresh(); await openAssessment(a.id); setNotice(PLAN_SOURCE_NOTE[a.plan_source] || '') })
   const savePlan = () => run(async()=>{ await request(`/assessments/${selected.id}/plan`,{method:'PUT',body:JSON.stringify({plan:draftPlan})}); await openAssessment(selected.id); await refresh(); setNotice('Command plan saved and ready for individual approval.') })
   const execute = index => run(async()=>{ await request(`/assessments/${selected.id}/execute`,{method:'POST',body:JSON.stringify({step_index:index,approved:true})}); await openAssessment(selected.id); await refresh() })
-  const analyze = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/analyze`,{method:'POST'}); await openAssessment(selected.id); await refresh(); setNotice(d.failed_steps?.length ? `Analysis complete, but step ${d.failed_steps.map(i=>i+1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
+  const analyze = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/analyze`,{method:'POST'}); await openAssessment(selected.id); await refresh(); const failed=d.failed_steps||[]; setNotice(failed.length ? `Analysis complete, but ${failed.length>1?'steps':'step'} ${failed.map(i=>i+1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
   const report = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/report`,{method:'POST'}); window.open(API+d.download_url,'_blank','noopener'); await openAssessment(selected.id); await refresh() })
   const patchStep = (i,key,value) => setDraftPlan(plan=>plan.map((s,n)=>n===i?{...s,[key]:value}:s))
   const toolNames = useMemo(() => new Set(capabilities.flatMap(group => (group.tools||[]).map(tool => tool.name))), [capabilities])
@@ -76,12 +83,13 @@ function App() {
   return <main>
     <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Plan, approve, execute, correlate, and report—with every decision visible.</p></div><div className="health"><i/> Lab environment</div></header>
     {notice && <div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
-    <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a=>a.status==='reported').length}</b><span>Reports completed</span></div><div><b>{settings.gemini_configured?'AI':'Local'}</b><span>Configured analyzer</span></div></section>
+    <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a=>a.status==='reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready?'AI':'Local'}</b><span>Configured analyzer</span></div></section>
 
     <div className="workspace">
       <aside>
-        <section className="panel"><div className="panel-title"><h2>Configuration</h2><span className={settings.gemini_configured?'tag good':'tag'}>{settings.gemini_configured?'AI provider ready':'Fallback mode'}</span></div><form onSubmit={saveSettings}>
-          <div className="provider-fields"><label>Base URL<input type="url" required placeholder="https://api.openai.com/v1" value={settings.api_base_url||''} onChange={e=>setSettings({...settings,api_base_url:e.target.value})}/><small>OpenAI-compatible API endpoint</small></label><label>Model name<input required placeholder="gpt-4o-mini" value={settings.model_name||''} onChange={e=>setSettings({...settings,model_name:e.target.value})}/></label><label>API key<input type="password" placeholder={settings.gemini_configured?'Configured ••••••••':'Enter your API key'} value={settings.gemini_api_key} onChange={e=>setSettings({...settings,gemini_api_key:e.target.value})}/><small>{settings.gemini_configured?'Leave blank to keep the stored key.':'Stored locally for this prototype.'}</small></label></div>
+        <section className="panel"><div className="panel-title"><h2>Configuration</h2><span className={settings.provider_ready?'tag good':'tag'}>{settings.provider_ready?'AI provider ready':'Fallback mode'}</span></div><form onSubmit={saveSettings}>
+          <div className="provider-fields"><label>Base URL<input type="url" placeholder="https://your-provider.example/v1" value={settings.api_base_url||''} onChange={e=>setSettings({...settings,api_base_url:e.target.value})}/><small>Your own OpenAI-compatible endpoint. No provider is assumed.</small></label><label>Model name<input placeholder="your-model-name" value={settings.model_name||''} onChange={e=>setSettings({...settings,model_name:e.target.value})}/></label><label>API key<input type="password" placeholder={settings.gemini_configured?'Configured ••••••••':'Enter your own API key'} value={settings.gemini_api_key} onChange={e=>setSettings({...settings,gemini_api_key:e.target.value})}/><small>{settings.gemini_configured?'Leave blank to keep the stored key.':'Encrypted before storage and never returned by the API.'}</small></label></div>
+          <small className="plan-note">All three are needed for AI planning and analysis. Leave them blank to run entirely on the local deterministic analyzer.</small>
           <label>HTTP/S proxy<input placeholder="http://proxy:8080" value={settings.proxy_url||''} onChange={e=>setSettings({...settings,proxy_url:e.target.value})}/><small>Clearing this also clears the credentials below.</small></label>
           <div className="split"><label>Username<input value={settings.proxy_username||''} onChange={e=>setSettings({...settings,proxy_username:e.target.value})}/></label><label>Password<input type="password" value={settings.proxy_password||''} onChange={e=>setSettings({...settings,proxy_password:e.target.value})}/></label></div>
           <button className="secondary" disabled={busy}>Save configuration</button><small>Responses never return secret values.</small>

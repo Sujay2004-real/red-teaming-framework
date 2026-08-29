@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from modules.secret_store import encrypt_secret, is_encrypted
+
 os.makedirs('./data', exist_ok=True)
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./data/redteam.db')
 engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
@@ -24,9 +26,12 @@ class Target(Base):
 class AppSettings(Base):
     __tablename__ = 'app_settings'
     id = Column(Integer, primary_key=True, default=1)
+    # No default provider, model, or key: the operator supplies their own, and a
+    # baked-in endpoint would quietly send scanner output to a third party that
+    # nobody chose. Empty means "AI features off", which is a safe resting state.
     gemini_api_key = Column(Text, default='')
-    api_base_url = Column(String, default='https://api.openai.com/v1')
-    model_name = Column(String, default='gpt-4o-mini')
+    api_base_url = Column(String, default='')
+    model_name = Column(String, default='')
     proxy_url = Column(String, default='')
     proxy_username = Column(String, default='')
     proxy_password = Column(Text, default='')
@@ -81,7 +86,17 @@ def _migrate_sqlite():
     if not DATABASE_URL.startswith('sqlite'):
         return
     additions = {
-        'app_settings': [('api_base_url', "VARCHAR DEFAULT 'https://api.openai.com/v1'"), ('model_name', "VARCHAR DEFAULT 'gpt-4o-mini'")],
+        # Every column added to AppSettings after the first release has to be
+        # listed here. create_all only creates missing tables, so a database
+        # from an earlier version keeps its old app_settings shape, and
+        # _encrypt_stored_secrets below then SELECTs proxy_password from a
+        # table that has no such column - an OperationalError at import time
+        # that takes the whole backend down before it can serve anything.
+        'app_settings': [
+            ('api_base_url', "VARCHAR DEFAULT ''"), ('model_name', "VARCHAR DEFAULT ''"),
+            ('proxy_url', "VARCHAR DEFAULT ''"), ('proxy_username', "VARCHAR DEFAULT ''"),
+            ('proxy_password', "TEXT DEFAULT ''"), ('updated_at', 'DATETIME'),
+        ],
         'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70')],
         'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME')],
         'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1')],
@@ -98,6 +113,38 @@ def _migrate_sqlite():
         if not duplicate:
             conn.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS uq_tool_execution_step_idx ON tool_executions (assessment_id, step_index)'))
 _migrate_sqlite()
+
+def _encrypt_stored_secrets():
+    """Bring an existing settings row in line with the no-defaults policy.
+
+    Two one-time fixes, both no-ops once applied:
+      - encrypt credentials stored before encryption was introduced
+      - clear the provider endpoint and model that earlier versions baked in,
+        so the operator is asked for their own instead of silently inheriting
+        a third-party endpoint nobody chose
+    """
+    legacy_defaults = {'api_base_url': 'https://api.openai.com/v1', 'model_name': 'gpt-4o-mini'}
+    with engine.begin() as conn:
+        rows = conn.execute(text('SELECT id, gemini_api_key, proxy_password, api_base_url, model_name FROM app_settings')).mappings().all()
+        for row in rows:
+            updates = {
+                field: encrypt_secret(row[field])
+                for field in ('gemini_api_key', 'proxy_password')
+                if row[field] and not is_encrypted(row[field])
+            }
+            # Only clear the endpoint and model when they still hold the exact
+            # values the old build shipped and no key was ever saved: that
+            # combination means nobody configured this row deliberately.
+            if not row['gemini_api_key']:
+                updates.update({
+                    field: ''
+                    for field, shipped in legacy_defaults.items()
+                    if row[field] == shipped
+                })
+            if updates:
+                assignments = ', '.join(f'{field} = :{field}' for field in updates)
+                conn.execute(text(f'UPDATE app_settings SET {assignments} WHERE id = :id'), {**updates, 'id': row['id']})
+_encrypt_stored_secrets()
 
 def get_db():
     db = SessionLocal()

@@ -118,12 +118,16 @@ class PolicyEngine:
                         '-6', '--ipv6', '-g', '--globoff', '--compressed',
                         '--http1.0', '--http1.1', '--http2', '--path-as-is',
                         '--tcp-nodelay', '--no-keepalive', '-#', '--progress-bar',
+                        # Minimum-version switches take no value; only --tls-max
+                        # does. Listing one of these as a value flag made it eat
+                        # the following argument, which is usually the URL.
+                        '--tlsv1', '--tlsv1.0', '--tlsv1.1', '--tlsv1.2', '--tlsv1.3',
                     },
                     'value_flags': {
                         '-A', '--user-agent', '-e', '--referer', '-m', '--max-time',
                         '--connect-timeout', '--max-redirs', '--retry',
                         '--retry-delay', '--retry-max-time', '--limit-rate',
-                        '--tlsv1.2', '--tls-max',
+                        '--tls-max',
                     },
                     'target_flags': {'--url'},
                 },
@@ -131,16 +135,20 @@ class PolicyEngine:
                     'risk': 'low',
                     'bool_flags': {
                         '-v', '--verbose', '-q', '--quiet', '--no-errors',
-                        '--colour=never', '--color=never', '--open-timeout',
+                        '--colour=never', '--color=never',
                     },
                     'value_flags': {
                         '-a', '--aggression', '-U', '--user-agent', '-t',
                         '--max-threads', '--read-timeout', '--follow-redirect',
                         '-H', '--header', '--wait',
+                        # Takes a number of seconds. Listed as a boolean it left
+                        # that number to be read as a positional target, so a
+                        # legitimate command failed the scope check on '5'.
+                        '--open-timeout',
                     },
                     'attached_patterns': (
                         r'^-(a|t)=[A-Za-z0-9_.\-]+$',
-                        r'^--(aggression|max-threads|read-timeout|follow-redirect|user-agent|wait)=[A-Za-z0-9_.\-]+$',
+                        r'^--(aggression|max-threads|read-timeout|follow-redirect|user-agent|wait|open-timeout)=[A-Za-z0-9_.\-]+$',
                     ),
                 },
                 'sslscan': {
@@ -151,10 +159,17 @@ class PolicyEngine:
                         '--ssl2', '--ssl3', '--tls10', '--tls11', '--tls12',
                         '--tls13', '--tlsall', '--no-cipher-details',
                         '--no-ciphersuites', '--no-heartbleed', '--ipv4', '--ipv6',
+                        # sslscan has no bare --starttls; the protocol is part of
+                        # the flag name and it takes no value. Listing the bare
+                        # form as a value flag accepted a spelling that does not
+                        # exist while rejecting every one that does.
+                        '--starttls-ftp', '--starttls-imap', '--starttls-irc',
+                        '--starttls-ldap', '--starttls-pop3', '--starttls-smtp',
+                        '--starttls-mysql', '--starttls-psql', '--starttls-xmpp',
                     },
-                    'value_flags': {'--sni-name', '--timeout', '--connect-timeout', '--starttls'},
+                    'value_flags': {'--sni-name', '--timeout', '--connect-timeout'},
                     'attached_patterns': (
-                        r'^--(sni-name|timeout|connect-timeout|starttls)=[A-Za-z0-9_.\-]+$',
+                        r'^--(sni-name|timeout|connect-timeout)=[A-Za-z0-9_.\-]+$',
                     ),
                 },
                 'nuclei': {
@@ -198,8 +213,20 @@ class PolicyEngine:
 
     def normalize_host(self, value):
         value = (value or '').strip()
+        if not value:
+            return ''
+        # A bare IPv6 literal carries no brackets, and urlparse reads everything
+        # after the first colon as a port, which discards the address entirely
+        # and left '::1' normalizing to ''. Every IPv6 scope silently matched
+        # nothing as a result, so recognise the literal before parsing.
+        literal = self._as_ip(value.strip('[]'))
+        if literal is not None:
+            return str(literal)
         parsed = urlparse(value if '://' in value else f'//{value}')
-        return (parsed.hostname or value.split(':')[0]).strip('[]').lower().rstrip('.')
+        host = (parsed.hostname or value.split(':')[0]).strip('[]').lower().rstrip('.')
+        # Canonicalise so '0:0:0:0:0:0:0:1' and '::1' compare equal.
+        bracketed = self._as_ip(host)
+        return str(bracketed) if bracketed is not None else host
 
     @staticmethod
     def _as_ip(value):

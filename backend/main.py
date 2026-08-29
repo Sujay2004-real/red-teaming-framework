@@ -1,6 +1,6 @@
 import os
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from datetime import timedelta
+from urllib.parse import quote, urlparse
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -10,18 +10,27 @@ from pathlib import Path
 
 from database import AppSettings, Assessment, Finding, Target, ToolExecution, get_db, utcnow
 from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
-from modules.analyzer import analyzer_agent
+from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
 from modules.reporter import reporter
+from modules.secret_store import decrypt_secret, encrypt_secret
 
 app = FastAPI(title='Red Teaming Framework API', version='2.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+# The dev server's origin is the default, but it is not the only place this UI
+# can be served from; a hardcoded origin meant any other deployment silently
+# failed every request in the browser with no server-side sign of why.
+CORS_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOW_ORIGINS', 'http://localhost:5173').split(',') if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 REPORTS_DIR = Path('./data/reports')
 MAX_REQUIREMENT_BYTES = 5 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 65_536
+# A plan is stored as opaque JSON, so nothing else bounds what a client can put
+# in one. Long enough for any real scanner invocation, short enough that fifty
+# steps cannot become a multi-megabyte row.
+MAX_PLAN_FIELD_CHARS = {'tool': 100, 'command': 4000, 'reason': 2000}
 # An execution row is written before the command runs, so a row still holding
 # return_code=NULL after the command could not possibly still be running is the
 # residue of a disconnect or a restart and may be reclaimed.
@@ -32,7 +41,7 @@ SECRET_SETTING_FIELDS = ('gemini_api_key', 'proxy_password')
 
 
 def serialize_target(row):
-    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else 70, 'created_at': row.created_at}
+    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'created_at': row.created_at}
 
 
 def serialize_assessment(row):
@@ -68,16 +77,45 @@ def get_settings_row(db):
     row = db.query(AppSettings).filter(AppSettings.id == 1).first()
     if row:
         return row
-    row = AppSettings(id=1, gemini_api_key=os.getenv('GEMINI_API_KEY', ''), api_base_url=os.getenv('API_BASE_URL', 'https://api.openai.com/v1'), model_name=os.getenv('MODEL_NAME', 'gpt-4o-mini'))
+    # Created empty on purpose. Seeding a key, endpoint, or model from the
+    # environment would mean scanner output could reach a provider the operator
+    # never chose, so AI features stay off until someone configures them here.
+    row = AppSettings(id=1, gemini_api_key='', api_base_url='', model_name='')
     db.add(row)
     try:
         db.commit()
     except IntegrityError:
         # Another request created the singleton row first.
         db.rollback()
-        return db.query(AppSettings).filter(AppSettings.id == 1).first()
+        existing = db.query(AppSettings).filter(AppSettings.id == 1).first()
+        if existing is None:
+            # The insert conflicted with something that is no longer there, so
+            # the caller would get an AttributeError on a None row instead of a
+            # readable failure.
+            raise HTTPException(503, 'Settings are temporarily unavailable; retry the request')
+        return existing
     db.refresh(row)
     return row
+
+
+def provider_credentials(settings):
+    """Return (api_key, base_url, model_name), all three or nothing.
+
+    A key without an endpoint and model is not a usable provider, and there is
+    no default to fall back on, so a partial configuration reports as unset and
+    the caller takes its deterministic path.
+    """
+    api_key = decrypt_secret(settings.gemini_api_key)
+    base_url = (settings.api_base_url or '').strip()
+    model_name = (settings.model_name or '').strip()
+    if not (api_key and base_url and model_name):
+        return '', '', ''
+    # requests would reject a non-HTTP scheme deep inside the planner, where it
+    # is indistinguishable from the provider being down. Treat an endpoint that
+    # can never work as an unconfigured one instead.
+    if urlparse(base_url).scheme not in ('http', 'https'):
+        return '', '', ''
+    return api_key, base_url, model_name
 
 
 def normalize_plan(plan):
@@ -96,6 +134,10 @@ def normalize_plan(plan):
             raise HTTPException(422, 'Plan step enabled must be a boolean')
         item.setdefault('enabled', True)
         item.setdefault('reason', 'User-defined assessment command.')
+        for field, limit in MAX_PLAN_FIELD_CHARS.items():
+            value = item.get(field)
+            if isinstance(value, str) and len(value) > limit:
+                raise HTTPException(422, f'Plan step {field} cannot exceed {limit} characters')
         normalized.append(item)
     return normalized
 
@@ -104,9 +146,10 @@ def proxy_environment(settings):
     if not settings.proxy_url:
         return {}
     url = settings.proxy_url
-    if settings.proxy_username and settings.proxy_password and '://' in url:
+    password = decrypt_secret(settings.proxy_password)
+    if settings.proxy_username and password and '://' in url:
         scheme, remainder = url.split('://', 1)
-        url = f'{scheme}://{quote(settings.proxy_username)}:{quote(settings.proxy_password)}@{remainder}'
+        url = f'{scheme}://{quote(settings.proxy_username)}:{quote(password)}@{remainder}'
     return {'HTTP_PROXY': url, 'HTTPS_PROXY': url, 'http_proxy': url, 'https_proxy': url}
 
 
@@ -148,6 +191,14 @@ def record_abandoned_execution(db, execution_id, detail):
         if execution and execution.return_code is None:
             execution.return_code = -1
             execution.stderr = detail
+            # The execute endpoint set the assessment to 'running' before the
+            # command started. Reclaiming the execution row without also moving
+            # the assessment off 'running' left the UI reporting an in-progress
+            # step that had already been given up on.
+            session.flush()
+            assessment = session.query(Assessment).filter(Assessment.id == execution.assessment_id).first()
+            if assessment is not None and assessment.status == 'running':
+                refresh_assessment_status(session, assessment)
             session.commit()
     except Exception:
         session.rollback()
@@ -165,6 +216,25 @@ def refresh_assessment_status(db, row, extra_executed=()):
     # assessment is idle again and waiting on the next human approval.
     row.status = 'ready_for_analysis' if enabled and all(index in executed for index in enabled) else 'awaiting_approval'
     return row.status
+
+
+def reconcile_running_status(db, row, executions):
+    """Move an assessment off 'running' when nothing is actually running.
+
+    A clean disconnect is handled by record_abandoned_execution, but a hard
+    restart of the server kills the request without running anything at all,
+    leaving status='running' and a NULL return code behind. Once that row is old
+    enough that the command cannot still be alive, the state is stale rather
+    than in-progress, and the UI would otherwise report the run as ongoing
+    forever with no way to clear it.
+    """
+    if row.status != 'running':
+        return False
+    if any(execution.return_code is None and not execution_is_stale(execution) for execution in executions):
+        return False
+    refresh_assessment_status(db, row)
+    db.commit()
+    return True
 
 
 @app.get('/capabilities')
@@ -224,7 +294,25 @@ def health():
 @app.get('/settings')
 def get_settings(db: Session = Depends(get_db)):
     row = get_settings_row(db)
-    return {'gemini_configured': bool(row.gemini_api_key), 'api_base_url': row.api_base_url or '', 'model_name': row.model_name or '', 'proxy_url': row.proxy_url or '', 'proxy_configured': bool(row.proxy_url), 'proxy_username': row.proxy_username or ''}
+    # Whether a key is stored is a separate question from whether the provider is
+    # usable. Conflating them made a saved key look absent while the model name
+    # was still blank, so the UI told the user to enter it again.
+    stored_key = decrypt_secret(row.gemini_api_key)
+    base_url = (row.api_base_url or '').strip()
+    model_name = (row.model_name or '').strip()
+    return {
+        # Secrets are reported as booleans only. No response on this API ever
+        # carries the API key or the proxy password back out, encrypted or not.
+        'gemini_configured': bool(stored_key),
+        'proxy_configured': bool(row.proxy_url),
+        # A key with no endpoint or model cannot reach a provider, so the UI is
+        # told the difference between "configured" and "partly filled in".
+        'provider_ready': bool(stored_key and base_url and model_name),
+        'api_base_url': row.api_base_url or '',
+        'model_name': row.model_name or '',
+        'proxy_url': row.proxy_url or '',
+        'proxy_username': row.proxy_username or '',
+    }
 
 
 @app.put('/settings')
@@ -233,7 +321,7 @@ def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     for key, value in payload.model_dump(exclude_unset=True).items():
         if value is None or (value == '' and key in SECRET_SETTING_FIELDS):
             continue
-        setattr(row, key, value)
+        setattr(row, key, encrypt_secret(value) if key in SECRET_SETTING_FIELDS else value)
     # Credentials with no proxy to authenticate against are dead weight, and
     # keeping a password that can never be cleared is worse than useless.
     if not (row.proxy_url or '').strip():
@@ -268,12 +356,13 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     plan = payload.plan
     requirement_context = (payload.requirements or '').strip()
     if not plan:
+        api_key, base_url, model_name = provider_credentials(settings)
         plan, source = planner_agent.generate_plan(
             target.scope_domain_ip,
             payload.objective,
-            settings.gemini_api_key,
-            settings.api_base_url,
-            settings.model_name,
+            api_key,
+            base_url,
+            model_name,
             requirement_context,
             policy_engine,
             # Plan-time policy review has to use the same scopes the execute
@@ -304,6 +393,7 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     if not row:
         raise HTTPException(404, 'Assessment not found')
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).order_by(ToolExecution.step_index).all()
+    reconcile_running_status(db, row, executions)
     findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).order_by(Finding.priority_score.desc()).all()
     result = serialize_assessment(row)
     result['executions'] = [serialize_execution(execution) for execution in executions]
@@ -406,11 +496,12 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     target = db.query(Target).filter(Target.id == row.target_id).first()
     raw = [{'tool': e.tool_name, 'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in executions]
     settings = get_settings_row(db)
+    api_key, base_url, model_name = provider_credentials(settings)
     analyzed, analyzer_mode = analyzer_agent.analyze_results(
         raw,
-        settings.gemini_api_key,
-        settings.api_base_url,
-        settings.model_name,
+        api_key,
+        base_url,
+        model_name,
         include_metadata=True,
         asset_criticality=target.criticality if target else None,
     )
@@ -418,7 +509,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     for item in analyzed:
         db.add(Finding(assessment_id=assessment_id, fingerprint=item['fingerprint'], title=item.get('title', 'Unknown finding'), description=item.get('description', ''), severity=item['severity'], evidence=item.get('evidence', ''), remediation=item.get('remediation', ''), risk_score=item['risk_score'], priority_score=item['priority_score'], confidence_score=item['confidence_score'], source_tools=item.get('source_tools', [])))
     row.status = 'analyzed'
-    row.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    row.completed_at = utcnow()
     db.commit()
     failed = [execution.step_index for execution in executions if execution.return_code != 0]
     return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode, 'failed_steps': failed}

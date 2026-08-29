@@ -6,6 +6,10 @@ from requests.exceptions import RequestException
 from modules.planner import PlannerAgent
 from modules.policy_engine import PolicyEngine
 
+# There is no default endpoint or model, so every test that expects the provider
+# path to be attempted has to supply all three.
+PROVIDER = {'api_key': 'test-key', 'base_url': 'https://provider.example/v1', 'model_name': 'test-model'}
+
 
 def test_default_plan_separates_host_and_web_port():
     plan = PlannerAgent().default_plan('juice-shop:3000')
@@ -31,8 +35,7 @@ def test_ai_plan_filters_mismatched_declared_tool():
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
-            api_key='test-key',
-            base_url='https://provider.example/v1',
+            **PROVIDER,
             policy_engine=PolicyEngine(),
         )
 
@@ -46,7 +49,7 @@ def test_provider_failure_is_reported_separately_from_policy_rejection():
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
-            api_key='test-key',
+            **PROVIDER,
             policy_engine=PolicyEngine(),
         )
 
@@ -54,10 +57,24 @@ def test_provider_failure_is_reported_separately_from_policy_rejection():
     assert plan == PlannerAgent().default_plan('juice-shop:3000')
 
 
-def test_missing_api_key_is_reported_separately():
+def test_unconfigured_provider_is_reported_separately():
     plan, source = PlannerAgent().generate_plan('juice-shop:3000', 'Inspect the target')
 
-    assert source == 'default-no-api-key'
+    assert source == 'default-unconfigured'
+    assert plan == PlannerAgent().default_plan('juice-shop:3000')
+
+
+def test_partial_provider_configuration_never_calls_out():
+    """A key with no endpoint or model must not reach any provider."""
+    with patch('requests.post') as post:
+        plan, source = PlannerAgent().generate_plan(
+            'juice-shop:3000',
+            'Inspect the target',
+            api_key='test-key',
+        )
+
+    post.assert_not_called()
+    assert source == 'default-unconfigured'
     assert plan == PlannerAgent().default_plan('juice-shop:3000')
 
 
@@ -75,7 +92,7 @@ def test_secondary_authorized_scopes_survive_policy_review():
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
-            api_key='test-key',
+            **PROVIDER,
             policy_engine=PolicyEngine(),
             authorized_scopes=['juice-shop:3000', '172.18.0.0/16'],
         )

@@ -6,7 +6,11 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      # Every setting in .env has a default, and .env is gitignored, so a fresh
+      # clone has no such file. Without required:false Compose refuses to start
+      # the stack at all instead of running with those defaults.
+      - path: ./backend/.env
+        required: false
     volumes:
       - ./backend:/app
       - data_volume:/app/data

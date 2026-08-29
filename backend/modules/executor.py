@@ -57,8 +57,11 @@ class Executor:
         started = time.perf_counter()
         elapsed = lambda: round((time.perf_counter() - started) * 1000)
         stdout_chunks, stderr_chunks = [], []
+        process = None
         try:
             tokens = shlex.split(command, posix=True)
+            if not tokens:
+                raise ValueError('Command is empty')
             process = await asyncio.create_subprocess_exec(
                 *tokens,
                 stdout=asyncio.subprocess.PIPE,
@@ -89,6 +92,14 @@ class Executor:
             return {'tool': tool, 'command': command, 'stdout': stdout, 'stderr': stderr, 'return_code': return_code, 'duration_ms': elapsed()}
         except Exception as exc:
             return {'tool': tool, 'command': command, 'stdout': _truncate(stdout_chunks, 'stdout'), 'stderr': str(exc), 'return_code': -1, 'duration_ms': elapsed()}
+        finally:
+            # A client disconnect cancels this coroutine, and CancelledError is a
+            # BaseException that no except clause here catches, so the scanner
+            # used to keep running - and keep hammering the target - long after
+            # nobody was left to read its output. The same applied to any
+            # unexpected error raised while the readers were still attached.
+            if process is not None and process.returncode is None:
+                self._terminate(process)
 
 
 executor = Executor()
