@@ -19,6 +19,18 @@ const PLAN_SOURCE_NOTE = {
 const detailText = detail => Array.isArray(detail) ? detail.map(item => item?.msg || JSON.stringify(item)).join('; ') : typeof detail === 'string' ? detail : ''
 const samePlan = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || [])
 
+// An objective drafted from the letter keeps the client's own framing: a
+// baseline-restricted target says so plainly, a full assessment carries the
+// letter's numbered objectives.
+const suggestedObjective = (brief, target) => {
+  const goals = (brief?.objectives || []).map(o => o.replace(/^[\d.]+\s*/, '')).join('; ')
+  const baseline = (target.assessment_type || '').toLowerCase().includes('baseline')
+  const headline = baseline
+    ? `Baseline assessment of ${target.name}: ${target.assessment_type}`
+    : `Assess ${target.name} per engagement ${brief?.engagement_ref || ''}`
+  return (goals ? `${headline}. Objectives: ${goals}` : headline).slice(0, 1000)
+}
+
 function App() {
   const [targets, setTargets] = useState([]), [assessments, setAssessments] = useState([])
   const [selected, setSelected] = useState(null), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
@@ -29,10 +41,20 @@ function App() {
   const [target, setTarget] = useState({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 })
   const [assessment, setAssessment] = useState({ target_id: '', objective: '', requirements: '' })
   const [requirementFile, setRequirementFile] = useState(null)
+  // The parsed client engagement letter: what the agent was asked to do.
+  const [brief, setBrief] = useState(null), [briefFilename, setBriefFilename] = useState(''), [briefText, setBriefText] = useState('')
   // Blank, not pre-filled: the operator chooses their own provider endpoint and
   // model. The input placeholders show the expected shape without submitting it.
   const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: '', model_name: '', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false, proxy_configured: false, provider_ready: false })
   const [loading, setLoading] = useState(true)
+  // Which agent card is mid-flight right now; '' means the crew is idle. Bound
+  // to real request lifecycles rather than a timer, so an agent only ever
+  // "works" while an actual request is in flight.
+  const [activeAgent, setActiveAgent] = useState('')
+  // Human-sentence activity feed, newest first, capped so a long session
+  // stays readable.
+  const [feed, setFeed] = useState([])
+  const pushFeed = (text, kind='info') => setFeed(entries => [{ text, kind, at: Date.now() }, ...entries].slice(0, 30))
 
   const request = async (path, options={}) => {
     const res = await fetch(API + path, { headers: {'Content-Type':'application/json'}, ...options })
@@ -52,19 +74,71 @@ function App() {
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   useEffect(()=>{ refresh().catch(e=>setNotice(e.message)).finally(()=>setLoading(false)) },[])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  const run = async fn => { setBusy(true); setNotice(''); try { await fn() } catch(e){ setNotice(e.message) } finally { setBusy(false) } }
-  const saveSettings = e => run(async()=>{ e.preventDefault()
+  // The agent argument lights the matching crew card for exactly as long as
+  // the request is in flight; the finally clause guarantees it clears even on
+  // failure, so no agent is ever left "working" after a crash.
+  const run = async (agent, fn) => { setBusy(true); setNotice(''); setActiveAgent(agent || ''); try { await fn() } catch(e){ setNotice(e.message) } finally { setBusy(false); setActiveAgent('') } }
+  const saveSettings = e => run('', async()=>{ e.preventDefault()
     // Compare against what was stored before this save. Testing the submitted
     // proxy_url alone announced "clearing the proxy URL also cleared its stored
     // credentials" to every operator who had never configured a proxy at all.
     const clearedProxy = settings.proxy_configured && !settings.proxy_url
     await request('/settings',{method:'PUT',body:JSON.stringify({gemini_api_key:settings.gemini_api_key||'',api_base_url:settings.api_base_url||'',model_name:settings.model_name||'',proxy_url:settings.proxy_url||'',proxy_username:settings.proxy_username||'',proxy_password:settings.proxy_password||''})}); setSettings(v=>({...v,gemini_api_key:'',proxy_password:''})); await refresh(); setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : 'Settings saved. Secrets are masked after storage.') })
-  const addTarget = e => run(async()=>{ e.preventDefault(); await request('/targets/',{method:'POST',body:JSON.stringify({...target,criticality:Math.min(100,Math.max(0,Number(target.criticality)||0)),authorized_scopes:target.authorized_scopes.split(',').map(x=>x.trim()).filter(Boolean)})}); setTarget({name:'',scope_domain_ip:'',authorized_scopes:'',criticality:70}); await refresh() })
-  const createAssessment = e => run(async()=>{ e.preventDefault(); let requirements=assessment.requirements; if(requirementFile){ const form=new FormData(); form.append('file', requirementFile); const extracted=await fetch(API+'/requirements/extract',{method:'POST',body:form}); const data=await extracted.json().catch(()=>({})); if(!extracted.ok) throw new Error(detailText(data.detail)||'Could not read requirements'); requirements=data.text } const a=await request('/assessments/',{method:'POST',body:JSON.stringify({...assessment,target_id:Number(assessment.target_id),requirements})}); setAssessment({target_id:'',objective:'',requirements:''}); setRequirementFile(null); await refresh(); await openAssessment(a.id); setNotice(PLAN_SOURCE_NOTE[a.plan_source] || '') })
-  const savePlan = () => run(async()=>{ await request(`/assessments/${selected.id}/plan`,{method:'PUT',body:JSON.stringify({plan:draftPlan})}); await openAssessment(selected.id); await refresh(); setNotice('Command plan saved and ready for individual approval.') })
-  const execute = index => run(async()=>{ await request(`/assessments/${selected.id}/execute`,{method:'POST',body:JSON.stringify({step_index:index,approved:true})}); await openAssessment(selected.id); await refresh() })
-  const analyze = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/analyze`,{method:'POST'}); await openAssessment(selected.id); await refresh(); const failed=d.failed_steps||[]; setNotice(failed.length ? `Analysis complete, but ${failed.length>1?'steps':'step'} ${failed.map(i=>i+1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
-  const report = () => run(async()=>{ const d=await request(`/assessments/${selected.id}/report`,{method:'POST'}); window.open(API+d.download_url,'_blank','noopener'); await openAssessment(selected.id); await refresh() })
+  const addTarget = e => run('registrar', async()=>{ e.preventDefault(); await request('/targets/',{method:'POST',body:JSON.stringify({...target,criticality:Math.min(100,Math.max(0,Number(target.criticality)||0)),authorized_scopes:target.authorized_scopes.split(',').map(x=>x.trim()).filter(Boolean)})}); setTarget({name:'',scope_domain_ip:'',authorized_scopes:'',criticality:70}); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
+  const createAssessment = e => run('planner', async()=>{ e.preventDefault(); let requirements=assessment.requirements; if(requirementFile){ const form=new FormData(); form.append('file', requirementFile); const extracted=await fetch(API+'/requirements/extract',{method:'POST',body:form}); const data=await extracted.json().catch(()=>({})); if(!extracted.ok) throw new Error(detailText(data.detail)||'Could not read requirements'); requirements=data.text } const selectedTarget = targets.find(t=>t.id===Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t=>t.address===selectedTarget.scope_domain_ip); const a=await request('/assessments/',{method:'POST',body:JSON.stringify({...assessment,target_id:Number(assessment.target_id),requirements,...(briefApplies?{engagement_brief:brief}:{})})}); setAssessment({target_id:'',objective:'',requirements:''}); setRequirementFile(null); await refresh(); await openAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source==='ai-filtered'?'ok':'info'); const dropped=a.restricted_steps_dropped||0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped>1?'s':''} using tools the client's letter restricts for this target.` : '')) })
+  const savePlan = () => run('planner', async()=>{ await request(`/assessments/${selected.id}/plan`,{method:'PUT',body:JSON.stringify({plan:draftPlan})}); await openAssessment(selected.id); await refresh(); pushFeed(`Saved the edited plan for assessment #${selected.id}.`); setNotice('Command plan saved and ready for individual approval.') })
+  const execute = index => run('executor', async()=>{ const d=await request(`/assessments/${selected.id}/execute`,{method:'POST',body:JSON.stringify({step_index:index,approved:true})}); const r=d.result||{}; pushFeed(r.return_code===0 ? `Step ${index+1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index+1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code===0?'ok':'warn'); await openAssessment(selected.id); await refresh() })
+  const analyze = () => run('analyst', async()=>{ const d=await request(`/assessments/${selected.id}/analyze`,{method:'POST'}); await openAssessment(selected.id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count||0} finding${(d.findings_count||0)!==1?'s':''} (${d.analyzer} mode).`, 'ok'); const failed=d.failed_steps||[]; setNotice(failed.length ? `Analysis complete, but ${failed.length>1?'steps':'step'} ${failed.map(i=>i+1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
+  const report = () => run('reporter', async()=>{ const d=await request(`/assessments/${selected.id}/report`,{method:'POST'}); window.open(API+d.download_url,'_blank','noopener'); await openAssessment(selected.id); await refresh(); pushFeed('Report written and opened in a new tab — it cites the engagement brief and every command.', 'ok') })
+  const importBrief = file => run('reader', async()=>{ if(!file) return
+    const form=new FormData(); form.append('file', file)
+    const res=await fetch(API+'/engagement/parse',{method:'POST',body:form})
+    const data=await res.json().catch(()=>({}))
+    if(!res.ok) throw new Error(detailText(data.detail)||'Could not read the client letter')
+    setBrief(data.engagement); setBriefFilename(data.filename); setBriefText(data.text || '')
+    const n=data.engagement.targets.length
+    pushFeed(`Read “${data.filename}” — ${n} authorized target${n>1?'s':''}, ${data.engagement.objectives?.length||0} objectives, ${data.engagement.out_of_scope?.length||0} out-of-scope item${(data.engagement.out_of_scope?.length||0)!==1?'s':''}.`, 'ok')
+    setNotice(`I've read “${data.filename}” — ${n} authorized target${n>1?'s':''} found. Review the brief and register each target below.`)
+  })
+  const registerBriefTarget = t => run('registrar', async()=>{
+    const created=await request('/targets/',{method:'POST',body:JSON.stringify({
+      name: t.name || t.address,
+      scope_domain_ip: t.address,
+      authorized_scopes: (t.scopes && t.scopes.length) ? t.scopes : [t.address],
+      criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
+      restricted_tools: t.restricted_tools || [],
+    })})
+    await refresh()
+    setAssessment({ target_id: String(created.id), objective: suggestedObjective(brief, t), requirements: briefText })
+    pushFeed(`Registered “${created.name}”${created.restricted_tools?.length ? ` (no ${created.restricted_tools.join(', ')} per the letter)` : ''}.`, 'ok')
+    setNotice(`“${created.name}” is registered${created.restricted_tools?.length ? ` — ${created.restricted_tools.join(', ')} will be refused on this target per the client's letter` : ''}. Now generate its command plan.`)
+  })
+  // One click from letter to ready-to-approve plans: register every target in
+  // the brief, then draft an assessment for each so the operator lands on a
+  // plan they can review. The crew cards alternate registrar/planner as the
+  // loop moves between the two kinds of work.
+  const setupFromBrief = () => run('registrar', async()=>{
+    let firstId=null, registered=0, drafted=0
+    for(const t of brief.targets){
+      const existing = targets.find(x => x.scope_domain_ip === t.address)
+      const target = existing || await request('/targets/',{method:'POST',body:JSON.stringify({
+        name: t.name || t.address,
+        scope_domain_ip: t.address,
+        authorized_scopes: (t.scopes && t.scopes.length) ? t.scopes : [t.address],
+        criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
+        restricted_tools: t.restricted_tools || [],
+      })})
+      if(!existing) registered++
+      setActiveAgent('planner')
+      const a=await request('/assessments/',{method:'POST',body:JSON.stringify({target_id:target.id,objective:suggestedObjective(brief,t),requirements:briefText,engagement_brief:brief})})
+      drafted++
+      if(firstId===null) firstId=a.id
+      setActiveAgent('registrar')
+    }
+    await refresh(); await openAssessment(firstId)
+    pushFeed(`Set up the whole letter: ${registered} target${registered!==1?'s':''} registered, ${drafted} plan${drafted!==1?'s':''} drafted. Each waits for your approval.`, 'ok')
+    setNotice(`All set — ${drafted} plan${drafted!==1?'s':''} drafted from the letter. Review the commands, then approve each one when you're ready.`)
+  })
   const patchStep = (i,key,value) => setDraftPlan(plan=>plan.map((s,n)=>n===i?{...s,[key]:value}:s))
   const toolNames = useMemo(() => new Set(capabilities.flatMap(group => (group.tools||[]).map(tool => tool.name))), [capabilities])
   const executionByStep = useMemo(() => new Map((selected?.executions || []).map(execution => [execution.step_index, execution])), [selected])
@@ -75,13 +149,48 @@ function App() {
   const completedSteps = useMemo(() => enabledSteps.filter(({index}) => executionByStep.get(index)?.complete), [enabledSteps, executionByStep])
   const planLocked = (selected?.executions?.length || 0) > 0
   const planDirty = !!selected && !samePlan(draftPlan, selected.plan)
+  const selectedTarget = useMemo(() => targets.find(t => t.id === selected?.target_id), [targets, selected])
   const canAnalyze = !!selected && !planDirty && enabledSteps.length > 0 && completedSteps.length === enabledSteps.length
   const canReport = selected?.status === 'analyzed' || selected?.status === 'reported'
+
+  // The agent pipeline the stepper visualises. Each stage reads only saved
+  // state, so the tracker never claims progress the backend has not made.
+  const stages = useMemo(() => {
+    const registered = targets.length > 0
+    const hasBrief = !!brief
+    const planned = !!selected && (selected.plan || []).length > 0
+    const findings = selected?.findings?.length || 0
+    return [
+      { key:'read',   label:'Read the engagement letter', caption: hasBrief ? `Parsed ${brief.targets.length} target${brief.targets.length>1?'s':''} from “${briefFilename}”` : 'Import the client PDF to set scope and rules' , done: hasBrief },
+      { key:'register', label:'Register authorized targets', caption: registered ? `${targets.length} target${targets.length>1?'s':''} with scopes and criticality` : 'Scopes and criticality feed every policy check and score', done: registered },
+      { key:'plan',   label:'Draft the command plan', caption: planned ? `${enabledSteps.length} command${enabledSteps.length!==1?'s':''} awaiting your approval` : 'The agent proposes; nothing runs until you approve', done: planned },
+      { key:'run',    label:'Approve & execute', caption: selected ? `${completedSteps.length} of ${enabledSteps.length} approved commands complete` : 'Every command needs your explicit approval', done: !!selected && completedSteps.length === enabledSteps.length && enabledSteps.length > 0 },
+      { key:'analyze',label:'Correlate findings', caption: findings ? `${findings} correlated finding${findings>1?'s':''}` : 'Dedupe and score severity, risk and confidence', done: selected?.status==='analyzed' || selected?.status==='reported' },
+      { key:'report', label:'Deliver the report', caption: selected?.status==='reported' ? 'Ready to download' : 'Signed-off evidence for the client', done: selected?.status==='reported' },
+    ]
+  }, [targets, brief, briefFilename, selected, enabledSteps, completedSteps])
+
+  // The agent crew the cards animate. `working` comes from the live request
+  // lifecycle (`activeAgent`); `done` reads saved state only, so a card never
+  // claims an agent finished work the backend has not recorded.
+  const crew = useMemo(() => {
+    const findings = selected?.findings?.length || 0
+    const planned = !!selected && (selected.plan || []).length > 0
+    return [
+      { key:'reader', emoji:'📄', name:'Brief reader', idle:'Waiting for the client letter', working:'Reading the letter…', done: !!brief, doneText: briefFilename ? `Read “${briefFilename}”` : '' },
+      { key:'registrar', emoji:'🗂️', name:'Registrar', idle:'Registers authorized targets', working:'Registering targets…', done: targets.length>0, doneText: targets.length ? `${targets.length} target${targets.length!==1?'s':''} on file` : '' },
+      { key:'planner', emoji:'🧭', name:'Planner', idle:'Drafts commands for your approval', working:'Drafting the command plan…', done: planned, doneText: planned ? `${(selected.plan||[]).length} steps awaiting approval` : '' },
+      { key:'executor', emoji:'⚡', name:'Executor', idle:'Runs only what you approve', working:'Running the approved command…', done: completedSteps.length>0, doneText: completedSteps.length ? `${completedSteps.length}/${enabledSteps.length} commands complete` : '' },
+      { key:'analyst', emoji:'🔎', name:'Analyst', idle:'Correlates and scores findings', working:'Correlating outputs…', done: selected?.status==='analyzed'||selected?.status==='reported', doneText: findings ? `${findings} finding${findings!==1?'s':''} scored` : '' },
+      { key:'reporter', emoji:'📝', name:'Reporter', idle:'Writes the client report', working:'Writing the report…', done: selected?.status==='reported', doneText: selected?.status==='reported' ? 'Report ready to download' : '' },
+    ]
+  }, [brief, briefFilename, targets, selected, completedSteps, enabledSteps])
+  const workingAgent = crew.find(agent => agent.key === activeAgent)
 
   if (loading) return <main className="loading-screen"><div className="loading-mark"/><p>Loading control center...</p></main>
 
   return <main>
-    <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Plan, approve, execute, correlate, and report—with every decision visible.</p></div><div className="health"><i/> Lab environment</div></header>
+    <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="health"><i/> Lab environment</div></header>
     {notice && <div className="notice">{notice}<button onClick={()=>setNotice('')}>×</button></div>}
     <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a=>a.status==='reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready?'AI':'Local'}</b><span>Configured analyzer</span></div></section>
 
@@ -95,14 +204,78 @@ function App() {
           <button className="secondary" disabled={busy}>Save configuration</button><small>Responses never return secret values.</small>
         </form></section>
         <section className="panel"><h2>Add authorized target</h2><form onSubmit={addTarget}><label>Display name<input required value={target.name} onChange={e=>setTarget({...target,name:e.target.value})} placeholder="Juice Shop lab"/></label><label>Primary host<input required value={target.scope_domain_ip} onChange={e=>setTarget({...target,scope_domain_ip:e.target.value})} placeholder="juice-shop:3000"/></label><label>Allowed domains / CIDRs<input value={target.authorized_scopes} onChange={e=>setTarget({...target,authorized_scopes:e.target.value})} placeholder="juice-shop, 172.18.0.0/16"/></label><label>Asset criticality<input type="number" min="0" max="100" required value={target.criticality} onChange={e=>setTarget({...target,criticality:e.target.value})}/><small>0-100. Feeds the priority score of every finding on this target.</small></label><button disabled={busy}>Add target</button></form></section>
-        <section className="panel"><h2>New assessment</h2><form onSubmit={createAssessment}><label>Target<select required value={assessment.target_id} onChange={e=>setAssessment({...assessment,target_id:e.target.value})}><option value="">Select target</option>{targets.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Objective<textarea required value={assessment.objective} onChange={e=>setAssessment({...assessment,objective:e.target.value})} placeholder="Identify high-risk web vulnerabilities before release"/></label><label>Client requirements<input type="file" accept=".txt,.md,.pdf,.docx" onChange={e=>setRequirementFile(e.target.files?.[0]||null)}/><small>Optional planning context; every command still needs HITL approval.</small></label><button disabled={busy}>Generate command plan</button></form></section>
+        <section className="panel"><h2>New assessment</h2><form onSubmit={createAssessment}><label>Target<select required value={assessment.target_id} onChange={e=>setAssessment({...assessment,target_id:e.target.value})}><option value="">Select target</option>{targets.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Objective<textarea required value={assessment.objective} onChange={e=>setAssessment({...assessment,objective:e.target.value})} placeholder="Identify high-risk web vulnerabilities before release"/></label><label>Client requirements<input type="file" accept=".txt,.md,.pdf,.docx" onChange={e=>setRequirementFile(e.target.files?.[0]||null)}/><small>{assessment.requirements ? `Context from “${briefFilename}” is attached and will guide planning.` : 'Optional planning context; every command still needs HITL approval.'}</small></label><button disabled={busy}>{brief ? 'Draft plan from the letter' : 'Generate command plan'}</button></form></section>
       </aside>
 
       <section className="main-column">
+        <section className="panel brief-panel">
+          <div className="panel-title"><div><span className="eyebrow">START HERE</span><h2>Read the client's letter</h2></div>{brief && <button className="secondary compact" onClick={()=>{setBrief(null);setBriefFilename('');setBriefText('')}} disabled={busy}>Clear</button>}</div>
+          {!brief ? <div className="dropzone" onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();importBrief(e.dataTransfer.files?.[0])}}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            <label className="drop-pick" htmlFor="brief-file">{briefFilename || 'Drop the request letter here'}</label>
+            <input id="brief-file" type="file" accept=".txt,.md,.pdf,.docx" hidden onChange={e=>importBrief(e.target.files?.[0])}/>
+            <small>PDF, Word or text. I'll read it and work out the scope, targets, criticality and rules of engagement — then wait for your approval on every command.</small>
+          </div> : <>
+            <p className="brief-meta"><b>{brief.client_name || 'Client'}</b>{brief.engagement_ref && <> · engagement <code>{brief.engagement_ref}</code></>}{brief.test_window && <> · test window {brief.test_window}</>}</p>
+            <div className="brief-targets">
+              {brief.targets.map((t,i)=>{
+                const registered = targets.some(existing => existing.scope_domain_ip === t.address)
+                return <div className="brief-target" key={i}>
+                  <div className="brief-target-head">
+                    <div><b>{t.name || t.address}</b><small>{t.address}{t.technology ? ` · ${t.technology}` : ''}</small></div>
+                    <div className="criticality"><span style={{'--level': (Number.isFinite(t.criticality)?t.criticality:70)}}><b>{Number.isFinite(t.criticality)?t.criticality:'—'}</b></span><small>criticality</small></div>
+                  </div>
+                  <div className="chip-row">
+                    {(t.scopes||[]).map(s=><span className="chip" key={s}>{s}</span>)}
+                    {!!t.restricted_tools?.length && <span className="chip warn" title="The client's letter rules these tools out for this target">no {t.restricted_tools.join(', ')}</span>}
+                    {t.assessment_type && <span className="chip">{t.assessment_type}</span>}
+                  </div>
+                  {registered
+                    ? <span className="registered-note">Registered ✓</span>
+                    : <button className="compact" onClick={()=>registerBriefTarget(t)} disabled={busy}>Register this target</button>}
+                </div>})}
+            </div>
+            <div className="brief-actions">
+              <button onClick={setupFromBrief} disabled={busy}>Set up everything from this letter</button>
+              <small>Registers every target above and drafts a plan for each. Still your call on every command — nothing runs until you approve it.</small>
+            </div>
+            {!!brief.objectives?.length && <details className="brief-details" open><summary>What the client asked for ({brief.objectives.length})</summary><ol>{brief.objectives.map((o,i)=><li key={i}>{o}</li>)}</ol></details>}
+            {(!!brief.out_of_scope?.length || !!brief.prohibited?.length) && <details className="brief-details"><summary>Out of scope ({brief.out_of_scope?.length || 0}) &amp; prohibited techniques ({brief.prohibited?.length || 0})</summary>
+              {!!brief.out_of_scope?.length && <><b>Never touch</b><ul>{brief.out_of_scope.map((o,i)=><li key={i}>{o}</li>)}</ul></>}
+              {!!brief.prohibited?.length && <><b>Never do</b><ul>{brief.prohibited.map((p,i)=><li key={i}>{p}</li>)}</ul></>}
+            </details>}
+          </>}
+        </section>
+
+        <section className="panel crew-panel"><div className="panel-title"><div><span className="eyebrow">LIVE</span><h2>The agent crew</h2></div><span className={activeAgent?'tag good':'tag'}>{workingAgent ? `${workingAgent.name} is working…` : 'Standing by'}</span></div>
+          <div className="crew">
+            {crew.map(agent => <div className={`crew-card${activeAgent===agent.key?' working':''}${agent.done && activeAgent!==agent.key?' done':''}`} key={agent.key}>
+              <span className="crew-avatar" aria-hidden="true">{agent.emoji}</span>
+              <b>{agent.name}</b>
+              <small>{activeAgent===agent.key ? agent.working : agent.done ? agent.doneText : agent.idle}</small>
+            </div>)}
+          </div>
+          {!!feed.length && <div className="feed-wrap"><div className="panel-title"><h2>What just happened</h2><button className="secondary compact" onClick={()=>setFeed([])} disabled={busy}>Clear</button></div>
+            <ul className="feed">{feed.map((entry,i)=><li key={entry.at+'-'+i} className={entry.kind}><span className="feed-time">{new Date(entry.at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span>{entry.text}</li>)}</ul>
+          </div>}
+        </section>
+
+        <section className="panel pipeline-panel"><div className="panel-title"><h2>Where the agent is</h2><span className="muted">{selected ? `Assessment #${selected.id} · ${targets.find(t=>t.id===selected.target_id)?.name||''}` : 'No assessment selected yet'}</span></div>
+          <ol className="pipeline">
+            {stages.map((stage,i)=>{
+              const active = !stage.done && stages.slice(0,i).every(s=>s.done)
+              return <li key={stage.key} className={`${stage.done?'done':''} ${active?'active':''}`}>
+                <span className="stage-dot">{stage.done?'✓':i+1}</span>
+                <span className="stage-body"><b>{stage.label}</b><small>{stage.caption}</small></span>
+              </li>})}
+          </ol>
+        </section>
+
         <section className="panel"><div className="panel-title"><h2>Assessments</h2><span className="muted">Select a run to inspect</span></div><div className="assessment-list">{assessments.length===0?<div className="empty">Create your first authorized assessment.</div>:assessments.map(a=><button key={a.id} className={`assessment-row ${selected?.id===a.id?'active':''}`} onClick={()=>openAssessment(a.id)}><span><b>#{a.id} · {targets.find(t=>t.id===a.target_id)?.name||'Target'}</b><small>{a.objective}</small></span><span className={`status ${a.status}`}>{a.status.replaceAll('_',' ')}</span></button>)}</div></section>
 
         {selected && <>
           <section className="panel"><div className="panel-title"><div><span className="eyebrow">ASSESSMENT #{selected.id}</span><h2>Editable command plan</h2></div><button className="secondary compact" onClick={savePlan} disabled={busy||planLocked||!planDirty}>Save plan</button></div><p className="muted intro">Review every command before execution. Enabled steps require approval and pass policy checks.</p>
+            {!!selectedTarget?.restricted_tools?.length && <small className="plan-note">Client's letter for this target: {selectedTarget.restricted_tools.join(', ')} {selectedTarget.restricted_tools.length>1?'are':'is'} restricted and will be refused at approval.</small>}
             <div className="plan">{draftPlan.map((step,i)=>{
               const execution = executionByStep.get(i)
               const running = !!execution && !execution.complete

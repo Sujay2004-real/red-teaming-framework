@@ -21,6 +21,9 @@ class Target(Base):
     scope_domain_ip = Column(String, nullable=False)
     authorized_scopes = Column(JSON, default=list)
     criticality = Column(Integer, default=70)
+    # Tools the client's engagement letter rules out for this target, kept as
+    # plain names; the execute endpoint refuses them before policy review.
+    restricted_tools = Column(JSON, default=list)
     created_at = Column(DateTime, default=utcnow)
 
 class AppSettings(Base):
@@ -44,6 +47,10 @@ class Assessment(Base):
     objective = Column(Text, nullable=False)
     status = Column(String, default='awaiting_approval')
     plan = Column(JSON, default=list)
+    # The parsed engagement letter this assessment was drafted from, stored so
+    # the brief the operator reviewed is the same one the planner, analyzer and
+    # report act on - not a re-parse of raw text that can drift.
+    engagement_brief = Column(JSON, default=None)
     approval_required = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
@@ -97,8 +104,8 @@ def _migrate_sqlite():
             ('proxy_url', "VARCHAR DEFAULT ''"), ('proxy_username', "VARCHAR DEFAULT ''"),
             ('proxy_password', "TEXT DEFAULT ''"), ('updated_at', 'DATETIME'),
         ],
-        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70')],
-        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME')],
+        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70'), ('restricted_tools', "JSON DEFAULT '[]'")],
+        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON')],
         'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1')],
         'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME')],
     }

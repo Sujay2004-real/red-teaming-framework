@@ -35,6 +35,8 @@ coverage.xml
 htmlcov/
 .pytest_cache/
 **/.pytest_cache/
+.pytest_tmp/
+**/.pytest_tmp/
 
 # Master key for credential encryption at rest
 .secret_key
@@ -43,6 +45,9 @@ htmlcov/
 # Operating System files
 .DS_Store
 Thumbs.db
+
+# Claude Code local settings (machine-specific permission allowlist)
+.claude/settings.local.json
 
 # IDEs & Editors
 .vscode/

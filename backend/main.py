@@ -11,6 +11,7 @@ from pathlib import Path
 from database import AppSettings, Assessment, Finding, Target, ToolExecution, get_db, utcnow
 from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
 from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent
+from modules.engagement_parser import parse_engagement
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
@@ -41,11 +42,11 @@ SECRET_SETTING_FIELDS = ('gemini_api_key', 'proxy_password')
 
 
 def serialize_target(row):
-    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'created_at': row.created_at}
+    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'restricted_tools': row.restricted_tools or [], 'created_at': row.created_at}
 
 
 def serialize_assessment(row):
-    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'approval_required': row.approval_required, 'created_at': row.created_at, 'completed_at': row.completed_at}
+    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'created_at': row.created_at, 'completed_at': row.completed_at}
 
 
 def execution_is_stale(execution):
@@ -175,6 +176,58 @@ def authorized_scopes_for(target):
     return target.authorized_scopes or [target.scope_domain_ip]
 
 
+def restricted_tools_for(target):
+    return set(target.restricted_tools or [])
+
+
+def engagement_restriction_context(target):
+    """One-line summary of the client's per-target tool restrictions.
+
+    Appended to the planner's requirement context so an AI plan avoids the
+    restricted tools up front instead of having them filtered out afterward.
+    """
+    restricted = sorted(restricted_tools_for(target))
+    if not restricted:
+        return ''
+    return ('Client engagement restriction: the tools '
+            + ', '.join(restricted)
+            + ' must not be used against this target.')
+
+
+def brief_requirement_context(brief):
+    """Render the parsed letter as the labelled lines a planner follows best.
+
+    A structured brief states scope and rules as facts ('Out of scope:',
+    'Prohibited techniques:') instead of leaving them buried in letter prose,
+    so a model asked to plan from it cannot mistake a rule for background.
+    """
+    if not isinstance(brief, dict):
+        return ''
+    lines = []
+    meta = []
+    if brief.get('client_name'):
+        meta.append('client ' + str(brief['client_name']))
+    if brief.get('engagement_ref'):
+        meta.append('engagement ' + str(brief['engagement_ref']))
+    if brief.get('test_window'):
+        meta.append('test window ' + str(brief['test_window']))
+    if meta:
+        lines.append('Engagement: ' + ', '.join(meta))
+    objectives = [str(item) for item in (brief.get('objectives') or []) if str(item).strip()]
+    if objectives:
+        lines.append('Client objectives:')
+        lines.extend('- ' + item for item in objectives)
+    out_of_scope = [str(item) for item in (brief.get('out_of_scope') or []) if str(item).strip()]
+    if out_of_scope:
+        lines.append('Out of scope (never touch):')
+        lines.extend('- ' + item for item in out_of_scope)
+    prohibited = [str(item) for item in (brief.get('prohibited') or []) if str(item).strip()]
+    if prohibited:
+        lines.append('Prohibited techniques (never do):')
+        lines.extend('- ' + item for item in prohibited)
+    return '\n'.join(lines)
+
+
 def record_abandoned_execution(db, execution_id, detail):
     """Give an execution a terminal state after its request died mid-flight.
 
@@ -259,6 +312,26 @@ async def read_bounded_upload(upload, limit):
         chunks.append(chunk)
 
 
+def extract_upload_text(suffix, content):
+    """Decode an uploaded requirement document to plain text.
+
+    Shared by the requirements extractor and the engagement parser so both
+    accept the same formats and fail with the same message.
+    """
+    if suffix in {'.txt', '.md'}:
+        text = content.decode('utf-8', errors='ignore')
+    elif suffix == '.pdf':
+        from pypdf import PdfReader
+        import io
+        text = '\n'.join(page.extract_text() or '' for page in PdfReader(io.BytesIO(content)).pages)
+    else:
+        from docx import Document
+        import io
+        doc = Document(io.BytesIO(content))
+        text = '\n'.join(p.text for p in doc.paragraphs)
+    return text.strip()
+
+
 @app.post('/requirements/extract')
 async def extract_requirements(file: UploadFile = File(...)):
     allowed = {'.txt', '.md', '.pdf', '.docx'}
@@ -267,23 +340,38 @@ async def extract_requirements(file: UploadFile = File(...)):
         raise HTTPException(415, 'Supported requirement files: .txt, .md, .pdf, .docx')
     content = await read_bounded_upload(file, MAX_REQUIREMENT_BYTES)
     try:
-        if suffix in {'.txt', '.md'}:
-            text = content.decode('utf-8', errors='ignore')
-        elif suffix == '.pdf':
-            from pypdf import PdfReader
-            import io
-            text = '\n'.join(page.extract_text() or '' for page in PdfReader(io.BytesIO(content)).pages)
-        else:
-            from docx import Document
-            import io
-            doc = Document(io.BytesIO(content))
-            text = '\n'.join(p.text for p in doc.paragraphs)
+        text = extract_upload_text(suffix, content)
     except Exception as exc:
         raise HTTPException(422, f'Could not read requirement file: {exc}')
-    text = text.strip()
     if not text:
         raise HTTPException(422, 'Requirement file contains no readable text')
     return {'filename': file.filename, 'text': text[:30000]}
+
+
+@app.post('/engagement/parse')
+async def parse_engagement_letter(file: UploadFile = File(...)):
+    """Import a client engagement letter and hand back what the agent should do.
+
+    The same extraction path as /requirements/extract feeds a deterministic
+    parser, so the brief the UI shows - targets, criticalities, per-target
+    tool restrictions, objectives, out-of-scope list - is identical to what
+    the policy and planning layers will act on.
+    """
+    allowed = {'.txt', '.md', '.pdf', '.docx'}
+    suffix = Path(file.filename or '').suffix.lower()
+    if suffix not in allowed:
+        raise HTTPException(415, 'Supported engagement files: .txt, .md, .pdf, .docx')
+    content = await read_bounded_upload(file, MAX_REQUIREMENT_BYTES)
+    try:
+        text = extract_upload_text(suffix, content)
+    except Exception as exc:
+        raise HTTPException(422, f'Could not read engagement file: {exc}')
+    if not text:
+        raise HTTPException(422, 'Engagement file contains no readable text')
+    engagement = parse_engagement(text)
+    if not engagement['targets']:
+        raise HTTPException(422, 'No authorized targets could be found in this document; add the target manually instead')
+    return {'filename': file.filename, 'engagement': engagement, 'text': text[:30000]}
 
 
 @app.get('/health')
@@ -335,7 +423,12 @@ def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
 def create_target(payload: TargetCreate, db: Session = Depends(get_db)):
     primary_scope = payload.scope_domain_ip.strip()
     scopes = [scope.strip() for scope in payload.authorized_scopes if scope and scope.strip()] or [primary_scope]
-    row = Target(name=payload.name.strip(), scope_domain_ip=primary_scope, authorized_scopes=scopes, criticality=payload.criticality)
+    # A restriction can only bind tools the framework is able to run, so names
+    # outside the policy registry are dropped here rather than refused - a
+    # misparsed letter should not block target registration.
+    runnable = set(policy_engine.tool_registry())
+    restricted = [tool for tool in dict.fromkeys(payload.restricted_tools) if tool in runnable]
+    row = Target(name=payload.name.strip(), scope_domain_ip=primary_scope, authorized_scopes=scopes, criticality=payload.criticality, restricted_tools=restricted)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -353,8 +446,20 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     if not target:
         raise HTTPException(404, 'Target not found')
     settings = get_settings_row(db)
+    restricted = restricted_tools_for(target)
+    # The structured brief leads and the raw letter text follows it, so the
+    # planner gets the rules as labelled facts first and the prose only as
+    # supporting context. The restriction line stays last, where it already
+    # proved effective.
+    context_parts = [
+        brief_requirement_context(payload.engagement_brief),
+        (payload.requirements or '').strip(),
+    ]
+    restriction_line = engagement_restriction_context(target)
+    if restriction_line:
+        context_parts.append(restriction_line)
+    requirement_context = '\n\n'.join(part for part in context_parts if part)
     plan = payload.plan
-    requirement_context = (payload.requirements or '').strip()
     if not plan:
         api_key, base_url, model_name = provider_credentials(settings)
         plan, source = planner_agent.generate_plan(
@@ -372,13 +477,22 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
         )
     else:
         source = 'user'
+    if restricted and plan:
+        # The client letter outranks both the AI and the operator's pasted
+        # plan: steps using a restricted tool never reach the approval list.
+        kept = [step for step in plan if step.get('tool') not in restricted]
+        dropped = len(plan) - len(kept)
+        plan = kept
+    else:
+        dropped = 0
     plan = normalize_plan(plan)
-    row = Assessment(target_id=payload.target_id, objective=payload.objective, plan=plan, status='awaiting_approval')
+    row = Assessment(target_id=payload.target_id, objective=payload.objective, plan=plan, engagement_brief=payload.engagement_brief, status='awaiting_approval')
     db.add(row)
     db.commit()
     db.refresh(row)
     result = serialize_assessment(row)
     result['plan_source'] = source
+    result['restricted_steps_dropped'] = dropped
     return result
 
 
@@ -430,6 +544,11 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     target = db.query(Target).filter(Target.id == row.target_id).first()
     if not target:
         raise HTTPException(404, 'Target not found')
+    if step['tool'] in restricted_tools_for(target):
+        # The client's letter restricts this tool for this target even though
+        # the global policy would allow it; refusing here keeps a manually
+        # edited plan from bypassing the import-time filtering.
+        raise HTTPException(403, f"{step['tool']} is restricted for this target by the client's engagement letter")
     valid, reason, capability = policy_engine.validate_command(step['command'], authorized_scopes_for(target), expected_tool=step['tool'])
     if not valid:
         raise HTTPException(403, reason)
@@ -535,6 +654,7 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
         [serialize_finding(finding) for finding in findings],
         [serialize_execution(execution) for execution in executions],
         str(path),
+        engagement_brief=row.engagement_brief,
     )
     row.status = 'reported'
     db.commit()
