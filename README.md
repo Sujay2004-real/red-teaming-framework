@@ -247,6 +247,18 @@ npm run dev
 Vite serves the UI at http://localhost:5173. If your backend is not at
 `http://localhost:8000`, set `VITE_API_URL` (see below).
 
+> **Local-dev caveats:**
+> - The UI works identically at `http://localhost:5173` and `http://127.0.0.1:5173` —
+>   both origins are allowed by the backend's default CORS policy. If you reach the UI
+>   from another device or hostname, set both `VITE_API_URL` (where the browser finds
+>   the backend) and `CORS_ALLOW_ORIGINS` (which browser origins the backend accepts).
+> - A bare local backend on Windows has no scanner binaries on `PATH`, so
+>   **Approve & execute** will fail with a clear error; the UI, letter import, planning,
+>   and analysis features all work regardless. Use Docker for full command execution.
+> - The UI polls `/health` and shows a banner when the backend is unreachable, and every
+>   button explains itself while its request is in flight — a disabled button is always
+>   either busy or waiting on you, never silently broken.
+
 ---
 
 ## Configuration
@@ -260,7 +272,7 @@ and have safe defaults.
 |----------|---------|---------|
 | `DATABASE_URL` | `sqlite:///./data/redteam.db` | Database location |
 | `REDTEAM_SECRET_KEY` | *(generated)* | Master key for encrypting stored credentials. Set it explicitly if `data/` is not persistent, or stored secrets become undecryptable when the key regenerates. |
-| `CORS_ALLOW_ORIGINS` | `http://localhost:5173` | Comma-separated browser origins allowed to call the API |
+| `CORS_ALLOW_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated browser origins allowed to call the API |
 
 ### Frontend environment variable
 

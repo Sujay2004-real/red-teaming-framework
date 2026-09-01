@@ -21,8 +21,10 @@ from modules.secret_store import decrypt_secret, encrypt_secret
 app = FastAPI(title='Red Teaming Framework API', version='2.0')
 # The dev server's origin is the default, but it is not the only place this UI
 # can be served from; a hardcoded origin meant any other deployment silently
-# failed every request in the browser with no server-side sign of why.
-CORS_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOW_ORIGINS', 'http://localhost:5173').split(',') if origin.strip()]
+# failed every request in the browser with no server-side sign of why. Both
+# localhost spellings are allowed by default because port-forward links and
+# terminals routinely hand out 127.0.0.1 instead.
+CORS_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOW_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(',') if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 REPORTS_DIR = Path('./data/reports')
