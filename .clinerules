@@ -1,0 +1,68 @@
+# Project Context — AI-Assisted Red Teaming Framework ("Red Team Control Center")
+
+Human-in-the-loop security assessment platform: operator imports a client engagement
+letter (PDF/DOCX/MD/TXT), the framework parses scope/targets/rules deterministically,
+drafts a policy-checked command plan, runs each scanner command ONLY after explicit
+human approval, correlates findings, and emits an HTML report. Authorized lab use only.
+
+## Architecture map
+
+- `frontend/src/App.jsx` — the ENTIRE single-page React 19 UI (one file). `App.css` styles it.
+- `backend/main.py` — FastAPI app: targets, assessments, execute, analyze, report,
+  settings, `/engagement/parse`, `/requirements/extract`, `/health`.
+- `backend/models.py` — Pydantic request schemas with bounds.
+- `backend/database.py` — SQLAlchemy/SQLite ORM + migrations.
+- `backend/modules/` — `engagement_parser` (letter → structured brief, deterministic),
+  `planner` (AI or default plan, policy-filtered), `policy_engine` (allowlist, fail-closed,
+  scope checks — THE security core), `executor` (async subprocess, 300s timeout, output
+  caps, env sandbox), `analyzer` (findings + scoring), `reporter` (Jinja2 HTML),
+  `secret_store` (Fernet encryption at rest).
+- `docker-compose.yml` — backend :8000, frontend :5173, Juice Shop :3000, DVWA :8080.
+- Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (targets the two lab machines).
+
+## Run / test
+
+- Full stack: `docker compose up --build` (from project root) → UI at http://localhost:5173
+- Frontend checks: `cd frontend; npm run lint; npm run build`
+- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (80 tests)
+- PowerShell gotcha: the path contains `[IMPLEMENTATION]`, so always use
+  `Set-Location -LiteralPath "..."` (plain `cd` treats brackets as wildcards).
+
+## Key decisions & gotchas
+
+- CORS default allows BOTH `http://localhost:5173` and `http://127.0.0.1:5173`
+  (port-forward links hand out 127.0.0.1). Override via `CORS_ALLOW_ORIGINS`.
+- Frontend `request()` helper: AbortController timeouts (75s general, 320s for execute —
+  above the executor's 300s cap so the server decides how commands end), friendly
+  network errors, FormData bodies skip the JSON header.
+- UI polls `/health` every 10s → offline banner + auto-refresh on recovery.
+- One global `busy` flag disables all buttons during requests; buttons label themselves
+  ("Analyzing…", "Running…") so long requests read as progress, not dead UI.
+- Scanner binaries (nmap, nuclei, …) exist ONLY inside the backend Docker image — a bare
+  local Windows backend can drive UI/parser/planning but execution fails with a clear error.
+- AI provider (OpenAI-compatible) is configured in the UI Configuration panel, stored
+  Fernet-encrypted in the DB; never via env vars. Without it: deterministic fallbacks.
+- Secrets are write-only: API responses return booleans, never values.
+- Client letter restrictions (per-target tool bans) outrank both AI and operator plans.
+- SQLite DB + secret key persist in the `data_volume` Docker volume (`down` keeps it,
+  `down -v` wipes it).
+
+## Fixed bugs (do not reintroduce)
+
+- Dropzone: whole box is the picker (click + Enter/Space via ref); hidden file input
+  clears `e.target.value` after every pick so re-selecting the same file re-fires onChange.
+- Report `window.open` runs after an await → popup blockers swallow it; fallback link
+  (`reportUrl` state) is rendered when `window.open` returns null.
+- Assessment rows are busy-guarded; execute/analyze/report capture the assessment id up
+  front so switching assessments mid-request cannot cross-write results.
+- Uploads go through `request()` (timeouts + friendly errors), not raw `fetch`.
+
+## Demo runbook
+
+1. `docker compose down -v` (clean DB) then `docker compose up --build`
+2. Open http://localhost:5173 → import the PDF in "Read the client's letter"
+3. "Set up everything from this letter" → review the plan
+4. Demo policy rejection: edit a command dangerously (e.g. `nmap -oN out.txt ...` or
+   retarget to google.com) → approve → refused with a clear reason
+5. Approve & execute each step → audit trail fills with real output
+6. Analyze results → scored findings → Generate report (HTML, cites the engagement)
