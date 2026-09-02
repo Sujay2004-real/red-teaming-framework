@@ -405,6 +405,10 @@ def get_settings(db: Session = Depends(get_db)):
         # carries the API key or the proxy password back out, encrypted or not.
         'gemini_configured': bool(stored_key),
         'proxy_configured': bool(row.proxy_url),
+        # The username reloads into the form but its password never does, so
+        # without this flag a stored password is indistinguishable from a
+        # never-entered one once the page reloads.
+        'proxy_password_configured': bool(decrypt_secret(row.proxy_password)),
         # A key with no endpoint or model cannot reach a provider, so the UI is
         # told the difference between "configured" and "partly filled in".
         'provider_ready': bool(stored_key and base_url and model_name),

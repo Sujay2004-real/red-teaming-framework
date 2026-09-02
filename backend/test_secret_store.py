@@ -121,6 +121,9 @@ def test_get_settings_never_exposes_secret_fields(client, key):
     assert 'gemini_api_key' not in payload
     assert 'proxy_password' not in payload
     assert API_KEY not in client.get('/settings').text
+    # The password never reloads into the form, so the UI needs a boolean to
+    # tell "stored" from "never entered" after a page reload.
+    assert payload['proxy_password_configured'] is True
 
 
 def test_blank_secret_submission_keeps_the_stored_value(client, key):
