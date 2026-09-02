@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Generates the fictional client 'Request for Security Assessment Services' PDF."""
+"""Generates the fictional client 'Request for Security Assessment Services' PDF.
+
+Phase-2 deep-assessment edition: same fictional client, escalated engagement.
+The letter is deliberately parser-compatible (label/value tables, numbered
+objectives, both restriction sentence shapes) while demanding far deeper
+coverage than the original request.
+"""
 from datetime import date
 from pathlib import Path
 
@@ -9,16 +15,16 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (BaseDocTemplate, Frame, KeepTogether,
-                                PageTemplate, Paragraph, Spacer, Table,
-                                TableStyle)
+                                 PageTemplate, Paragraph, Spacer, Table,
+                                 TableStyle)
 
 OUT = Path(__file__).with_name('JuiceBox_Security_Assessment_Request.pdf')
 
 COMPANY = 'JuiceBox Retail Pvt. Ltd.'
 ADDRESS = '4th Floor, Orion Tech Park, Whitefield, Bengaluru, Karnataka 560066'
-ENGAGEMENT_REF = 'JB/SEC/2026/014'
-ENGAGEMENT_DATE = date(2026, 9, 1)
-TEST_WINDOW = '02 September 2026 to 06 September 2026 (both days inclusive)'
+ENGAGEMENT_REF = 'JB/SEC/2026/021'
+ENGAGEMENT_DATE = date(2026, 9, 2)
+TEST_WINDOW = '04 September 2026 to 10 September 2026 (both days inclusive)'
 PRIMARY_CONTACT = 'Ananya Rao — Chief Information Security Officer'
 PRIMARY_EMAIL = 'ciso.office@juiceboxretail.example'
 PRIMARY_PHONE = '+91 80 4XXX 2100 (ext. 401)'
@@ -104,7 +110,8 @@ def on_page(canvas, doc):
 doc = BaseDocTemplate(str(OUT), pagesize=A4, leftMargin=18 * mm,
                       rightMargin=18 * mm, topMargin=16 * mm,
                       bottomMargin=18 * mm,
-                      title='Request for Security Assessment Services', author=COMPANY)
+                      title='Request for Security Assessment Services — Deep Assessment',
+                      author=COMPANY)
 frame = Frame(18 * mm, 18 * mm, 174 * mm, 264 * mm, id='main')
 doc.addPageTemplates([PageTemplate(id='page', frames=[frame], onPage=on_page)])
 
@@ -131,23 +138,30 @@ story.append(Paragraph('1. Cover letter from the client', h2))
 story.append(Paragraph(f'Dear {PROVIDER},', body))
 story.append(Paragraph(
     f'{COMPANY} ("JuiceBox", "the Company") is preparing to launch a new customer-facing '
-    'e-commerce storefront. Before the platform is exposed to production customers, the '
-    'Company wishes to obtain an independent, authorized security assessment of the '
-    'pre-release deployment, conducted in a controlled laboratory environment that mirrors '
-    'the intended production configuration.', body))
+    'e-commerce storefront. Under engagement JB/SEC/2026/014 your team performed the '
+    'initial pre-launch assessment of the release-candidate deployment. As launch '
+    'approaches, the Company now requires a substantially deeper second-pass '
+    'assessment of the same laboratory environment: full service and version '
+    'enumeration, a complete HTTP security-header audit, technology fingerprinting, '
+    'cookie and transport review, and rate-limited template-driven vulnerability '
+    'checks, all correlated into one prioritized report.', body))
 story.append(Paragraph(
-    'We request your team to perform a non-destructive external and web-application security '
-    'assessment of the assets identified in Section 3 of this document, strictly within the '
-    'authorized scope stated therein, during the test window stated above. We understand that '
-    'your assessment methodology is semi-autonomous: automated reconnaissance and scanning '
-    'steps are proposed by your framework and must be individually reviewed and approved by '
-    'your human operator before execution. This is acceptable to the Company, and we '
-    'specifically require that this human approval step remain in force for every command '
-    'issued against our assets.', body))
+    'We request your team to perform a non-destructive external and web-application '
+    'security assessment of the assets identified in Section 3 of this document, '
+    'strictly within the authorized scope stated therein, during the test window '
+    'stated above. We understand that your assessment methodology is semi-autonomous: '
+    'automated reconnaissance and scanning steps are proposed by your framework and '
+    'must be individually reviewed and approved by your human operator before '
+    'execution. This is acceptable to the Company, and we specifically require that '
+    'this human approval step remain in force for every command issued against our '
+    'assets. Given the depth requested, the Company also asks that the final report '
+    'quantify the coverage achieved relative to the manual effort an unaided tester '
+    'would have required, as described in Section 6.', body))
 story.append(Paragraph(
-    'All systems listed in Section 3 are owned or controlled by the Company. No third-party, '
-    'shared-hosting, or cloud-provider infrastructure is included in scope. Please sign and '
-    'return the authorization in Section 8 to confirm your acceptance of these terms.', body))
+    'All systems listed in Section 3 are owned or controlled by the Company. No '
+    'third-party, shared-hosting, or cloud-provider infrastructure is included in '
+    'scope. Please sign and return the authorization in Section 8 to confirm your '
+    'acceptance of these terms.', body))
 story.append(Paragraph(
     'Yours sincerely,<br/><br/><b>Ananya Rao</b><br/>Chief Information Security Officer<br/>'
     f'{COMPANY}', body))
@@ -158,8 +172,11 @@ story.append(Paragraph(
     'JuiceBox Retail operates a loyalty and retail platform serving approximately 240,000 '
     'registered customers. The pre-release storefront (internally named "Juice Shop") is a '
     'new Node.js-based e-commerce application scheduled to go live at the end of Q3 2026. '
-    'The Company is contractually obliged to its payment partners to evidence a pre-launch '
-    'vulnerability assessment. The assessment requested here is that evidence.', body))
+    'The initial assessment under engagement JB/SEC/2026/014 confirmed basic exposure '
+    'but was deliberately shallow. The Company is now contractually obliged to its '
+    'payment partners to evidence a deeper pre-launch vulnerability assessment '
+    'covering the full external attack surface. The assessment requested here is that '
+    'evidence.', body))
 story.append(Paragraph(
     'The Company additionally maintains an internal web-application security-training system '
     '(internally named "DVWA Lab") used by the IT team. A baseline assessment of this '
@@ -169,7 +186,7 @@ story.append(Paragraph(
 # ------------------------------------------------------------- scope
 story.append(Paragraph('3. Authorized scope of the assessment', h2))
 story.append(Paragraph(
-    '<b>3.1 Primary asset — pre-release storefront (in scope, full assessment)</b>', body))
+    '<b>3.1 Primary asset — pre-release storefront (in scope, deep assessment)</b>', body))
 story.append(Paragraph(
     'The following asset is the only production-relevant system authorized for this '
     'engagement. All testing activity must be directed exclusively at it.', body))
@@ -181,7 +198,10 @@ story.append(grid_table(
         ['Authorized scope identifiers', 'juice-shop, juice-shop:3000'],
         ['Technology', 'Node.js / Express web application, HTTP on TCP port 3000'],
         ['Asset criticality (client-declared, 0-100)',
-         '85 — customer-facing e-commerce platform'],
+         '90 — customer-facing e-commerce platform, weeks from launch'],
+        ['Assessment type',
+         'Deep external and web-application assessment (full framework toolset, '
+         'subject to Section 5.3)'],
         ['Environment',
          'Isolated laboratory deployment (Docker), mirrors release-candidate build'],
     ],
@@ -197,9 +217,9 @@ story.append(grid_table(
         ['Authorized scope identifiers', 'dvwa, dvwa:80'],
         ['Technology', 'Apache / PHP / MySQL training application, HTTP on TCP port 80'],
         ['Asset criticality (client-declared, 0-100)',
-         '40 — internal training system, no production data'],
+         '45 — internal training system, no production data'],
         ['Assessment type',
-         'Service discovery and HTTP header baseline only (see Section 5.3)'],
+         'Service discovery and HTTP header baseline only (see Section 5.4)'],
     ],
     [62 * mm, 112 * mm]))
 story.append(Spacer(1, 4))
@@ -230,18 +250,30 @@ story.append(Paragraph(
     'The Company requests that the assessment pursue the following objectives, in priority '
     'order:', body))
 for item in [
-    '<b>4.1 Service discovery:</b> identify the network services and versions exposed by the '
-    'authorized targets, using lightweight active discovery (e.g. nmap service version '
-    'detection restricted to the listed ports).',
-    '<b>4.2 Web-attack-surface inspection:</b> enumerate HTTP response headers, disclosed '
-    'technology fingerprints, transport-security configuration, and missing browser security '
-    'headers.',
-    '<b>4.3 Known-vulnerability identification:</b> where safe template-driven checks exist '
-    '(e.g. nuclei with non-invasive templates), identify publicly documented weaknesses in '
-    'the web tier without exploiting them.',
-    '<b>4.4 Findings correlation and prioritization:</b> consolidate all findings, remove '
-    'duplicates, and rank them by severity, risk, business criticality and confidence, so '
-    'that the Company can schedule remediation before launch.',
+    '<b>4.1 Service and version discovery:</b> identify every network service and '
+    'software version exposed by the authorized targets, using lightweight active '
+    'discovery (nmap service version detection restricted to the listed ports).',
+    '<b>4.2 HTTP security-header audit:</b> enumerate the complete set of HTTP response '
+    'headers on each web target and report every missing or weakly configured browser '
+    'security header (Content-Security-Policy, Strict-Transport-Security where '
+    'applicable, X-Frame-Options, X-Content-Type-Options and Referrer-Policy) together '
+    'with a per-header explanation and remediation.',
+    '<b>4.3 Technology fingerprinting:</b> identify disclosed technology fingerprints '
+    '(server banner, framework markers, X-Powered-By style headers) that would assist '
+    'an attacker in selecting exploits, using automated fingerprinting tools.',
+    '<b>4.4 Cookie and transport review:</b> review the security flags of any session '
+    'cookie set by the storefront, and characterise the transport-security '
+    'configuration of each web target where a TLS endpoint exists.',
+    '<b>4.5 Rate-limited known-vulnerability checks:</b> where safe template-driven '
+    'checks exist (e.g. nuclei with non-invasive templates), identify publicly '
+    'documented weaknesses in the web tier without exploiting them, strictly '
+    'rate-limited as required by Section 5.1.',
+    '<b>4.6 DNS and name characterization:</b> resolve and characterise the name '
+    'resolution of the authorized scope identifiers, to confirm addressing and support '
+    'exposure analysis.',
+    '<b>4.7 Findings correlation and prioritization:</b> consolidate all findings, '
+    'remove duplicates, and rank them by severity, risk, business criticality and '
+    'confidence, so that the Company can schedule remediation before launch.',
 ]:
     story.append(bullet(item))
 
@@ -256,6 +288,8 @@ for item in [
     'fully automated execution.',
     'All activity must remain within the authorized scope identifiers listed in Section 3. '
     'Commands whose target resolves outside this scope must be refused by the framework.',
+    'All active scanning must be rate-limited to a maximum of 30 packets or requests per '
+    'second (e.g. nmap --max-rate 30, nuclei -rl 30), so that no target is saturated.',
     'The assessment team must keep a complete audit trail of every approved command, its '
     'output, exit status, duration, and the fact of human approval. This audit trail forms '
     'part of the required deliverables.',
@@ -279,15 +313,24 @@ for item in [
     story.append(bullet(item))
 
 story.append(Paragraph(
-    '<b>5.3 Technique restrictions specific to the DVWA training system (Section 3.2)</b>',
+    '<b>5.3 Technique restrictions specific to the storefront (Section 3.1)</b>',
+    body))
+story.append(Paragraph(
+    'The laboratory network is shared with other assessment teams during this window. To '
+    'keep packet volume low, traceroute must not be run against the storefront. All '
+    'other discovery and inspection tools enumerated by the assessment framework remain '
+    'authorized for this target, subject to the rate limit in Section 5.1.', body))
+
+story.append(Paragraph(
+    '<b>5.4 Technique restrictions specific to the DVWA training system (Section 3.2)</b>',
     body))
 story.append(Paragraph(
     'Because the training system contains intentionally vulnerable code, only service '
-    'discovery (nmap -sV on TCP port 80) and HTTP header inspection (curl -I, whatweb) are '
-    'authorized against it. Template-driven vulnerability checks (e.g. nuclei) must not be '
-    'run against the DVWA lab.', body))
+    'discovery (nmap) and HTTP header inspection (curl, whatweb) are authorized against '
+    'it. Template-driven vulnerability checks (e.g. nuclei) and every other tool must '
+    'not be run against the DVWA lab.', body))
 
-story.append(Paragraph('<b>5.4 Incidents and escalation</b>', body))
+story.append(Paragraph('<b>5.5 Incidents and escalation</b>', body))
 story.append(Paragraph(
     'If any activity causes an unintended service disruption, or if the team discovers '
     'evidence of an actual security compromise, all testing must stop immediately and the '
@@ -302,18 +345,26 @@ story.append(grid_table(
     [
         ['1', 'Assessment report (HTML) covering both authorized targets, produced by the '
               'framework\'s reporting module.',
-         'Contains prioritized findings with severity, risk score, priority score, '
-         'confidence, evidence, remediation and the client-declared asset criticality.'],
+         'Contains an executive summary, the analysis mode used, and prioritized '
+         'findings with severity, risk score, priority score, confidence, affected '
+         'endpoint, scoring breakdown, evidence, remediation and the client-declared '
+         'asset criticality.'],
         ['2', 'Complete execution audit trail.',
-         'Every approved command recorded with its raw output, exit code, duration, attempt '
-         'count and human-approval record.'],
+         'Every approved command recorded with its raw output, exit code, duration, '
+         'attempt count and human-approval record.'],
         ['3', 'Policy-refusal evidence.',
-         'Evidence that out-of-scope and prohibited commands were refused before execution, '
-         'with the policy reason shown.'],
+         'Evidence that out-of-scope and prohibited commands were refused before '
+         'execution, with the policy reason shown.'],
         ['4', 'Remediation summary for the pre-release storefront.',
-         'Each finding mapped to a concrete remediation action, ordered by priority score.'],
+         'Each finding mapped to a concrete remediation action, ordered by priority '
+         'score.'],
+        ['5', 'Automation-benefit statement.',
+         'A statement of the number of commands executed, the wall-clock duration of '
+         'the automated assessment, and the equivalent manual effort an unaided tester '
+         'would require to reach the same coverage, so the Company can evaluate the '
+         'efficiency of the semi-autonomous methodology.'],
     ],
-    [10 * mm, 82 * mm, 82 * mm]))
+    [10 * mm, 76 * mm, 88 * mm]))
 story.append(Paragraph(
     'The Company requires that the final report clearly state the mode of analysis used '
     '(automated AI-provider analysis or the framework\'s deterministic local analyzer), so '

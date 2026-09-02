@@ -12,7 +12,7 @@ from database import AppSettings, Assessment, Finding, Target, ToolExecution, ge
 from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
 from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent
 from modules.engagement_parser import parse_engagement
-from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor
+from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor, live_registry
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
 from modules.reporter import reporter
@@ -48,7 +48,7 @@ def serialize_target(row):
 
 
 def serialize_assessment(row):
-    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'created_at': row.created_at, 'completed_at': row.completed_at}
+    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'created_at': row.created_at, 'completed_at': row.completed_at}
 
 
 def execution_is_stale(execution):
@@ -73,7 +73,17 @@ def serialize_execution(row):
 
 
 def serialize_finding(row):
-    return {'id': row.id, 'title': row.title, 'description': row.description, 'severity': row.severity, 'evidence': row.evidence, 'remediation': row.remediation, 'risk_score': row.risk_score, 'priority_score': row.priority_score, 'confidence_score': row.confidence_score, 'source_tools': row.source_tools}
+    # The scoring drivers and location fields are persisted so the UI and the
+    # report can explain *why* a finding scored the way it did and where it
+    # lives, instead of making the reader re-derive both from raw evidence.
+    return {
+        'id': row.id, 'title': row.title, 'description': row.description, 'severity': row.severity,
+        'evidence': row.evidence, 'remediation': row.remediation,
+        'risk_score': row.risk_score, 'priority_score': row.priority_score, 'confidence_score': row.confidence_score,
+        'endpoint': row.endpoint or '', 'parameter': row.parameter or '',
+        'exploitability': row.exploitability or 3, 'impact': row.impact or 3, 'exposure': row.exposure or 3,
+        'source_tools': row.source_tools,
+    }
 
 
 def get_settings_row(db):
@@ -587,11 +597,16 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     db.refresh(execution)
     execution_id = execution.id
 
+    # Registered before the command starts so the UI terminal can attach and
+    # stream from the first chunk; removed whatever way the command ends.
+    live_registry.start(execution_id, step['command'])
     try:
-        result = await executor.execute_command(step['tool'], step['command'], proxy_environment(settings))
+        result = await executor.execute_command(step['tool'], step['command'], proxy_environment(settings), execution_id=execution_id)
     except BaseException as exc:
         record_abandoned_execution(db, execution_id, f'Execution did not complete: {type(exc).__name__}: {exc}'.strip())
         raise
+    finally:
+        live_registry.finish(execution_id)
 
     execution.stdout = result['stdout']
     execution.stderr = result['stderr']
@@ -599,7 +614,34 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     execution.duration_ms = result['duration_ms']
     status = refresh_assessment_status(db, row, extra_executed={payload.step_index})
     db.commit()
-    return {'message': 'Execution finished', 'policy': reason, 'capability': capability, 'status': status, 'result': result}
+    return {'message': 'Execution finished', 'policy': reason, 'capability': capability, 'status': status, 'result': result, 'execution_id': execution_id}
+
+
+@app.get('/assessments/{assessment_id}/executions/{execution_id}/live')
+def get_live_execution(assessment_id: int, execution_id: int, db: Session = Depends(get_db)):
+    """Partial output for a command that is still running.
+
+    Lets the UI terminal stream scanner output while it is produced instead of
+    presenting a locked button until the command finishes. Scoped to the
+    assessment so only the session that owns the run can watch it.
+    """
+    row = db.query(ToolExecution).filter(ToolExecution.id == execution_id, ToolExecution.assessment_id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Execution not found')
+    snapshot = live_registry.snapshot(execution_id)
+    if snapshot is not None:
+        return {
+            'execution_id': execution_id, 'running': True, 'command': snapshot['command'],
+            'output': snapshot['output'], 'return_code': None,
+        }
+    # Not in the registry: either it finished between the UI's polls (the
+    # caller re-reads the audit row) or it never started. Distinguish using
+    # the database, which is the record of truth.
+    return {
+        'execution_id': execution_id, 'running': False, 'command': row.command,
+        'output': row.stdout or '', 'return_code': row.return_code,
+        'stderr': row.stderr or '',
+    }
 
 
 @app.post('/assessments/{assessment_id}/analyze')
@@ -628,8 +670,20 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     )
     invalidate_analysis(db, assessment_id)
     for item in analyzed:
-        db.add(Finding(assessment_id=assessment_id, fingerprint=item['fingerprint'], title=item.get('title', 'Unknown finding'), description=item.get('description', ''), severity=item['severity'], evidence=item.get('evidence', ''), remediation=item.get('remediation', ''), risk_score=item['risk_score'], priority_score=item['priority_score'], confidence_score=item['confidence_score'], source_tools=item.get('source_tools', [])))
+        db.add(Finding(
+            assessment_id=assessment_id, fingerprint=item['fingerprint'],
+            title=item.get('title', 'Unknown finding'), description=item.get('description', ''),
+            severity=item['severity'], evidence=item.get('evidence', ''),
+            remediation=item.get('remediation', ''),
+            risk_score=item['risk_score'], priority_score=item['priority_score'],
+            confidence_score=item['confidence_score'],
+            endpoint=item.get('endpoint', ''), parameter=item.get('parameter', ''),
+            exploitability=item.get('exploitability', 3), impact=item.get('impact', 3),
+            exposure=item.get('exposure', 3),
+            source_tools=item.get('source_tools', []),
+        ))
     row.status = 'analyzed'
+    row.analysis_mode = analyzer_mode
     row.completed_at = utcnow()
     db.commit()
     failed = [execution.step_index for execution in executions if execution.return_code != 0]
@@ -657,6 +711,7 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
         [serialize_execution(execution) for execution in executions],
         str(path),
         engagement_brief=row.engagement_brief,
+        analysis_mode=row.analysis_mode,
     )
     row.status = 'reported'
     db.commit()

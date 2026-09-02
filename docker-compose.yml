@@ -19,9 +19,9 @@ services:
     volumes:
       - ./backend:/app
       - data_volume:/app/data
-    depends_on:
-      - juice-shop
-      - dvwa
+    # No depends_on the lab targets: they live behind the "lab" profile and
+    # the backend starts fine without them (a real engagement has its own
+    # authorized targets on the client network).
 
   frontend:
     build:
@@ -38,13 +38,21 @@ services:
       # the UI from another device on the network.
       - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
 
+  # The deliberately vulnerable lab targets are behind the "lab" profile so a
+  # real engagement can run the assessment toolkit alone:
+  #   docker compose up                    -> backend + frontend only (toolkit)
+  #   docker compose --profile lab up      -> toolkit + Juice Shop + DVWA (demo)
+  # On Linux, uncomment network_mode on the backend to put the scanners
+  # directly on the host network for accurate LAN subnet scans.
   juice-shop:
     image: docker.io/bkimminich/juice-shop:latest
+    profiles: ["lab"]
     ports:
       - "3000:3000"
 
   dvwa:
     image: ghcr.io/digininja/dvwa:latest
+    profiles: ["lab"]
     ports:
       - "8080:80"
 

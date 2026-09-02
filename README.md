@@ -181,10 +181,14 @@ vulnerable lab targets)
 From the project root:
 
 ```bash
+# demo stack: the toolkit plus the two deliberately vulnerable lab targets
+docker compose --profile lab up --build
+
+# assessor's toolkit only: backend + frontend, for real authorized targets
 docker compose up --build
 ```
 
-This starts four services:
+The demo stack starts four services:
 
 | Service | URL | Purpose |
 |---------|-----|---------|
@@ -192,6 +196,11 @@ This starts four services:
 | Backend API | http://localhost:8000 | FastAPI (docs at `/docs`) |
 | Juice Shop | http://localhost:3000 | Vulnerable web app (lab target) |
 | DVWA | http://localhost:8080 | Vulnerable web app (lab target) |
+
+> The lab targets are behind the `lab` profile, so plain `docker compose up` runs the
+> **assessment toolkit alone** (backend + frontend — exactly what you would run
+> on an assessor's laptop against real, authorized targets). See
+> [Assessing real-world targets](#assessing-real-world-targets).
 
 The SQLite database and the credential key persist in a named Docker volume, so they
 survive container rebuilds.
@@ -289,6 +298,54 @@ framework runs entirely on its deterministic planner and analyzer.
 
 ---
 
+## Assessing real-world targets
+
+The framework is **not limited to the Docker lab targets**. The scanners run
+inside the backend container, which reaches the outside world through the
+host's network — so any device your machine can reach (a LAN host, a VPN
+segment, an internet-facing system you are authorized to test) is a valid
+target:
+
+1. Run the toolkit: `docker compose up` (no lab profile needed).
+2. Register the real target in **Add authorized target** (host or host:port,
+   scopes, criticality) — or import an engagement letter that names it; the
+   parser handles any hostname or IP.
+3. From there the flow is identical: plan → review → approve each command →
+   analysis → report. The policy engine, per-step human approval, rate limits,
+   audit trail, scoring and reporting all apply exactly the same.
+
+**Network notes:**
+- The backend container must be able to reach the target — test with
+  `docker compose exec backend curl -I http://target:port` if unsure.
+- Private DNS names only resolve if your host's resolver knows them; use IPs
+  or public names when in doubt.
+- On Linux, `network_mode: host` on the backend service places the scanners
+  directly on the host network for accurate LAN subnet scans.
+- For a demo of "not-Docker-only": register `host.docker.internal` (your own
+  machine) as a target and approve one step against it — it is outside the
+  compose network and still fully governed.
+
+**Honest scope statement:** this is a *non-destructive scanning and governance*
+framework — reconnaissance, fingerprinting, header/TLS audits and
+template-driven checks, each behind an allowlist policy and a human approval.
+It is deliberately **not** an exploitation framework; that restraint is what
+makes it safe to point at client systems.
+
+## Manual effort vs. the framework (demo comparison)
+
+The default deterministic plan for one web target runs **7 commands**
+(service/version discovery, path tracing, name resolution, full header capture,
+technology fingerprinting, TLS audit, rate-limited template checks). A
+competent tester doing the same coverage by hand would:
+
+| Manual tester | The framework |
+|---|---|
+| Recall and type 15–20 commands with the right flags, per target | Drafts all 7 policy-checked steps in seconds, per target |
+| Watch each command's output and note findings as they scroll past | Streams every output into a live terminal and persists all of it |
+| Re-read outputs, dedupe findings across tools, look up remediations | Correlates, dedupes, scores and explains every finding automatically |
+| Spend 1–3 hours writing the report | Generates a cited, prioritized HTML report in seconds |
+| Nothing prevents a typo hitting an out-of-scope host | Policy engine refuses out-of-scope and prohibited commands before they run |
+
 ## Using the application
 
 1. **(Optional) Configure an AI provider** in the Configuration panel. Skip this to run in
@@ -310,8 +367,10 @@ for testing the import flow. (`make_client_request_pdf.py` regenerates it.)
 
 ## Testing
 
-The backend has a pytest suite covering the analyzer, planner, policy engine, secret store,
-request models, engagement parser, and the end-to-end API workflow.
+The backend has a pytest suite (99 tests) covering the analyzer, planner, policy engine,
+secret store, request models, engagement parser, and the end-to-end API workflow. The
+analyzer and planner tests are written against output the scanners really produced in the
+Docker stack — escape codes, tentative nmap matches and all.
 
 ```bash
 cd backend
@@ -323,6 +382,14 @@ python -m pytest -q
 
 `pytest.ini` sets `testpaths = test_*.py` so pytest never parses the `[IMPLEMENTATION]`
 segment of the project path as parametrization syntax.
+
+There is also a live end-to-end smoke run against a running stack — it imports the letter,
+registers the target, drafts the plan, executes every step, analyzes and reports:
+
+```bash
+# with the stack up (docker compose --profile lab up)
+backend\venv\Scripts\python.exe backend\smoke_e2e.py
+```
 
 ---
 

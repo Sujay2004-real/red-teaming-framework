@@ -14,8 +14,60 @@ PROVIDER = {'api_key': 'test-key', 'base_url': 'https://provider.example/v1', 'm
 def test_default_plan_separates_host_and_web_port():
     plan = PlannerAgent().default_plan('juice-shop:3000')
 
-    assert plan[0]['command'] == 'nmap -sV juice-shop'
-    assert plan[1]['command'] == 'curl -I http://juice-shop:3000'
+    commands = {step['tool']: step['command'] for step in plan}
+    # Name resolvers get the bare host and learn the port another way; anything
+    # that parses host:port itself keeps it, and the web templates add the
+    # http:// scheme exactly once (a re-prefixed target once produced
+    # http://http://host).
+    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -p 3000 juice-shop'
+    assert commands['traceroute'] == 'traceroute juice-shop'
+    assert commands['dig'] == 'dig +short juice-shop'
+    assert commands['curl'] == 'curl -sSI http://juice-shop:3000'
+    assert commands['whatweb'] == 'whatweb -a 3 --color=never http://juice-shop:3000'
+    assert commands['sslscan'] == 'sslscan --no-colour juice-shop:3000'
+    assert commands['nuclei'] == ('nuclei -u http://juice-shop:3000 '
+                                  '-tags cve,exposure,misconfig '
+                                  '-severity medium,high,critical -rl 30 -nc -stats -duc -silent')
+    # The default plan is deep: a manual tester would need many more commands
+    # and hours of correlation to reach the same coverage.
+    assert len(plan) >= 7
+
+
+def test_default_plan_commands_all_pass_policy_review():
+    """A default step that policy would refuse is a plan that cannot be run."""
+    engine = PolicyEngine()
+
+    for step in PlannerAgent().default_plan('juice-shop:3000'):
+        valid, reason, _ = engine.validate_command(
+            step['command'], ['juice-shop:3000'], expected_tool=step['tool'])
+        assert valid, f"{step['command']} rejected: {reason}"
+
+
+# The bug this covers: 'nmap juice-shop:3000' and 'dig +short juice-shop:3000'
+# fail with "Failed to resolve" *and still exit 0*, so the audit trail showed
+# six green steps that had scanned nothing at all.
+def test_name_resolving_tools_never_receive_an_endpoint():
+    plan = PlannerAgent().default_plan('juice-shop:3000')
+    commands = {step['tool']: step['command'] for step in plan}
+
+    assert ':3000' not in commands['dig']
+    assert ':3000' not in commands['traceroute']
+    # nmap keeps the port the letter named, as a flag it can actually use.
+    assert commands['nmap'].endswith('-p 3000 juice-shop')
+
+
+def test_default_plan_without_a_port_scans_the_default_range():
+    commands = {step['tool']: step['command'] for step in PlannerAgent().default_plan('example.test')}
+
+    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 example.test'
+    assert commands['curl'] == 'curl -sSI http://example.test'
+
+
+def test_default_plan_accepts_a_url_shaped_target():
+    commands = {step['tool']: step['command'] for step in PlannerAgent().default_plan('http://dvwa:8080/login')}
+
+    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -p 8080 dvwa'
+    assert commands['curl'] == 'curl -sSI http://dvwa:8080'
 
 
 def test_ai_plan_filters_mismatched_declared_tool():

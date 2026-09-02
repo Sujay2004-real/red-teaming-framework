@@ -1417,3 +1417,94 @@ footer {
         animation: none !important
     }
 }
+
+/* Live execution terminal */
+.live-terminal {
+    border: 1px solid #1d2a36;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 10px;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, .35)
+}
+
+.terminal-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0d131b;
+    border-bottom: 1px solid #1d2a36;
+    padding: 7px 12px;
+    font-size: 11.5px;
+    color: #8fa1b2
+}
+
+.terminal-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #f0a13b;
+    animation: pulse 1.4s ease infinite
+}
+
+.terminal-title {
+    font-weight: 700;
+    color: #dce6ed
+}
+
+.terminal-status {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent)
+}
+
+.terminal-body {
+    margin: 0;
+    background: #070c11;
+    color: #a8e6d5;
+    padding: 12px 14px;
+    min-height: 120px;
+    max-height: 260px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.5
+}
+
+.terminal-prompt {
+    color: #62dab9;
+    font-weight: 700
+}
+
+/* Finding detail cards + analysis mode */
+.finding-loc {
+    font-size: 12px;
+    color: #7cb8ef;
+    font-family: Consolas, monospace;
+    margin: 2px 0 6px
+}
+
+.score-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0
+}
+
+.score-chips span {
+    font-size: 10.5px;
+    background: #0f1d24;
+    border: 1px solid #23303d;
+    border-radius: 10px;
+    padding: 2px 8px;
+    color: #9aabba
+}
+
+.analysis-mode {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    font-style: italic
+}

@@ -1,1 +1,151 @@
-﻿<!doctype html><html><head><meta charset="utf-8"><title>Security Assessment - {{ target }}</title><style>body{font:15px/1.55 Inter,Segoe UI,sans-serif;color:#18202a;max-width:1050px;margin:40px auto;padding:0 24px}h1{font-size:32px}h2{margin-top:36px;border-bottom:1px solid #d9e0e8;padding-bottom:8px}.summary,.finding,.execution{border:1px solid #d9e0e8;border-radius:10px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{background:#f4f7fa;padding:14px;border-radius:8px}.severity{font-weight:700}.Critical{color:#b42318}.High{color:#d92d20}.Medium{color:#b54708}.Low{color:#175cd3}pre{background:#101828;color:#eaecf0;padding:14px;border-radius:8px;overflow:auto;white-space:pre-wrap}</style></head><body><h1>Security Assessment Report</h1><div class="summary"><b>Target:</b> {{ target }}<br><b>Objective:</b> {{ objective }}<br><b>Total findings:</b> {{ total_findings }}</div>{% if engagement.client_name or engagement.engagement_ref or engagement.test_window %}<div class="summary"><b>Engagement:</b> {% if engagement.client_name %}{{ engagement.client_name }}{% endif %}{% if engagement.engagement_ref %} · ref {{ engagement.engagement_ref }}{% endif %}{% if engagement.test_window %} · test window {{ engagement.test_window }}{% endif %}{% if engagement.objectives %}<br><b>Client objectives:</b><ul>{% for o in engagement.objectives %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}{% if engagement.out_of_scope %}<b>Out of scope:</b> {{ engagement.out_of_scope|join(', ') }}{% endif %}{% if engagement.prohibited %}<br><b>Prohibited techniques:</b> {{ engagement.prohibited|join(', ') }}{% endif %}</div>{% endif %}<div class="grid">{% for level,count in severity_counts.items() %}<div class="metric"><span class="severity {{level}}">{{level}}</span><br>{{count}}</div>{% endfor %}</div><h2>Prioritized findings</h2>{% if not findings %}<p>No findings were identified.</p>{% endif %}{% for f in findings %}<div class="finding"><h3>{{f.title}}</h3><p><span class="severity {{f.severity}}">{{f.severity}}</span> · Risk {{f.risk_score}}/125 · Priority {{f.priority_score}}/100 · Confidence {{f.confidence_score}}%</p><p>{{f.description}}</p><b>Evidence</b><pre>{{f.evidence}}</pre><b>Remediation</b><p>{{f.remediation}}</p></div>{% endfor %}<h2>Audit trail</h2>{% for e in executions %}<div class="execution"><b>{{e.tool_name}}</b> · {% if e.return_code is none %}no exit status recorded{% else %}exit {{e.return_code}}{% endif %} · {{e.duration_ms or 0}} ms<br><code>{{e.command}}</code></div>{% endfor %}</body></html>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Security Assessment — {{ target }}</title>
+<style>
+:root{--ink:#18202a;--muted:#5a6472;--line:#d9e0e8;--accent:#0b6e69;--navy:#1f3864}
+*{box-sizing:border-box}
+body{font:15px/1.55 'Inter','Segoe UI',Arial,sans-serif;color:var(--ink);max-width:1050px;margin:40px auto;padding:0 24px}
+h1{font-size:30px;margin-bottom:4px}
+h2{margin-top:38px;border-bottom:1px solid var(--line);padding-bottom:8px;font-size:20px;color:var(--navy)}
+h3{margin:0 0 6px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+.summary,.finding,.execution{border:1px solid var(--line);border-radius:10px;padding:18px;margin:14px 0}
+.summary p{margin:6px 0}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}
+.metric{background:#f4f7fa;padding:14px;border-radius:8px;text-align:center}
+.metric .n{display:block;font-size:26px;font-weight:800;color:var(--navy)}
+.metric .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.sevbar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#eef2f6;margin:10px 0}
+.sevbar div{height:100%}
+.sev-Critical{background:#b42318}.sev-High{background:#d92d20}.sev-Medium{background:#b54708}.sev-Low{background:#175cd3}
+.severity{font-weight:700}
+.Critical{color:#b42318}.High{color:#d92d20}.Medium{color:#b54708}.Low{color:#175cd3}
+.badge{display:inline-block;font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px;background:#edf3f6;color:#31404d;text-transform:uppercase;letter-spacing:.4px;margin-left:8px;vertical-align:middle}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chip{font-size:11.5px;background:#f1f5f8;border:1px solid var(--line);border-radius:12px;padding:3px 9px;color:#3d4c5a}
+.chip b{color:var(--navy)}
+pre{background:#101828;color:#eaecf0;padding:14px;border-radius:8px;overflow:auto;white-space:pre-wrap;font-size:12.5px}
+.meta{color:var(--muted);font-size:13px;margin:4px 0}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+th{background:var(--navy);color:#fff;text-align:left;padding:9px 10px}
+td{border-bottom:1px solid var(--line);padding:9px 10px;vertical-align:top}
+tr:nth-child(even) td{background:#f7fafc}
+.impact-line{height:8px;border-radius:4px;background:#e6ebf0;overflow:hidden;width:120px}
+.impact-line i{display:block;height:100%;background:var(--accent)}
+details{margin-top:8px}
+summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
+.execution pre{max-height:220px}
+.mode-note{background:#f0f7f6;border:1px solid #cfe5e3;border-radius:8px;padding:12px 14px;font-size:13.5px;margin:14px 0}
+.footer-note{color:var(--muted);font-size:12px;margin-top:36px;border-top:1px solid var(--line);padding-top:14px}
+@media print{
+  body{margin:0;max-width:none;font-size:11.5px}
+  h2{page-break-after:avoid}
+  .finding,.execution,.summary{page-break-inside:avoid;box-shadow:none}
+  details{open:true}
+  summary{display:none}
+  details>div,details>pre{display:block !important}
+  a{color:inherit;text-decoration:none}
+}
+</style>
+</head>
+<body>
+<h1>Security Assessment Report</h1>
+<div class="sub">Generated by the Red Team Control Center — human approval was required before every command.</div>
+
+<div class="summary">
+  <p><b>Target:</b> {{ target }}</p>
+  <p><b>Objective:</b> {{ objective }}</p>
+  <p><b>Total findings:</b> {{ total_findings }} · <b>Commands executed:</b> {{ executions|length }}</p>
+</div>
+
+{% if engagement.client_name or engagement.engagement_ref or engagement.test_window %}
+<div class="summary">
+  <b>Engagement</b>
+  {% if engagement.client_name %}<p><b>Client:</b> {{ engagement.client_name }}</p>{% endif %}
+  {% if engagement.engagement_ref %}<p><b>Reference:</b> {{ engagement.engagement_ref }}</p>{% endif %}
+  {% if engagement.test_window %}<p><b>Test window:</b> {{ engagement.test_window }}</p>{% endif %}
+  {% if engagement.objectives %}<p><b>Client objectives:</b></p><ul>{% for o in engagement.objectives %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}
+  {% if engagement.out_of_scope %}<p><b>Out of scope:</b> {{ engagement.out_of_scope|join(', ') }}</p>{% endif %}
+  {% if engagement.prohibited %}<p><b>Prohibited techniques:</b> {{ engagement.prohibited|join(', ') }}</p>{% endif %}
+</div>
+{% endif %}
+
+{% if analysis_mode %}
+<div class="mode-note"><b>Analysis mode:</b> {{ 'AI provider analysis (an external model correlated the scanner outputs)' if analysis_mode == 'ai-provider' else 'Deterministic local analyzer (per-tool parsers correlated the scanner outputs; no AI provider was involved)' }}. Findings should be weighed accordingly.</div>
+{% endif %}
+
+<h2>Executive summary</h2>
+<div class="grid">
+  <div class="metric"><span class="n">{{ total_findings }}</span><span class="l">Findings</span></div>
+  <div class="metric"><span class="n severity Critical">{{ severity_counts.Critical }}</span><span class="l">Critical</span></div>
+  <div class="metric"><span class="n severity High">{{ severity_counts.High }}</span><span class="l">High</span></div>
+  <div class="metric"><span class="n severity Medium">{{ severity_counts.Medium }}</span><span class="l">Medium</span></div>
+  <div class="metric"><span class="n severity Low">{{ severity_counts.Low }}</span><span class="l">Low</span></div>
+</div>
+{% if total_findings %}
+<div class="sevbar">
+  {% if severity_counts.Critical %}<div class="sev-Critical" style="width:{{ (severity_counts.Critical / total_findings * 100)|round(1) }}%"></div>{% endif %}
+  {% if severity_counts.High %}<div class="sev-High" style="width:{{ (severity_counts.High / total_findings * 100)|round(1) }}%"></div>{% endif %}
+  {% if severity_counts.Medium %}<div class="sev-Medium" style="width:{{ (severity_counts.Medium / total_findings * 100)|round(1) }}%"></div>{% endif %}
+  {% if severity_counts.Low %}<div class="sev-Low" style="width:{{ (severity_counts.Low / total_findings * 100)|round(1) }}%"></div>{% endif %}
+</div>
+{% endif %}
+<p class="meta">Priority score (0–100) blends severity (40%), exploitability (25%), asset criticality (20%) and analyzer confidence (15%). Risk score is exploitability × impact × exposure (max 125).</p>
+
+<h2>Remediation summary (ordered by priority)</h2>
+{% if findings %}
+<table>
+  <tr><th>#</th><th>Finding</th><th>Severity</th><th>Priority</th><th>Where</th><th>Reported by</th></tr>
+  {% for f in findings %}
+  <tr>
+    <td>{{ loop.index }}</td>
+    <td>{{ f.title }}</td>
+    <td><span class="severity {{f.severity}}">{{f.severity}}</span></td>
+    <td><b>{{f.priority_score}}</b></td>
+    <td>{{ f.endpoint or '—' }}</td>
+    <td>{{ f.source_tools|join(', ') }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No findings were identified.</p>
+{% endif %}
+
+<h2>Prioritized findings</h2>
+{% if not findings %}<p>No findings were identified.</p>{% endif %}
+{% for f in findings %}
+<div class="finding">
+  <h3>{{ f.title }}{% if f.parameter %} <span class="badge">param: {{ f.parameter }}</span>{% endif %}</h3>
+  <div class="chips">
+    <span class="chip"><span class="severity {{f.severity}}">{{f.severity}}</span></span>
+    <span class="chip">Risk <b>{{f.risk_score}}/125</b></span>
+    <span class="chip">Priority <b>{{f.priority_score}}/100</b></span>
+    <span class="chip">Confidence <b>{{f.confidence_score}}%</b></span>
+    {% if f.endpoint %}<span class="chip">{{ f.endpoint }}</span>{% endif %}
+    {% if f.source_tools %}<span class="chip">via {{ f.source_tools|join(', ') }}</span>{% endif %}
+  </div>
+  <p class="meta">Scoring: exploitability {{ f.exploitability }}/5 · impact {{ f.impact }}/5 · exposure {{ f.exposure }}/5</p>
+  <p>{{ f.description }}</p>
+  <details open><summary>Evidence</summary><pre>{{ f.evidence }}</pre></details>
+  <p><b>Remediation:</b> {{ f.remediation }}</p>
+</div>
+{% endfor %}
+
+<h2>Audit trail</h2>
+<p class="meta">Every command below was individually approved by the human operator before it ran. Output excerpts are shown; the full output is retained in the framework database.</p>
+{% for e in executions %}
+<div class="execution">
+  <b>{{ e.tool_name }}</b> · {% if e.return_code is none %}no exit status recorded{% else %}exit {{ e.return_code }}{% endif %} · {{ e.duration_ms or 0 }} ms · attempt {{ e.attempt or 1 }}<br>
+  <code>{{ e.command }}</code>
+  <details {% if not loop.index0 %}open{% endif %}><summary>Output</summary>
+    <pre>{{ e.stdout or 'No standard output returned.' }}</pre>
+    {% if e.stderr %}<pre>{{ e.stderr }}</pre>{% endif %}
+  </details>
+</div>
+{% endfor %}
+
+<div class="footer-note">This report was produced by a semi-autonomous framework: commands were proposed automatically, reviewed against an allowlist policy engine and scope rules, and executed only after explicit human approval. For authorized laboratory and contractually permitted engagements only.</div>
+</body>
+</html>

@@ -8,8 +8,18 @@ MAX_OUTPUT_CHARS = 200_000
 # Stop accumulating well before memory pressure, but keep draining the pipes so
 # a chatty scanner never blocks on a full buffer and stalls until the timeout.
 MAX_OUTPUT_BYTES = MAX_OUTPUT_CHARS * 4
-EXECUTION_TIMEOUT_SECONDS = 300
+# Measured, not guessed: the default plan's nuclei step needs 12,078 requests
+# across 5,242 templates against a single target — about 308 s at the letter's
+# mandated 30 req/s. A 300 s cap killed it at 99% complete, losing the last
+# templates' findings and stamping every nuclei run 'timed out'. 360 s leaves
+# headroom without making a hung scanner wait meaningfully longer.
+EXECUTION_TIMEOUT_SECONDS = 360
 READ_CHUNK_BYTES = 65_536
+# Live-terminal buffer: how much partial output an in-flight command keeps for
+# the UI to poll. Capped like the persisted stdout, but held only in memory
+# and dropped once the command finishes - the database row remains the
+# authoritative record for the audit trail.
+LIVE_BUFFER_CHARS = 200_000
 # Scanners inherit only what they need to run. Passing the whole parent
 # environment would hand GEMINI_API_KEY and DATABASE_URL to every subprocess.
 INHERITED_ENV_KEYS = (
@@ -18,7 +28,39 @@ INHERITED_ENV_KEYS = (
 )
 
 
-async def _drain(stream, chunks):
+class LiveRegistry:
+    """In-memory partial output for in-flight executions.
+
+    The execute endpoint registers an execution before its command starts, the
+    drain loop appends decoded chunks as they arrive, and the /live endpoint
+    reads them for the UI terminal. Entries are removed when the command
+    finishes (or is abandoned), so the registry only ever holds commands that
+    are genuinely still running.
+    """
+
+    def __init__(self):
+        self._streams = {}
+
+    def start(self, execution_id, command):
+        self._streams[execution_id] = {'command': command, 'output': '', 'done': False}
+
+    def append(self, execution_id, text):
+        entry = self._streams.get(execution_id)
+        if entry is not None:
+            entry['output'] = (entry['output'] + text)[-LIVE_BUFFER_CHARS:]
+
+    def finish(self, execution_id):
+        self._streams.pop(execution_id, None)
+
+    def snapshot(self, execution_id):
+        entry = self._streams.get(execution_id)
+        return dict(entry) if entry is not None else None
+
+
+live_registry = LiveRegistry()
+
+
+async def _drain(stream, chunks, execution_id=None):
     """Read a pipe to EOF, retaining at most MAX_OUTPUT_BYTES of it."""
     retained = 0
     while True:
@@ -28,6 +70,8 @@ async def _drain(stream, chunks):
         if retained < MAX_OUTPUT_BYTES:
             chunks.append(chunk[:MAX_OUTPUT_BYTES - retained])
             retained += len(chunk)
+        if execution_id is not None:
+            live_registry.append(execution_id, chunk.decode(errors='ignore'))
 
 
 def _truncate(chunks, label):
@@ -53,7 +97,7 @@ class Executor:
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
-    async def execute_command(self, tool, command, proxy_env=None):
+    async def execute_command(self, tool, command, proxy_env=None, execution_id=None):
         started = time.perf_counter()
         elapsed = lambda: round((time.perf_counter() - started) * 1000)
         stdout_chunks, stderr_chunks = [], []
@@ -70,8 +114,8 @@ class Executor:
                 **({'start_new_session': True} if os.name == 'posix' else {}),
             )
             readers = asyncio.gather(
-                _drain(process.stdout, stdout_chunks),
-                _drain(process.stderr, stderr_chunks),
+                _drain(process.stdout, stdout_chunks, execution_id),
+                _drain(process.stderr, stderr_chunks, execution_id),
                 process.wait(),
             )
             try:

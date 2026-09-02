@@ -36,7 +36,11 @@ CRITICALITY_RE = re.compile(r'^(\d{1,3})\b')
 NUMBERED_ITEM_RE = re.compile(r'^(\d+\.\d+)\s+(.*)$')
 # '5.3 Technique restrictions ...' style section headings.
 SECTION_HEADING_RE = re.compile(r'^\d+(\.\d+)?\.?\s+[A-Z]')
-BULLET_RE = re.compile(r'^[•·▪*]\s*')
+# reportlab's bullet glyph extracts through pypdf as '\x7f' (DEL) on some
+# builds and as the literal bullet characters on others; all spellings must
+# start a list item or the letter's bulleted sections parse as prose and
+# every objective disappears.
+BULLET_RE = re.compile(r'^[\u2022\u00b7\u25aa*\x7f]\s*')
 
 # Table row labels an RFP uses for one in-scope asset, mapped to target
 # fields. Labels are matched case-insensitively by prefix.
@@ -269,7 +273,11 @@ def _parse_objectives(lines):
 
 
 def _parse_bullet_block(lines, start_pattern, stop_patterns=()):
-    """Collect bullet lines after a heading until the next section heading."""
+    """Collect bullet lines after a heading until the next section heading.
+
+    Items start only on bullet lines: the section's own intro sentence is not
+    an item, however the parser's start pattern matches it.
+    """
     items, active = [], False
     for line in lines:
         if active and (SECTION_HEADING_RE.match(line) or any(p.search(line) for p in stop_patterns)):
@@ -278,10 +286,17 @@ def _parse_bullet_block(lines, start_pattern, stop_patterns=()):
             active = True
             continue
         if active:
+            # A non-bullet line only continues the previous item; it never
+            # starts one. This is what keeps the "The following are strictly
+            # out of scope. Any traffic..." intro out of the item list.
+            if not BULLET_RE.match(line):
+                if items and not _ends_sentence(items[-1]):
+                    items[-1] += ' ' + _strip_bullet(line)
+                continue
             item = _strip_bullet(line)
             if not item:
                 continue
-            if not items or BULLET_RE.match(line) or _ends_sentence(items[-1]):
+            if not items or _ends_sentence(items[-1]):
                 items.append(item)
             else:
                 items[-1] += ' ' + item

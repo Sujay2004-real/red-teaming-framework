@@ -24,12 +24,15 @@ const samePlan = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || [])
 const ALLOWED_UPLOAD_SUFFIXES = ['.txt', '.md', '.pdf', '.docx']
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 const fileSuffix = name => (name.match(/\.[^.]+$/) || [''])[0].toLowerCase()
-// Request budgets. The backend caps a scanner run at 300 s and AI provider
+// Request budgets. The backend caps a scanner run at 360 s and AI provider
 // calls at 60 s, so the browser gives up only after the server itself
 // certainly has, and `busy` can never wedge on a request that never answers.
 const REQUEST_TIMEOUT_MS = 75_000
-const EXECUTE_TIMEOUT_MS = 320_000
+const EXECUTE_TIMEOUT_MS = 400_000
 const HEALTH_POLL_MS = 10_000
+// How often the in-flight execution terminal polls the backend for new
+// output while a command runs.
+const LIVE_POLL_MS = 1_000
 
 // An objective drafted from the letter keeps the client's own framing: a
 // baseline-restricted target says so plainly, a full assessment carries the
@@ -80,6 +83,12 @@ function App() {
   // Set when a popup blocker swallowed the report tab; a plain link needs no
   // user gesture, so the report stays one click away.
   const [reportUrl, setReportUrl] = useState('')
+  // Live terminal: which execution is being streamed, and the output fetched
+  // so far. The command's real output scrolls in as the scanner produces it.
+  const [liveExec, setLiveExec] = useState(null)
+  // Elapsed seconds for the running command's status line, ticking locally
+  // between polls so the terminal never looks frozen.
+  const [liveElapsed, setLiveElapsed] = useState(0)
 
   const request = async (path, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
     // FormData bodies set their own multipart boundary; a JSON header on top
@@ -115,6 +124,29 @@ function App() {
   useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
   /* eslint-disable react-hooks/exhaustive-deps */
+  // Live terminal polling: while a step shows as still running in the audit
+  // trail, fetch its partial output every second and stop when the command
+  // finishes. Attaching by the audit row's execution id (rather than the
+  // execute response) means the terminal also works when a command was
+  // started before a page refresh.
+  useEffect(() => {
+    const running = selected?.executions?.find(e => !e.complete && e.step_index === runningStep)
+    if (runningStep === null || runningStep === undefined || !selected || !running) { return }
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const snap = await request(`/assessments/${selected.id}/executions/${running.id}/live`)
+        if (cancelled || !snap.running) return
+        setLiveExec({ id: running.id, command: snap.command, output: snap.output, running: true })
+        setLiveElapsed(prev => prev + 1)
+      } catch { /* poll failures are silent; the execute request reports errors */ }
+    }
+    tick()
+    const interval = setInterval(tick, LIVE_POLL_MS)
+    return () => { cancelled = true; clearInterval(interval) }
+     
+  }, [runningStep, selected?.id, selected?.executions?.length])
+
   // A dead backend turns every button into a silent no-op, so reachability is
   // polled on its own schedule and announced in a banner. Coming back online
   // triggers a refresh, because the UI's data is stale by the length of the
@@ -153,10 +185,10 @@ function App() {
   const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan }) }); await openAssessment(id); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
   // The assessment id is captured up front so switching assessments
   // mid-request cannot write one assessment's results into another, and the
-  // timeout exceeds the executor's own 300 s cap so the server always decides
+  // timeout exceeds the executor's own 360 s cap so the server always decides
   // how a command ends. runningStep lights the exact button that is
   // mid-flight, so a long command reads as progress rather than a dead UI.
-  const execute = index => { setRunningStep(index); run('executor', async () => { const id = selected.id; const d = await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true }) }, EXECUTE_TIMEOUT_MS); const r = d.result || {}; pushFeed(r.return_code === 0 ? `Step ${index + 1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index + 1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code === 0 ? 'ok' : 'warn'); await openAssessment(id); await refresh() }).finally(() => setRunningStep(null)) }
+  const execute = index => { setRunningStep(index); setLiveExec(null); setLiveElapsed(0); run('executor', async () => { const id = selected.id; const d = await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true }) }, EXECUTE_TIMEOUT_MS); const r = d.result || {}; pushFeed(r.return_code === 0 ? `Step ${index + 1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index + 1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code === 0 ? 'ok' : 'warn'); await openAssessment(id); await refresh() }).finally(() => setRunningStep(null)) }
   const analyze = () => run('analyst', async () => { const id = selected.id; const d = await request(`/assessments/${id}/analyze`, { method: 'POST' }); await openAssessment(id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count || 0} finding${(d.findings_count || 0) !== 1 ? 's' : ''} (${d.analyzer} mode).`, 'ok'); const failed = d.failed_steps || []; setNotice(failed.length ? `Analysis complete, but ${failed.length > 1 ? 'steps' : 'step'} ${failed.map(i => i + 1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
   const report = () => run('reporter', async () => { const id = selected.id; const d = await request(`/assessments/${id}/report`, { method: 'POST' }); const url = API + d.download_url; const opened = window.open(url, '_blank', 'noopener'); // A window.open that follows an await has lost its user gesture, so popup
   // blockers swallow it silently; a plain link needs no gesture, so the
@@ -382,6 +414,7 @@ function App() {
               const savedStep = selected.plan?.[i]
               const locked = planLocked || running
               const inFlight = runningStep === i
+              const execLive = inFlight && liveExec ? liveExec : null
               const label = inFlight ? 'Running…' : running ? 'Running...' : retryable ? 'Re-approve & retry' : executed ? 'Executed' : 'Approve & execute'
               const state = inFlight || running ? 'Execution in progress'
                 : executed && execution.return_code === 0 ? `Execution logged${execution.attempt > 1 ? ` (attempt ${execution.attempt})` : ''}`
@@ -389,6 +422,10 @@ function App() {
                     : planDirty ? 'Save the plan before approving'
                       : 'Awaiting explicit approval'
               return <div className={`step ${step.enabled === false ? 'disabled-step' : ''}`} key={i}>
+                {execLive && <div className="live-terminal" role="log" aria-live="polite">
+                  <div className="terminal-bar"><span className="terminal-dot" /><span className="terminal-title">{selectedTarget?.name || 'target'} — live</span><span className="terminal-status">{execLive.running ? `running · ${liveElapsed}s` : 'finishing…'}</span></div>
+                  <pre className="terminal-body"><span className="terminal-prompt">$ {step.command}</span>{'\n'}{execLive.output || 'connecting…'}{'\u2588'}</pre>
+                </div>}
                 <div className="step-head"><span className="step-number">{i + 1}</span>
                   <select value={step.tool} onChange={e => patchStep(i, 'tool', e.target.value)} disabled={locked}>
                     {!toolNames.has(step.tool) && <option value={step.tool}>{step.tool} (not permitted)</option>}
@@ -410,9 +447,9 @@ function App() {
             {!planLocked && planDirty && <small className="plan-note">Unsaved plan edits. Save the plan so approvals run the commands shown here.</small>}
           </section>
 
-          <section className="panel action-panel"><div><h2>Analysis & report</h2><p>Correlates outputs, removes duplicate findings, and calculates transparent risk and priority scores.</p><span className="action-status">{canAnalyze ? 'All enabled steps complete' : `${completedSteps.length}/${enabledSteps.length || 0} enabled steps complete${planDirty ? ' · unsaved plan edits' : ''}`}</span></div><div><button className="secondary" onClick={analyze} disabled={busy || !canAnalyze}>{agentBusy('analyst') ? 'Analyzing…' : 'Analyze results'}</button><button onClick={report} disabled={busy || !canReport}>{agentBusy('reporter') ? 'Writing the report…' : 'Generate report'}</button>{reportUrl && <a className="download-link report-fallback" href={reportUrl} target="_blank" rel="noreferrer">Your browser blocked the report tab — open it here</a>}{selected.status === 'reported' && <a className="download-link" href={`${API}/reports/${selected.id}`} target="_blank" rel="noreferrer">Download last report</a>}</div></section>
+          <section className="panel action-panel"><div><h2>Analysis & report</h2><p>Correlates outputs, removes duplicate findings, and calculates transparent risk and priority scores.</p><span className="action-status">{canAnalyze ? 'All enabled steps complete' : `${completedSteps.length}/${enabledSteps.length || 0} enabled steps complete${planDirty ? ' · unsaved plan edits' : ''}`}</span>{selected.analysis_mode && <span className="analysis-mode">Analyzed with: {selected.analysis_mode === 'ai-provider' ? 'AI provider' : 'deterministic local analyzer'}</span>}</div><div><button className="secondary" onClick={analyze} disabled={busy || !canAnalyze}>{agentBusy('analyst') ? 'Analyzing…' : 'Analyze results'}</button><button onClick={report} disabled={busy || !canReport}>{agentBusy('reporter') ? 'Writing the report…' : 'Generate report'}</button>{reportUrl && <a className="download-link report-fallback" href={reportUrl} target="_blank" rel="noreferrer">Your browser blocked the report tab — open it here</a>}{selected.status === 'reported' && <a className="download-link" href={`${API}/reports/${selected.id}`} target="_blank" rel="noreferrer">Download last report</a>}</div></section>
 
-          {!!selected.findings?.length && <section className="panel"><div className="panel-title"><h2>Prioritized findings</h2><span className="tag good">{selected.findings.length} correlated</span></div><div className="findings">{selected.findings.map(f => <article key={f.id}><div><span className={`severity ${f.severity}`}>{f.severity}</span><h3>{f.title}</h3><p>{f.description}</p>{!!f.source_tools?.length && <small>Reported by {f.source_tools.join(', ')}</small>}</div><div className="scores"><span><b>{f.priority_score}</b>Priority</span><span><b>{f.risk_score}</b>Risk / 125</span><span><b>{f.confidence_score}%</b>Confidence</span></div><details><summary>Evidence and remediation</summary><pre>{f.evidence}</pre><p><b>Fix:</b> {f.remediation}</p></details></article>)}</div></section>}
+          {!!selected.findings?.length && <section className="panel"><div className="panel-title"><h2>Prioritized findings</h2><span className="tag good">{selected.findings.length} correlated</span></div><div className="findings">{selected.findings.map(f => <article key={f.id}><div><span className={`severity ${f.severity}`}>{f.severity}</span><h3>{f.title}</h3>{(f.endpoint || f.parameter) && <div className="finding-loc">{f.endpoint}{f.parameter ? ` · param: ${f.parameter}` : ''}</div>}<p>{f.description}</p><div className="score-chips"><span>Exploit {f.exploitability || 3}/5</span><span>Impact {f.impact || 3}/5</span><span>Exposure {f.exposure || 3}/5</span></div>{!!f.source_tools?.length && <small>Reported by {f.source_tools.join(', ')}</small>}</div><div className="scores"><span><b>{f.priority_score}</b>Priority</span><span><b>{f.risk_score}</b>Risk / 125</span><span><b>{f.confidence_score}%</b>Confidence</span></div><details><summary>Evidence and remediation</summary><pre>{f.evidence}</pre><p><b>Fix:</b> {f.remediation}</p></details></article>)}</div></section>}
 
           {!!selected.executions?.length && <section className="panel"><h2>Execution audit trail</h2><div className="audit">{selected.executions.map(e => <details key={e.id}><summary><b>{e.tool_name}</b><code>{e.command}</code><span className={!e.complete ? 'muted' : e.return_code === 0 ? 'ok' : 'fail'}>{e.complete ? `exit ${e.return_code} · ${e.duration_ms} ms` : 'still running'}{e.attempt > 1 ? ` · attempt ${e.attempt}` : ''}</span></summary><pre>{e.stdout || 'No standard output returned.'}</pre>{!!e.stderr && <pre className="stderr">{e.stderr}</pre>}</details>)}</div></section>}
         </>}

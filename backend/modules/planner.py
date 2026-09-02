@@ -5,10 +5,50 @@ from urllib.parse import urlparse
 
 MAX_PLAN_STEPS = 50
 
+# The deterministic default plan. Every command below is legal for the
+# policy engine as written, so an unconfigured (or offline) provider yields a
+# deep, executable plan rather than two steps. Targets carrying client letter
+# restrictions still lose their restricted steps at plan time.
 DEFAULT_PLAN = [
-    {'tool': 'nmap', 'command': 'nmap -sV {target}', 'reason': 'Discover exposed ports and service versions.', 'enabled': True},
-    {'tool': 'curl', 'command': 'curl -I http://{target}', 'reason': 'Inspect HTTP response headers without modifying the target.', 'enabled': True},
+    {'tool': 'nmap', 'command': 'nmap -sV --version-light --max-rate 30 {ports}{target}',
+     'reason': 'Discover exposed ports and the software version behind each service.',
+     'enabled': True},
+    {'tool': 'traceroute', 'command': 'traceroute {target}',
+     'reason': 'Map the network path to the target to confirm adjacency and exposure.',
+     'enabled': True},
+    {'tool': 'dig', 'command': 'dig +short {target}',
+     'reason': 'Resolve the scope identifier to confirm addressing before active checks.',
+     'enabled': True},
+    {'tool': 'curl', 'command': 'curl -sSI http://{target}',
+     'reason': 'Capture full HTTP response headers for the security-header audit.',
+     'enabled': True},
+    # The colour switches matter for evidence, not looks: these tools emit ANSI
+    # escapes when their output is captured, and the escapes land in the middle
+    # of the very tokens the analyzer parses ('SSLv3 \x1b[32menabled').
+    {'tool': 'whatweb', 'command': 'whatweb -a 3 --color=never http://{target}',
+     'reason': 'Fingerprint the technology stack from banners and framework markers.',
+     'enabled': True},
+    {'tool': 'sslscan', 'command': 'sslscan --no-colour {target}',
+     'reason': 'Audit TLS protocol versions and cipher suites where TLS is exposed.',
+     'enabled': True},
+    # -stats is for the operator, not the parser: -silent alone prints nothing
+    # until a template matches, so the longest step in the plan showed an empty
+    # live terminal for minutes with no way to tell it apart from a hang. The
+    # periodic progress line goes to stderr and matches no finding pattern.
+    # -duc pins the template set: without it nuclei phones GitHub for template
+    # updates on every run, so the template count (and the runtime) only grows,
+    # until the step creeps past the executor's timeout cap again.
+    {'tool': 'nuclei', 'command': 'nuclei -u http://{target} -tags cve,exposure,misconfig -severity medium,high,critical -rl 30 -nc -stats -duc -silent',
+     'reason': 'Run rate-limited, non-invasive template checks for publicly documented weaknesses.',
+     'enabled': True},
 ]
+
+# Tools that take a hostname, not an endpoint: 'nmap juice-shop:3000' and
+# 'dig +short juice-shop:3000' both fail with "Failed to resolve" while still
+# exiting 0, so a whole plan once ran green and produced no findings at all.
+# nmap learns the port the letter named through -p instead; sslscan and the web
+# tools parse host:port themselves and keep it.
+HOST_ONLY_TOOLS = {'nmap', 'traceroute', 'dig', 'nslookup'}
 
 
 class PlannerAgent:
@@ -17,10 +57,15 @@ class PlannerAgent:
     def default_plan(self, target):
         parsed = urlparse(target if '://' in target else f'//{target}')
         host = parsed.hostname or target.split(':', 1)[0]
-        web_target = target if '://' in target else f'http://{target}'
+        port = parsed.port
+        # Web tool templates already carry the http:// scheme, so a host:port
+        # target must not be re-prefixed or curl gets http://http://host:3000.
+        endpoint = f'{host}:{port}' if port else host
         return [
-            {**DEFAULT_PLAN[0], 'command': DEFAULT_PLAN[0]['command'].format(target=host)},
-            {**DEFAULT_PLAN[1], 'command': 'curl -I ' + web_target},
+            {**step, 'command': step['command'].format(
+                target=host if step['tool'] in HOST_ONLY_TOOLS else endpoint,
+                ports=f'-p {port} ' if port else '')}
+            for step in DEFAULT_PLAN
         ]
 
     def _strip_fence(self, text):

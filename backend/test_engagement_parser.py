@@ -107,7 +107,13 @@ def test_parses_the_real_client_pdf():
     addresses = {target['address']: target for target in brief['targets']}
     assert 'juice-shop:3000' in addresses
     assert 'dvwa:80' in addresses
-    assert addresses['juice-shop:3000']['criticality'] == 85
-    assert addresses['dvwa:80']['criticality'] == 40
+    assert addresses['juice-shop:3000']['criticality'] == 90
+    assert addresses['dvwa:80']['criticality'] == 45
     assert 'nuclei' in addresses['dvwa:80']['restricted_tools']
-    assert brief['engagement_ref'] == 'JB/SEC/2026/014'
+    # The escalated letter denies traceroute for the storefront while allowing
+    # everything else, so both restriction shapes are exercised end to end.
+    assert addresses['juice-shop:3000']['restricted_tools'] == ['traceroute']
+    assert brief['engagement_ref'] == 'JB/SEC/2026/021'
+    # All seven objectives survive PDF extraction and parsing.
+    assert len(brief['objectives']) == 7
+    assert any('security-header audit' in objective for objective in brief['objectives'])

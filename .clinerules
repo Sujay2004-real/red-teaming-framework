@@ -14,17 +14,22 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - `backend/database.py` — SQLAlchemy/SQLite ORM + migrations.
 - `backend/modules/` — `engagement_parser` (letter → structured brief, deterministic),
   `planner` (AI or default plan, policy-filtered), `policy_engine` (allowlist, fail-closed,
-  scope checks — THE security core), `executor` (async subprocess, 300s timeout, output
+  scope checks — THE security core), `executor` (async subprocess, 360s timeout, output
   caps, env sandbox), `analyzer` (findings + scoring), `reporter` (Jinja2 HTML),
   `secret_store` (Fernet encryption at rest).
-- `docker-compose.yml` — backend :8000, frontend :5173, Juice Shop :3000, DVWA :8080.
+- `docker-compose.yml` — backend :8000, frontend :5173; Juice Shop :3000 and DVWA :8080
+  behind the `lab` profile (see "Deployment modes").
 - Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (targets the two lab machines).
+- `backend/smoke_e2e.py` — one-shot end-to-end run against the live stack (letter → target
+  → plan → execute every step → analyze → report), printing each result.
 
 ## Run / test
 
-- Full stack: `docker compose up --build` (from project root) → UI at http://localhost:5173
+- Demo stack: `docker compose --profile lab up --build` → UI at http://localhost:5173
+- Toolkit only (no lab targets): `docker compose up --build`
 - Frontend checks: `cd frontend; npm run lint; npm run build`
-- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (80 tests)
+- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (99 tests)
+- End-to-end: `.\backend\venv\Scripts\python.exe backend\smoke_e2e.py` (stack must be up)
 - PowerShell gotcha: the path contains `[IMPLEMENTATION]`, so always use
   `Set-Location -LiteralPath "..."` (plain `cd` treats brackets as wildcards).
 
@@ -32,8 +37,8 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 
 - CORS default allows BOTH `http://localhost:5173` and `http://127.0.0.1:5173`
   (port-forward links hand out 127.0.0.1). Override via `CORS_ALLOW_ORIGINS`.
-- Frontend `request()` helper: AbortController timeouts (75s general, 320s for execute —
-  above the executor's 300s cap so the server decides how commands end), friendly
+- Frontend `request()` helper: AbortController timeouts (75s general, 400s for execute —
+  above the executor's 360s cap so the server decides how commands end), friendly
   network errors, FormData bodies skip the JSON header.
 - UI polls `/health` every 10s → offline banner + auto-refresh on recovery.
 - One global `busy` flag disables all buttons during requests; buttons label themselves
@@ -47,7 +52,95 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - SQLite DB + secret key persist in the `data_volume` Docker volume (`down` keeps it,
   `down -v` wipes it).
 
+## Phase-2 capabilities (current)
+
+- Default deterministic plan: **7 policy-legal steps** (nmap/traceroute/dig/curl/whatweb/
+  sslscan/nuclei), rate-limited (`--max-rate 30`, `-rl 30`), targets formatted as
+  host:port with the scheme added exactly once.
+- Deterministic analyzer: **per-tool parsers** (nmap service lines, nuclei template
+  lines, curl header blocks incl. per-header missing-security-header findings +
+  cookie flags, whatweb plugins, sslscan deprecated protocols) with detailed
+  explanations, endpoint/parameter, distinct scoring drivers, concrete remediation.
+- Finding rows persist endpoint/parameter/exploitability/impact/exposure; assessments
+  persist `analysis_mode`; both surfaced in UI and report.
+- Live execution terminal: executor keeps an in-memory capped buffer per in-flight
+  execution (`live_registry`), `GET /assessments/{id}/executions/{eid}/live` streams
+  it, frontend polls every 1 s and renders a black terminal panel in the step card.
+- Report: executive summary + severity bar, analysis-mode statement, remediation
+  summary table ordered by priority, scoring breakdown per finding, audit output,
+  print stylesheet (Ctrl+P → clean PDF).
+- Compose profiles: lab targets behind `--profile lab`; plain `docker compose up` is
+  the real-world assessment toolkit. Backend no longer depends_on the lab targets.
+- Letter v2 (`JB/SEC/2026/021`): criticalities 90/45, 7 objectives, deny-list
+  (no traceroute on storefront) + allow-list (DVWA) restrictions, rate-limit rules,
+  automation-benefit deliverable.
+
+## Deployment modes (real-world vs. lab)
+
+- The framework is an **assessor's toolkit**, not a lab-only exhibit. `docker compose up`
+  runs backend + frontend only; the operator registers whatever targets the client
+  letter authorizes. `--profile lab` adds Juice Shop + DVWA for the demo.
+- Reachability is the only network requirement: scanners run inside the backend
+  container, so the target must be routable from there (Docker DNS name, LAN IP, public
+  host, or `host.docker.internal` for the Windows/macOS host itself). On Linux,
+  uncomment `network_mode: host` on the backend for accurate LAN subnet scans.
+- Proven out of the Docker network: `host.docker.internal` registered as a target,
+  one step approved, real output in the live terminal.
+- Targets arrive either from the parsed letter ("Set up everything from this letter")
+  or by manual registration; either way the policy engine still gates every command
+  against the authorized scopes and the letter's per-target tool restrictions.
+- Remote/LAN UI access: set `VITE_API_URL` (browser → backend) and
+  `CORS_ALLOW_ORIGINS` (backend → allowed origin) to the machine's LAN IP.
+- Honest scope statement: non-destructive discovery/enumeration plus governance
+  (authorization, approval, audit) by design — not an exploitation framework. That
+  restraint is what makes it safe to point at a paying client's production estate.
+
+## Manual effort vs. the framework (the demo's argument)
+
+- Manual: read the letter, hand-translate 7 objectives into ~15–20 commands, remember
+  each target's tool restrictions, run them one by one, then spend hours correlating
+  output into scored findings and writing the report.
+- Framework: letter parsed in seconds, restricted steps dropped automatically with the
+  reason shown, 7 approvals, correlated + scored findings, report generated in minutes —
+  with a full audit trail no manual run produces for free.
+- The letter's final deliverable asks for exactly this evidence, so the comparison is
+  part of the engagement, not a marketing aside.
+
 ## Fixed bugs (do not reintroduce)
+
+- Parser: reportlab bullets extract via pypdf as `\x7f` (DEL); `BULLET_RE` must match
+  it or objectives vanish and intro sentences pollute bullet lists. Items start only
+  on bullet lines.
+- Planner: never re-prefix a web target — `http://{target}` template + pre-prefixed
+  target once produced `http://http://host:3000`.
+- Planner: name-resolving tools (nmap/traceroute/dig/nslookup, `HOST_ONLY_TOOLS`) get the
+  BARE host; nmap learns the port via `-p`. `nmap juice-shop:3000` and
+  `dig +short juice-shop:3000` fail with "Failed to resolve" **and still exit 0**, so a
+  whole plan once ran green and produced findings from curl alone. sslscan and the web
+  tools parse `host:port` themselves and keep it.
+- Analyzer: nuclei severity is compared LOWERCASE. Title-casing it first meant no driver
+  branch ever matched, so a Critical CVE match scored the same as an informational one;
+  `info` also maps to Low, never Medium.
+- Analyzer: `_finding_curl` files header findings only after a real `HTTP/x nnn` status
+  line (`STATUS_LINE_RE`), resetting per redirect hop. Without that gate a refused
+  connection produced all five "missing security header" findings for a host that was
+  never reached (main.py passes no return_code, so the status line is the only signal).
+- Analyzer: every stream goes through `strip_ansi` before parsing. whatweb/sslscan/nuclei
+  colourise even into a pipe, and the escapes land mid-token (`SSLv3 \x1b[32menabled`,
+  `\x1b[1mHTTPServer\x1b[0m[nginx]`), which silently zeroed three parsers. The plan also
+  passes `--color=never` / `--no-colour` / `-nc`, but parsing must not depend on it.
+- Analyzer: nuclei v3 prints `[template] [http] [severity] url` — the protocol field is
+  optional in `NUCLEI_LINE_RE`. nmap's tentative `ppp?` must still yield a finding
+  (lower confidence, description says tentative), not be dropped by the regex.
+- nuclei is pinned to 3.11.1 in the Dockerfile: 3.1.9 died with `fatal error: concurrent
+  map writes` mid-run (exit 2, no findings, 149 s wasted). Do not downgrade.
+- Executor timeout is 360 s, measured against the nuclei step: 5,242 templates /
+  12,078 requests ≈ 308 s at the letter-mandated 30 req/s. A 300 s cap killed the scan
+  at 99% complete and stamped every run "timed out". The plan passes `-duc` so runtime
+  cannot creep past the cap via template auto-updates — which requires the Dockerfile
+  to seed templates at build time (`nuclei -duc -update-templates`), or a fresh
+  container dies with "no templates provided for scan". Re-measure before raising
+  `-rl` or the timeout.
 
 - Dropzone: whole box is the picker (click + Enter/Space via ref); hidden file input
   clears `e.target.value` after every pick so re-selecting the same file re-fires onChange.
@@ -59,10 +152,17 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 
 ## Demo runbook
 
-1. `docker compose down -v` (clean DB) then `docker compose up --build`
+1. `docker compose down -v` (clean DB) then `docker compose --profile lab up --build`
 2. Open http://localhost:5173 → import the PDF in "Read the client's letter"
 3. "Set up everything from this letter" → review the plan
 4. Demo policy rejection: edit a command dangerously (e.g. `nmap -oN out.txt ...` or
    retarget to google.com) → approve → refused with a clear reason
-5. Approve & execute each step → audit trail fills with real output
+5. Approve & execute each step → live terminal streams output → audit trail keeps it
 6. Analyze results → scored findings → Generate report (HTML, cites the engagement)
+7. Real-world proof: add `host.docker.internal:<port>` as a target and approve a step —
+   the scanners reach a machine outside the compose network (nmap resolves it to the
+   host's IP, traceroute shows the hop through the Docker gateway).
+
+Two API gates that look like bugs during a demo but are deliberate: the plan is frozen
+once any step has executed, and analysis requires every *enabled* step to have run
+(disable steps before starting if you want a shorter run).

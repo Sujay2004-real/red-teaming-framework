@@ -5,6 +5,11 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from modules.secret_store import encrypt_secret, is_encrypted
 
+# Default driver bounds mirrored from the analyzer. Duplicated here because
+# importing the analyzer from the database layer would create a circular
+# import (the analyzer has no database dependency by design).
+FINDING_DRIVER_DEFAULTS = {'exploitability': 3, 'impact': 3, 'exposure': 3}
+
 os.makedirs('./data', exist_ok=True)
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./data/redteam.db')
 engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
@@ -52,6 +57,10 @@ class Assessment(Base):
     # report act on - not a re-parse of raw text that can drift.
     engagement_brief = Column(JSON, default=None)
     approval_required = Column(Boolean, default=True)
+    # Which analyzer produced the current findings ('ai-provider' or
+    # 'deterministic-fallback'). The client letter requires the report to
+    # state it so findings can be weighed accordingly.
+    analysis_mode = Column(String, default='')
     created_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
 
@@ -84,6 +93,16 @@ class Finding(Base):
     risk_score = Column(Integer, default=0)
     priority_score = Column(Integer, default=0)
     confidence_score = Column(Integer, default=0)
+    # Where the finding lives (URL or host:port) and which parameter is
+    # affected when one is known; surfaced in the UI and the report so a
+    # remediation team does not have to re-derive the location from evidence.
+    endpoint = Column(String, default='')
+    parameter = Column(String, default='')
+    # The score drivers behind risk/priority. Persisted so the report can show
+    # *why* a finding scored the way it did, not just the resulting numbers.
+    exploitability = Column(Integer, default=FINDING_DRIVER_DEFAULTS['exploitability'])
+    impact = Column(Integer, default=FINDING_DRIVER_DEFAULTS['impact'])
+    exposure = Column(Integer, default=FINDING_DRIVER_DEFAULTS['exposure'])
     source_tools = Column(JSON, default=list)
     created_at = Column(DateTime, default=utcnow)
 
@@ -105,9 +124,9 @@ def _migrate_sqlite():
             ('proxy_password', "TEXT DEFAULT ''"), ('updated_at', 'DATETIME'),
         ],
         'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70'), ('restricted_tools', "JSON DEFAULT '[]'")],
-        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON')],
+        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON'), ('analysis_mode', "VARCHAR DEFAULT ''")],
         'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1')],
-        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME')],
+        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME'), ('endpoint', "VARCHAR DEFAULT ''"), ('parameter', "VARCHAR DEFAULT ''"), ('exploitability', 'INTEGER DEFAULT 3'), ('impact', 'INTEGER DEFAULT 3'), ('exposure', 'INTEGER DEFAULT 3')],
     }
     with engine.begin() as conn:
         known = inspect(engine)
