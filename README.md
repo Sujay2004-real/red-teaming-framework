@@ -44,6 +44,14 @@ Key capabilities:
   text; the framework extracts targets, authorized scopes, per-target tool restrictions,
   declared asset criticality, objectives, and out-of-scope / prohibited lists —
   deterministically, without needing an AI provider.
+- **Subnet discovery** — a CIDR target (e.g. `172.28.0.0/24`) gets a two-step
+  discovery plan: an `nmap` live-host sweep followed by a targeted port/version sweep,
+  with every finding attributed to the host it came from. Primary network targets
+  are bounded to 256 addresses by default (`MAX_SUBNET_ADDRESSES`); anything larger
+  should be split into smaller authorized ranges. The assessment detail and
+  `GET /assessments/{id}/discovered-hosts` expose the resulting host inventory,
+  but discovered hosts still require separate registration and approval for deeper
+  testing.
 - **AI-assisted planning** — with an (optional) OpenAI-compatible provider configured, it
   drafts an assessment plan tailored to the objective; every step is filtered through the
   policy engine before it reaches you. With no provider, it falls back to a safe default
@@ -120,6 +128,11 @@ execution audit trail. It never holds secrets and reads only server-confirmed st
    and any tools the client's letter restricts for it.
 3. **Draft the plan** — the planner proposes commands for a target's objective; each is
    validated against the policy engine. Restricted tools never make it onto the list.
+   There are two ways to enter this stage: **from the letter** (the imported brief
+   pre-fills the objective and requirements), or **with your own prompt** — pick one or
+   more registered targets, describe the engagement in your own words, and the framework
+   drafts a plan per target. Both paths go through the same policy review and the same
+   per-target letter restrictions; the prompt mode is not a parallel, weaker route.
 4. **Approve & execute** — you review and approve each command individually. Approved
    commands run in a sandboxed subprocess; everything is logged.
 5. **Analyze** — once every enabled step has run, outputs are correlated into scored,
@@ -136,8 +149,10 @@ The framework is deliberately conservative — safety is enforced in code, not c
   per tool. Anything not enumerated is refused. File-write, output-redirect, body-sending,
   and connection-retargeting flags are deliberately excluded.
 - **Scope enforcement.** Every command must contain an explicit target inside the target's
-  authorized scopes (hostname suffix match or CIDR membership). DNS resolvers are validated
-  separately against in-scope hosts plus a well-known public-resolver allowlist.
+  authorized scopes (hostname suffix match, CIDR membership, or — for a CIDR target —
+  the requested range being a subnet of an authorized network). DNS resolvers are
+  validated separately against in-scope hosts plus a well-known public-resolver
+  allowlist.
 - **Human-in-the-loop.** No command runs without an explicit, per-step approval request
   carrying `approved: true`. The plan is locked once execution begins.
 - **Client engagement letter outranks everything.** Per-target tool restrictions parsed
@@ -307,9 +322,9 @@ segment, an internet-facing system you are authorized to test) is a valid
 target:
 
 1. Run the toolkit: `docker compose up` (no lab profile needed).
-2. Register the real target in **Add authorized target** (host or host:port,
-   scopes, criticality) — or import an engagement letter that names it; the
-   parser handles any hostname or IP.
+2. Register the real target in **Add authorized target** (host, host:port, or a CIDR
+   like `192.168.1.0/24` for a discovery sweep, scopes, criticality) — or import an
+   engagement letter that names it; the parser handles hostnames, IPs, and subnets.
 3. From there the flow is identical: plan → review → approve each command →
    analysis → report. The policy engine, per-step human approval, rate limits,
    audit trail, scoring and reporting all apply exactly the same.
@@ -324,6 +339,9 @@ target:
 - For a demo of "not-Docker-only": register `host.docker.internal` (your own
   machine) as a target and approve one step against it — it is outside the
   compose network and still fully governed.
+- A CIDR target runs discovery only (live hosts + exposed services); the sweep's
+  findings name each host individually, but a host it finds is not authorized for
+  deeper assessment until you register it separately with the client's say-so.
 
 **Honest scope statement:** this is a *non-destructive scanning and governance*
 framework — reconnaissance, fingerprinting, header/TLS audits and
@@ -360,14 +378,26 @@ competent tester doing the same coverage by hand would:
 6. **Analyze results** once every enabled step has run.
 7. **Generate the report** and download the HTML deliverable.
 
+**Starting without a letter:** the *New assessment* panel has a second tab, *Your own
+prompt*. Pick one or more registered targets, write the engagement in your own words
+(e.g. "enumerate services and audit the HTTP security headers on the storefront"), and
+the framework drafts a policy-checked plan per target. With an AI provider configured,
+your prompt steers the drafted commands; without one, each target gets the standard
+deterministic plan. Per-target scopes, criticality and letter restrictions apply exactly
+as in the letter-driven flow, and every command still waits for your approval.
+
 A `JuiceBox_Security_Assessment_Request.pdf` sample letter is included at the project root
-for testing the import flow. (`make_client_request_pdf.py` regenerates it.)
+for testing the import flow — letter v4 (`JB/SEC/2026/023`), which requests the
+virtualization-lab engagement: the storefront running as a full virtual machine at
+`192.168.56.10:3000`, a legacy multi-service virtual machine at `192.168.56.20:80`, and a
+discovery sweep of the `192.168.56.0/24` host-only lab segment.
+(`make_client_request_pdf.py` regenerates it.)
 
 ---
 
 ## Testing
 
-The backend has a pytest suite (99 tests) covering the analyzer, planner, policy engine,
+The backend has a pytest suite (115 tests) covering the analyzer, planner, policy engine,
 secret store, request models, engagement parser, and the end-to-end API workflow. The
 analyzer and planner tests are written against output the scanners really produced in the
 Docker stack — escape codes, tentative nmap matches and all.
@@ -384,7 +414,8 @@ python -m pytest -q
 segment of the project path as parametrization syntax.
 
 There is also a live end-to-end smoke run against a running stack — it imports the letter,
-registers the target, drafts the plan, executes every step, analyzes and reports:
+registers the targets, drafts and executes every step of both a host assessment and the
+subnet discovery sweep, analyzes and reports:
 
 ```bash
 # with the stack up (docker compose --profile lab up)

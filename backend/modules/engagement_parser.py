@@ -31,6 +31,9 @@ FURNITURE_PATTERNS = (
 # host[:port], host must start alphanumerically so a bare ':3000' or a
 # sentence fragment never matches.
 HOST_PORT_RE = re.compile(r'\b([A-Za-z0-9][A-Za-z0-9._\-]*:\d{1,5})\b')
+# A CIDR segment address ('172.28.0.0/24'), checked before HOST_PORT_RE so a
+# subnet row is not mangled into its base address with the mask left behind.
+NETWORK_RE = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b')
 CRITICALITY_RE = re.compile(r'^(\d{1,3})\b')
 # '4.1 Service discovery: ...' style objective items.
 NUMBERED_ITEM_RE = re.compile(r'^(\d+\.\d+)\s+(.*)$')
@@ -105,10 +108,31 @@ def _parse_scopes(value):
     scopes = []
     for token in value.split(','):
         token = token.strip()
-        if HOST_PORT_RE.fullmatch(token) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._\-]*', token):
+        if (HOST_PORT_RE.fullmatch(token) or NETWORK_RE.fullmatch(token)
+                or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._\-]*', token)):
             if token not in scopes:
                 scopes.append(token)
     return scopes
+
+
+def _out_of_scope_indexes(lines):
+    """Line indexes inside the out-of-scope section.
+
+    An address named there is explicitly NOT a target, but the fallback scan
+    treats any bare address as one. Without this, 'out of scope: the corporate
+    network 10.10.0.0/16' would register the corporate network for scanning.
+    """
+    excluded, active = set(), False
+    for index, line in enumerate(lines):
+        if active and SECTION_HEADING_RE.match(line):
+            break
+        if re.search(r'out of scope', line, re.IGNORECASE):
+            active = True
+            excluded.add(index)
+            continue
+        if active:
+            excluded.add(index)
+    return excluded
 
 
 def _parse_targets(lines):
@@ -136,18 +160,29 @@ def _parse_targets(lines):
                 current['criticality'] = int(match.group(1)) if match else None
             elif field == 'address':
                 # Values carry qualifiers ('juice-shop:3000 (assessment-lab
-                # network)'); only the host[:port] is an address.
-                match = HOST_PORT_RE.search(value)
-                current['address'] = match.group(1) if match else value
+                # network)'); only the address itself is a target. A CIDR must
+                # be tried first or '172.28.0.0/24 (store network)' keeps its
+                # parenthetical - HOST_PORT_RE cannot match a subnet at all.
+                network = NETWORK_RE.search(value)
+                if network:
+                    current['address'] = network.group(1)
+                else:
+                    match = HOST_PORT_RE.search(value)
+                    current['address'] = match.group(1) if match else value
             elif field == 'scopes':
                 current['scopes'] = _parse_scopes(value)
             else:
                 current[field] = value
 
-    # Fallback: any host:port line not already captured becomes a target, so
-    # a differently laid-out letter still yields its in-scope assets.
+    # Fallback: any host:port or subnet line not already captured becomes a
+    # target, so a differently laid-out letter still yields its in-scope assets.
+    # Addresses in the out-of-scope section are skipped - they are named there
+    # precisely because they must not be scanned.
+    excluded = _out_of_scope_indexes(lines)
     known_addresses = {target['address'].split(' ')[0] for target in targets if target['address']}
-    for line in lines:
+    for index, line in enumerate(lines):
+        if index in excluded:
+            continue
         for match in HOST_PORT_RE.finditer(line):
             address = match.group(1)
             if address not in known_addresses:
@@ -156,6 +191,13 @@ def _parse_targets(lines):
                                 'criticality': None, 'assessment_type': '', 'technology': '',
                                 'environment': '', 'restricted_tools': [], 'notes': []})
                 known_addresses.add(address)
+        for match in NETWORK_RE.finditer(line):
+            network = match.group(1)
+            if network not in known_addresses:
+                targets.append({'name': f'subnet {network}', 'address': network, 'scopes': [network],
+                                'criticality': None, 'assessment_type': '', 'technology': '',
+                                'environment': '', 'restricted_tools': [], 'notes': []})
+                known_addresses.add(network)
     return targets
 
 

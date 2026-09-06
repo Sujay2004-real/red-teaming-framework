@@ -31,6 +31,30 @@ def test_target_fields_are_stored_stripped():
     assert target.authorized_scopes == ['a.example', 'b.example']
 
 
+def test_cidr_target_is_canonicalized():
+    target = TargetCreate(name='Segment', scope_domain_ip=' 172.18.0.7/24 ')
+    assert target.scope_domain_ip == '172.18.0.0/24'
+
+
+def test_bare_ip_remains_a_single_host_target():
+    target = TargetCreate(name='Host', scope_domain_ip=' 192.168.1.7 ')
+    assert target.scope_domain_ip == '192.168.1.7'
+
+
+def test_oversized_cidr_target_is_rejected():
+    with pytest.raises(ValidationError, match='at most'):
+        TargetCreate(name='Large segment', scope_domain_ip='10.0.0.0/16')
+
+
+def test_authorized_scope_can_be_wider_than_the_scanned_target():
+    target = TargetCreate(
+        name='Segment',
+        scope_domain_ip='10.0.1.0/24',
+        authorized_scopes=['10.0.0.0/8'],
+    )
+    assert target.authorized_scopes == ['10.0.0.0/8']
+
+
 def test_authorized_scopes_are_bounded():
     with pytest.raises(ValidationError):
         TargetCreate(

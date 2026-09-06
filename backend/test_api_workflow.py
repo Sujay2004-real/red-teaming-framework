@@ -84,3 +84,46 @@ def test_completed_assessment_can_be_analyzed_and_reported(client, tmp_path):
         reported = client.post(f"/assessments/{assessment['id']}/report")
 
     assert reported.status_code == 200
+
+
+def test_prompt_mode_creates_one_assessment_per_picked_target(client):
+    """The second entry mode: registered targets + a free-text prompt.
+
+    The UI calls POST /assessments/ once per picked target with the prompt as
+    the objective and no letter brief or requirements. Each assessment must
+    come back with a policy-checked plan that still respects the target's
+    stored letter restrictions — the prompt mode reuses the same gates as
+    the letter mode rather than a parallel path.
+    """
+    prompt = 'Deep pre-launch check: enumerate services and audit HTTP security headers.'
+    target_ids = []
+    for name, address, restricted in (
+        ('Storefront', 'juice-shop:3000', []),
+        ('Legacy server', '192.168.56.20:80', ['traceroute', 'dig', 'sslscan', 'nuclei']),
+    ):
+        target = client.post('/targets/', json={
+            'name': name,
+            'scope_domain_ip': address,
+            'authorized_scopes': [address],
+            'criticality': 80,
+            'restricted_tools': restricted,
+        }).json()
+        target_ids.append(target['id'])
+
+    assessments = []
+    for target_id in target_ids:
+        response = client.post('/assessments/', json={'target_id': target_id, 'objective': prompt})
+        assert response.status_code == 200
+        assessments.append(response.json())
+
+    # Both plans exist, carry the prompt as their objective, and were drafted
+    # by the deterministic planner (no provider configured in tests).
+    assert [a['objective'] for a in assessments] == [prompt, prompt]
+    assert all(a['plan_source'] == 'default-unconfigured' for a in assessments)
+    assert all(len(a['plan']) >= 1 for a in assessments)
+    # The restricted target loses exactly its restricted steps; the
+    # unrestricted one loses none.
+    assert assessments[0]['restricted_steps_dropped'] == 0
+    assert assessments[1]['restricted_steps_dropped'] == 4
+    assert all(step['tool'] not in ('traceroute', 'dig', 'sslscan', 'nuclei')
+               for step in assessments[1]['plan'])

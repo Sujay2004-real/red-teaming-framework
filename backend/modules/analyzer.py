@@ -83,6 +83,26 @@ NMAP_SERVICE_RE = re.compile(
     r'^(?P<port>\d+)/(?P<proto>tcp|udp)\s+(?P<state>open|filtered)\s+(?P<service>[\w\-]+\??)(?:\s+(?P<version>.+))?$',
     re.IGNORECASE)
 
+# Opens a per-host block in nmap output: 'Nmap scan report for juice-shop
+# (172.28.0.3)' or 'Nmap scan report for 172.28.0.3'. Subnet sweeps produce
+# one block per live host.
+NMAP_HOST_RE = re.compile(r'^Nmap scan report for\s+(?P<host>.+)$', re.IGNORECASE)
+
+
+def extract_nmap_hosts(text):
+    """Return distinct hosts named by nmap report headers."""
+    hosts = []
+    for line in strip_ansi(text or '').splitlines():
+        match = NMAP_HOST_RE.match(line.strip())
+        if not match:
+            continue
+        raw_host = match.group('host').strip()
+        inner = re.search(r'\(([^)]+)\)', raw_host)
+        host = (inner.group(1) if inner else raw_host).strip()
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
 # nuclei summary lines. v3 prints the protocol between the template id and the
 # severity ('[apache-detect] [http] [info] http://target'), and older builds
 # omit it, so the protocol field is optional here.
@@ -205,8 +225,23 @@ class AnalyzerAgent:
     @staticmethod
     def _finding_nmap(stdout, source_tool):
         findings = []
+        # nmap prefixes every host block with 'Nmap scan report for X', where X
+        # is an IP or 'name (ip)'. Without tracking it, a subnet sweep's
+        # findings all carry the same port-only endpoint - and the fingerprint
+        # dedupe then merges 'port 3000 open' from different hosts into a
+        # single finding, hiding every host but the first.
+        host = ''
         for line in stdout.splitlines():
-            match = NMAP_SERVICE_RE.match(line.strip())
+            stripped = line.strip()
+            report = NMAP_HOST_RE.match(stripped)
+            if report:
+                raw_host = report.group('host').strip()
+                # Prefer the IP inside 'name (ip)' so the endpoint is an
+                # address the operator can act on.
+                inner = re.search(r'\(([^)]+)\)', raw_host)
+                host = (inner.group(1) if inner else raw_host).strip()
+                continue
+            match = NMAP_SERVICE_RE.match(stripped)
             if not match:
                 continue
             port, proto, state, service_raw, version = (
@@ -217,14 +252,15 @@ class AnalyzerAgent:
             # and carries lower confidence rather than asserting the service.
             tentative = service_raw.endswith('?')
             service = service_raw.rstrip('?') or 'unidentified'
-            endpoint = f'{port}/{proto}'
+            endpoint = f'{host}:{port}/{proto}' if host else f'{port}/{proto}'
             version_note = f' running {version}' if version else ' with no version information'
             if tentative:
                 version_note += (', and nmap marked the service identification as tentative '
                                  '(the banner did not match a known fingerprint)')
             findings.append({
                 'title': f'Exposed {service} service on port {port}' + (f' ({version.split(",")[0]})' if version else ''),
-                'description': (f'Port {port}/{proto} is {state} and identified as {service}'
+                'description': (f'Port {port}/{proto} is {state} on {host or "the target"} and '
+                                f'identified as {service}'
                                 f'{version_note}. Every exposed service is attack surface: its '
                                 f'known vulnerabilities, misconfigurations and administrative '
                                 f'interfaces are reachable by anyone who can route to the host.'),

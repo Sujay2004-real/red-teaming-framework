@@ -1,4 +1,5 @@
 import os
+import ipaddress
 from datetime import timedelta
 from urllib.parse import quote, urlparse
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from database import AppSettings, Assessment, Finding, Target, ToolExecution, get_db, utcnow
 from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
-from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent
+from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent, extract_nmap_hosts
 from modules.engagement_parser import parse_engagement
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor, live_registry
 from modules.planner import MAX_PLAN_STEPS, planner_agent
@@ -44,11 +45,27 @@ SECRET_SETTING_FIELDS = ('gemini_api_key', 'proxy_password')
 
 
 def serialize_target(row):
-    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'restricted_tools': row.restricted_tools or [], 'created_at': row.created_at}
+    network = None
+    try:
+        network = ipaddress.ip_network(row.scope_domain_ip, strict=False)
+    except ValueError:
+        pass
+    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'restricted_tools': row.restricted_tools or [], 'created_at': row.created_at, 'scope_type': 'network' if network else 'host', 'network_address_count': network.num_addresses if network else None, 'network_prefix': network.prefixlen if network else None}
 
 
 def serialize_assessment(row):
     return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'created_at': row.created_at, 'completed_at': row.completed_at}
+
+
+def discovered_hosts_for(executions):
+    hosts = []
+    for execution in executions:
+        if execution.tool_name.lower() != 'nmap':
+            continue
+        for host in extract_nmap_hosts(execution.stdout or ''):
+            if host not in hosts:
+                hosts.append(host)
+    return hosts
 
 
 def execution_is_stale(execution):
@@ -527,8 +544,22 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).order_by(Finding.priority_score.desc()).all()
     result = serialize_assessment(row)
     result['executions'] = [serialize_execution(execution) for execution in executions]
+    result['discovered_hosts'] = discovered_hosts_for(executions)
     result['findings'] = [serialize_finding(finding) for finding in findings]
     return result
+
+
+@app.get('/assessments/{assessment_id}/discovered-hosts')
+def get_discovered_hosts(assessment_id: int, db: Session = Depends(get_db)):
+    """Expose nmap inventory without authorizing any follow-up scan."""
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    executions = db.query(ToolExecution).filter(
+        ToolExecution.assessment_id == assessment_id,
+        ToolExecution.return_code.is_not(None),
+    ).all()
+    return {'assessment_id': assessment_id, 'target_id': row.target_id, 'hosts': discovered_hosts_for(executions)}
 
 
 @app.put('/assessments/{assessment_id}/plan')

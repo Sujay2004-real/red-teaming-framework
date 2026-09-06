@@ -1,3 +1,5 @@
+import ipaddress
+import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -5,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 MAX_AUTHORIZED_SCOPES = 50
 MAX_SCOPE_CHARS = 255
+MAX_SUBNET_ADDRESSES = int(os.getenv('MAX_SUBNET_ADDRESSES', '256'))
 # A client letter can only restrict tools the framework can run; anything
 # longer than a tool name is noise from a misparsed document.
 MAX_RESTRICTED_TOOLS = 20
@@ -55,6 +58,25 @@ class TargetCreate(BaseModel):
     restricted_tools: List[str] = Field(default_factory=list)
 
     _strip_name = field_validator('name', 'scope_domain_ip')(_required_text)
+
+    @field_validator('scope_domain_ip')
+    @classmethod
+    def _bounded_network_target(cls, value: str) -> str:
+        """Keep primary CIDR sweeps within the executor's practical budget."""
+        # A bare IP is a normal single-host target; ip_network would interpret
+        # it as a /32 and rewrite the value, changing the existing workflow.
+        if '/' not in value:
+            return value
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return value
+        if network.num_addresses > MAX_SUBNET_ADDRESSES:
+            raise ValueError(
+                f'network targets may contain at most {MAX_SUBNET_ADDRESSES} addresses; '
+                'use a narrower CIDR or split the assessment into smaller ranges'
+            )
+        return str(network)
 
     @field_validator('authorized_scopes')
     @classmethod

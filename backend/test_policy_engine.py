@@ -115,3 +115,39 @@ def test_ipv6_target_outside_an_authorized_network_is_still_refused():
 
     assert not valid
     assert 'outside the authorized scope' in reason
+
+
+# A CIDR target sweeps a whole range, so it must fit INSIDE an authorized
+# network. normalize_host strips the prefix, and the membership check on the
+# base address alone once let a /24 sweep pass against a /25 authorization.
+def test_cidr_target_must_be_within_an_authorized_network():
+    engine = PolicyEngine()
+
+    valid, reason, _ = engine.validate_command('nmap -sV 192.168.1.0/24', ['192.168.1.0/25'])
+    assert not valid
+    assert 'outside the authorized scope' in reason
+
+    # Equal or wider authorizations are fine.
+    for scope in ('192.168.1.0/24', '192.168.0.0/16'):
+        valid, reason, _ = engine.validate_command('nmap -sV 192.168.1.0/24', [scope])
+        assert valid, reason
+
+
+def test_cidr_target_refused_when_only_a_disjoint_range_is_authorized():
+    valid, reason, _ = PolicyEngine().validate_command('nmap -sV 192.168.1.0/24', ['10.0.0.0/8'])
+
+    assert not valid
+    assert 'outside the authorized scope' in reason
+
+
+def test_ipv6_cidr_target_authorized_by_a_wider_network():
+    valid, reason, _ = PolicyEngine().validate_command('nmap -sV 2001:db8:1::/48', ['2001:db8::/32'])
+
+    assert valid, reason
+
+
+def test_ipv6_cidr_target_refused_by_a_narrower_network():
+    valid, reason, _ = PolicyEngine().validate_command('nmap -sV 2001:db8:1::/48', ['2001:db8:1::/64'])
+
+    assert not valid
+    assert 'outside the authorized scope' in reason

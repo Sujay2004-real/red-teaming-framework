@@ -63,6 +63,41 @@ def test_default_plan_without_a_port_scans_the_default_range():
     assert commands['curl'] == 'curl -sSI http://example.test'
 
 
+def test_default_plan_for_a_cidr_target_is_a_discovery_sweep():
+    plan = PlannerAgent().default_plan('172.28.0.0/24')
+
+    # Every step is nmap: no other tool in the registry accepts a range, and
+    # the plan must not silently degenerate into scanning the base address.
+    assert [step['tool'] for step in plan] == ['nmap', 'nmap']
+    assert all('/24' in step['command'] for step in plan)
+    assert plan[0]['command'] == 'nmap -sn --max-rate 30 172.28.0.0/24'
+    assert plan[1]['command'].startswith('nmap -sV --version-light --open --max-rate 30 -p ')
+    assert '172.28.0.0/24' in plan[1]['command']
+    # No web tools in a subnet plan - they cannot take a CIDR.
+    assert not any(step['tool'] in ('curl', 'whatweb', 'sslscan', 'nuclei') for step in plan)
+
+
+def test_subnet_plan_commands_pass_policy_review():
+    engine = PolicyEngine()
+
+    for step in PlannerAgent().default_plan('172.28.0.0/24'):
+        valid, reason, _ = engine.validate_command(
+            step['command'], ['172.28.0.0/24'], expected_tool=step['tool'])
+        assert valid, f"{step['command']} rejected: {reason}"
+
+
+# 'host:port/path' also carries a slash but is not a network; it must keep the
+# single-host plan rather than being mistaken for a segment.
+def test_slash_in_a_target_does_not_make_it_a_subnet():
+    plan = PlannerAgent().default_plan('juice-shop:3000/#/about')
+
+    commands = {step['tool']: step['command'] for step in plan}
+    # The full single-host plan, aimed at the host and port - not a sweep.
+    assert len(plan) >= 7
+    assert commands['nmap'].endswith('-p 3000 juice-shop')
+    assert commands['curl'] == 'curl -sSI http://juice-shop:3000'
+
+
 def test_default_plan_accepts_a_url_shaped_target():
     commands = {step['tool']: step['command'] for step in PlannerAgent().default_plan('http://dvwa:8080/login')}
 

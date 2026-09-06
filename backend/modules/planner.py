@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import re
 import requests
@@ -50,11 +51,42 @@ DEFAULT_PLAN = [
 # tools parse host:port themselves and keep it.
 HOST_ONLY_TOOLS = {'nmap', 'traceroute', 'dig', 'nslookup'}
 
+# The subnet plan for a CIDR target. Everything except nmap is absent because
+# no other tool accepts a range: curl/whatweb/sslscan/nuclei need one host,
+# and traceroute/dig resolve one name. Deep assessment of a discovered host is
+# a separate assessment on that host - the plan is frozen per assessment by
+# design, so discovery and inspection cannot bleed into each other.
+# Probe budget at the letter-mandated 30 packets/s: -sn costs ~2 probes per
+# address (a /24 is under a minute); the sweep is 17 ports x 254 addresses
+# ~ 4300 probes ~ 145 s, with -sV adding version probes only to ports that
+# answered. Both stay well inside the executor's 360 s cap on a /24; a /16
+# would not, and is not a supported sweep size.
+SUBNET_PLAN = [
+    {'tool': 'nmap', 'command': 'nmap -sn --max-rate 30 {target}',
+     'reason': 'Discover which addresses in the authorized segment are live before any port-level probing.',
+     'enabled': True},
+    {'tool': 'nmap', 'command': 'nmap -sV --version-light --open --max-rate 30 -p 22,25,53,80,110,143,443,445,3000,3306,3389,5432,5900,6379,8000,8080,8443 {target}',
+     'reason': 'Sweep the segment for exposed services on common ports, with light version detection on what answers.',
+     'enabled': True},
+]
+
 
 class PlannerAgent:
-    prompt_version = 'planner-v4-scopes'
+    prompt_version = 'planner-v5-subnets'
 
     def default_plan(self, target):
+        # A CIDR target is a segment, not a host: urlparse would silently eat
+        # the prefix ('//192.168.1.0/24' -> hostname '192.168.1.0') and the
+        # plan below would scan one address while looking like it swept the
+        # segment. Subnets get their own discovery plan instead.
+        if '/' in str(target):
+            try:
+                ipaddress.ip_network(str(target).strip(), strict=False)
+                network = str(target).strip()
+                return [{**step, 'command': step['command'].format(target=network)}
+                        for step in SUBNET_PLAN]
+            except ValueError:
+                pass
         parsed = urlparse(target if '://' in target else f'//{target}')
         host = parsed.hostname or target.split(':', 1)[0]
         port = parsed.port

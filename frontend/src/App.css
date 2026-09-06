@@ -217,6 +217,68 @@ textarea {
     gap: 10px
 }
 
+/* The two entry modes for a new assessment: letter-driven or the operator's
+   own prompt. Plain tabs, not segmented buttons, so they read as a switch. */
+.mode-tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 4px
+}
+
+.mode-tab {
+    background: #fff;
+    color: #566574;
+    border: 1px solid var(--line);
+    font-weight: 700;
+    padding: 8px 10px
+}
+
+.mode-tab.active {
+    border-color: var(--accent);
+    color: var(--accent2);
+    background: #eef8f7;
+    box-shadow: inset 0 -2px 0 var(--accent)
+}
+
+/* Multi-select target picker for the prompt mode: each registered target is
+   a toggle chip; picked ones show the accent border and check. */
+.target-pick {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 220px;
+    overflow-y: auto
+}
+
+.pick-chip {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    text-align: left;
+    background: #fff;
+    border: 1px solid var(--line);
+    padding: 8px 10px
+}
+
+.pick-chip small {
+    font-weight: 600
+}
+
+.pick-chip.picked {
+    border-color: var(--accent);
+    background: #eef8f7
+}
+
+.pick-chip.picked b::after {
+    content: ' ✓'
+}
+
+.pick-warn {
+    color: var(--warn)
+}
+
 button {
     border: 0;
     border-radius: 5px;
@@ -911,6 +973,30 @@ footer {
     display: block;
     margin-top: 10px;
     color: var(--muted)
+}
+
+.network-inventory {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 0 14px;
+    padding: 10px 12px;
+    border: 1px solid #2c4850;
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: #0b171c;
+    font-size: 12px
+}
+
+.network-inventory span,
+.network-inventory small {
+    color: var(--muted)
+}
+
+.network-inventory code {
+    color: #8ee8d9;
+    white-space: pre-wrap;
+    word-break: break-word
 }
 
 .action-status {

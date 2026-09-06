@@ -18,8 +18,13 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
   caps, env sandbox), `analyzer` (findings + scoring), `reporter` (Jinja2 HTML),
   `secret_store` (Fernet encryption at rest).
 - `docker-compose.yml` — backend :8000, frontend :5173; Juice Shop :3000 and DVWA :8080
-  behind the `lab` profile (see "Deployment modes").
-- Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (targets the two lab machines).
+  behind the `lab` profile (see "Deployment modes"). The custom `labnet` network is
+  pinned to `172.28.0.0/24` so the letter's segment target names a real range.
+- Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (letter v4, the virtualization-lab
+  engagement `JB/SEC/2026/023`). Every authorized asset lives on the lab's host-only network:
+  the storefront as a full VM at `192.168.56.10:3000`, a legacy multi-service VM at
+  `192.168.56.20:80`, and the `192.168.56.0/24` segment for a discovery sweep. No letter
+  target names a compose `lab`-profile container.
 - `backend/smoke_e2e.py` — one-shot end-to-end run against the live stack (letter → target
   → plan → execute every step → analyze → report), printing each result.
 
@@ -28,7 +33,7 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - Demo stack: `docker compose --profile lab up --build` → UI at http://localhost:5173
 - Toolkit only (no lab targets): `docker compose up --build`
 - Frontend checks: `cd frontend; npm run lint; npm run build`
-- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (99 tests)
+- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (115 tests)
 - End-to-end: `.\backend\venv\Scripts\python.exe backend\smoke_e2e.py` (stack must be up)
 - PowerShell gotcha: the path contains `[IMPLEMENTATION]`, so always use
   `Set-Location -LiteralPath "..."` (plain `cd` treats brackets as wildcards).
@@ -61,6 +66,12 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
   lines, curl header blocks incl. per-header missing-security-header findings +
   cookie flags, whatweb plugins, sslscan deprecated protocols) with detailed
   explanations, endpoint/parameter, distinct scoring drivers, concrete remediation.
+- **Subnet (CIDR) targets**: a target like `172.28.0.0/24` gets a 2-step discovery
+  plan (`nmap -sn` live-host sweep, then `nmap -sV` over common ports), findings are
+  attributed per host (`172.28.0.3:80/tcp`), and the policy engine only accepts a
+  CIDR target that is equal to or a subnet of an authorized scope. /24 is the
+  supported size — a /16 at the letter-mandated 30/s cannot finish inside the 360 s
+  executor cap.
 - Finding rows persist endpoint/parameter/exploitability/impact/exposure; assessments
   persist `analysis_mode`; both surfaced in UI and report.
 - Live execution terminal: executor keeps an in-memory capped buffer per in-flight
@@ -71,9 +82,15 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
   print stylesheet (Ctrl+P → clean PDF).
 - Compose profiles: lab targets behind `--profile lab`; plain `docker compose up` is
   the real-world assessment toolkit. Backend no longer depends_on the lab targets.
-- Letter v2 (`JB/SEC/2026/021`): criticalities 90/45, 7 objectives, deny-list
-  (no traceroute on storefront) + allow-list (DVWA) restrictions, rate-limit rules,
-  automation-benefit deliverable.
+- Letter v4 (`JB/SEC/2026/023`, virtualization-lab edition): criticalities 90/50/65,
+  8 objectives, deny-list (no traceroute on storefront, discovery-only on the segment)
+  + allow-list (legacy server) restrictions, rate-limit rules, automation-benefit
+  deliverable, and a third target authorizing the `192.168.56.0/24` host-only lab
+  segment for a discovery sweep only (Section 5.5: hosts found there need separate
+  authorization before deeper assessment). ALL targets are full VMs on the host-only
+  lab network — storefront `192.168.56.10:3000`, legacy server `192.168.56.20:80` —
+  so the letter's premise is a virtualization laboratory of real systems; the full
+  walkthrough (`smoke_e2e.py`, live demo) expects the lab VMs to be running.
 
 ## Deployment modes (real-world vs. lab)
 
@@ -89,6 +106,13 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - Targets arrive either from the parsed letter ("Set up everything from this letter")
   or by manual registration; either way the policy engine still gates every command
   against the authorized scopes and the letter's per-target tool restrictions.
+- Second entry mode (prompt mode): the "New assessment" panel has two tabs —
+  "From a letter" (single registered target, letter pre-fills objective/requirements)
+  and "Your own prompt" (operator picks multiple registered targets and writes a
+  free-text prompt; the UI calls `POST /assessments/` once per target with the prompt
+  as the objective). Same planner, same policy review, same per-target restrictions —
+  there is no parallel, weaker path. With an AI provider configured the prompt steers
+  the drafted commands; without one, each target gets the default deterministic plan.
 - Remote/LAN UI access: set `VITE_API_URL` (browser → backend) and
   `CORS_ALLOW_ORIGINS` (backend → allowed origin) to the machine's LAN IP.
 - Honest scope statement: non-destructive discovery/enumeration plus governance
@@ -134,6 +158,14 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
   (lower confidence, description says tentative), not be dropped by the regex.
 - nuclei is pinned to 3.11.1 in the Dockerfile: 3.1.9 died with `fatal error: concurrent
   map writes` mid-run (exit 2, no findings, 149 s wasted). Do not downgrade.
+- Policy engine: a CIDR target is a RANGE, not an address. `normalize_host` strips
+  the `/24`, so the old membership check validated a /24 sweep against a /25 scope
+  by checking only the base address — authorizing double the range. CIDR targets now
+  require `requested.subnet_of(authorized_network)`, never the base-address path.
+- Analyzer: `_finding_nmap` tracks `Nmap scan report for …` lines so sweep findings
+  carry host-qualified endpoints. Without it every host block's "port 80 open" had
+  the same port-only endpoint and the fingerprint dedupe silently merged them —
+  every host after the first vanished from the report.
 - Executor timeout is 360 s, measured against the nuclei step: 5,242 templates /
   12,078 requests ≈ 308 s at the letter-mandated 30 req/s. A 300 s cap killed the scan
   at 99% complete and stamped every run "timed out". The plan passes `-duc` so runtime
@@ -162,6 +194,11 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 7. Real-world proof: add `host.docker.internal:<port>` as a target and approve a step —
    the scanners reach a machine outside the compose network (nmap resolves it to the
    host's IP, traceroute shows the hop through the Docker gateway).
+8. Subnet sweep: register the letter's third target (`172.28.0.0/24`) — the 2-step
+   discovery plan lists the lab machines as live hosts and files per-host findings
+   (`172.28.0.x:3000/tcp`, `172.28.0.y:80/tcp`). Demo the guardrail too: application
+   tools are restricted for the segment, and a host found by the sweep still needs
+   separate authorization before deeper assessment.
 
 Two API gates that look like bugs during a demo but are deliberate: the plan is frozen
 once any step has executed, and analysis requires every *enabled* step to have run

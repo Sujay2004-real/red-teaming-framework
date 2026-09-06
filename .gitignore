@@ -60,3 +60,8 @@ Thumbs.db
 
 # Empty nested git repo (placeholder)
 red-teaming-framework/
+
+# Local temp artifacts
+.tmp_pptx/
+output/
+.runlogs/

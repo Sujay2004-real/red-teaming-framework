@@ -105,15 +105,87 @@ def test_parses_the_real_client_pdf():
     text = '\n'.join(page.extract_text() or '' for page in PdfReader(str(REAL_PDF)).pages)
     brief = parse_engagement(text)
     addresses = {target['address']: target for target in brief['targets']}
-    assert 'juice-shop:3000' in addresses
-    assert 'dvwa:80' in addresses
-    assert addresses['juice-shop:3000']['criticality'] == 90
-    assert addresses['dvwa:80']['criticality'] == 45
-    assert 'nuclei' in addresses['dvwa:80']['restricted_tools']
+    # The storefront now runs as a full VM on the virtualization lab's
+    # application host, so every letter target points at the lab, not at a
+    # container started by the compose "lab" profile.
+    assert '192.168.56.10:3000' in addresses
+    assert '192.168.56.20:80' in addresses
+    assert addresses['192.168.56.10:3000']['criticality'] == 90
+    assert addresses['192.168.56.20:80']['criticality'] == 50
+    assert 'nuclei' in addresses['192.168.56.20:80']['restricted_tools']
     # The escalated letter denies traceroute for the storefront while allowing
     # everything else, so both restriction shapes are exercised end to end.
-    assert addresses['juice-shop:3000']['restricted_tools'] == ['traceroute']
-    assert brief['engagement_ref'] == 'JB/SEC/2026/021'
-    # All seven objectives survive PDF extraction and parsing.
-    assert len(brief['objectives']) == 7
+    assert addresses['192.168.56.10:3000']['restricted_tools'] == ['traceroute']
+    assert brief['engagement_ref'] == 'JB/SEC/2026/023'
+    # The letter's third target authorizes the whole virtualization-lab
+    # segment (a real host-only network, not a container bridge).
+    assert '192.168.56.0/24' in addresses
+    assert addresses['192.168.56.0/24']['criticality'] == 65
+    assert addresses['192.168.56.0/24']['restricted_tools'] == ['curl', 'nuclei', 'sslscan', 'whatweb']
+    # All objectives survive PDF extraction and parsing.
+    assert len(brief['objectives']) == 8
     assert any('security-header audit' in objective for objective in brief['objectives'])
+    assert any('segment' in objective.lower() for objective in brief['objectives'])
+
+
+# A letter that authorizes a whole segment. The subnet row uses the same
+# labelled-table layout as the host rows, with a CIDR as the address.
+SUBNET_LETTER = """
+JuiceBox Retail Pvt. Ltd.
+Engagement reference
+JB/SEC/2026/022
+System name
+Lab container segment
+Authorized target address
+172.28.0.0/24 (assessment-lab network)
+Authorized scope identifiers
+172.28.0.0/24
+Asset criticality (client-declared, 0-100)
+60 — shared laboratory infrastructure, no production data
+Assessment type
+discovery sweep (baseline)
+3.3 Assets explicitly OUT OF SCOPE
+The following are strictly out of scope:
+• JuiceBox corporate network 10.10.0.0/16 and all employee endpoints.
+4. Assessment objectives
+• 4.1 Segment sweep: enumerate live hosts and exposed services.
+5.5 Technique restrictions specific to the lab segment (Section 3.2)
+Application-layer inspection (curl, whatweb, sslscan, nuclei) must not be run
+against the 172.28.0.0/24 segment. Deeper assessment of any host found there
+requires a separate authorization.
+"""
+
+
+def test_parses_a_subnet_target_from_the_letter():
+    brief = parse_engagement(SUBNET_LETTER)
+    addresses = {target['address']: target for target in brief['targets']}
+
+    segment = addresses['172.28.0.0/24']
+    # The parenthetical qualifier must be stripped, and the CIDR must survive
+    # as the address (not be reduced to its base address).
+    assert segment['name'] == 'Lab container segment'
+    assert segment['criticality'] == 60
+    assert segment['scopes'] == ['172.28.0.0/24']
+
+
+def test_out_of_scope_subnet_is_not_lifted_into_the_targets():
+    brief = parse_engagement(SUBNET_LETTER)
+
+    # 10.10.0.0/16 is named in the out-of-scope section; a bare-address
+    # fallback must not register it as scannable.
+    addresses = {target['address'] for target in brief['targets']}
+    assert '10.10.0.0/16' not in addresses
+    assert addresses == {'172.28.0.0/24'}
+
+
+def test_subnet_restriction_binds_by_cidr_mention():
+    brief = parse_engagement(SUBNET_LETTER)
+    addresses = {target['address']: target for target in brief['targets']}
+
+    assert addresses['172.28.0.0/24']['restricted_tools'] == ['curl', 'nuclei', 'sslscan', 'whatweb']
+
+
+def test_bare_cidr_line_becomes_a_target_in_a_minimal_letter():
+    brief = parse_engagement('Authorized segment: 172.28.0.0/24 for discovery only.')
+
+    assert [target['address'] for target in brief['targets']] == ['172.28.0.0/24']

@@ -11,6 +11,7 @@ from modules.analyzer import (
     MAX_FINDING_TEXT_CHARS,
     SECURITY_HEADERS,
     AnalyzerAgent,
+    extract_nmap_hosts,
 )
 
 
@@ -220,15 +221,53 @@ def test_nmap_output_files_one_finding_per_service():
     findings = AnalyzerAgent()._finding_nmap(NMAP_OUTPUT, 'nmap')
     by_endpoint = {finding['endpoint']: finding for finding in findings}
 
-    assert set(by_endpoint) == {'3000/tcp', '8080/tcp', '22/tcp'}
+    # Endpoints are host-qualified: the report line names the host, and the
+    # address is what the operator acts on.
+    assert set(by_endpoint) == {'172.18.0.3:3000/tcp', '172.18.0.3:8080/tcp', '172.18.0.3:22/tcp'}
     # The version-bearing line names the software and is reported with higher
     # confidence than the bare one.
-    assert 'Node.js Express framework' in by_endpoint['3000/tcp']['description']
-    assert by_endpoint['3000/tcp']['confidence_score'] == 95
-    assert by_endpoint['8080/tcp']['confidence_score'] == 70
+    assert 'Node.js Express framework' in by_endpoint['172.18.0.3:3000/tcp']['description']
+    assert by_endpoint['172.18.0.3:3000/tcp']['confidence_score'] == 95
+    assert by_endpoint['172.18.0.3:8080/tcp']['confidence_score'] == 70
     # A filtered port is less exposed than an open one.
-    assert by_endpoint['22/tcp']['exposure'] < by_endpoint['3000/tcp']['exposure']
+    assert by_endpoint['172.18.0.3:22/tcp']['exposure'] < by_endpoint['172.18.0.3:3000/tcp']['exposure']
     assert all(finding['remediation'] for finding in findings)
+
+
+# The bug this covers: a subnet sweep emits one host block per live host, and
+# without host tracking every block's findings carried the same port-only
+# endpoint - so the fingerprint dedupe merged them and every host after the
+# first silently vanished from the report.
+def test_nmap_sweep_output_attributes_findings_per_host():
+    sweep = """Nmap scan report for 172.28.0.2
+Host is up (0.00010s latency).
+
+PORT     STATE SERVICE VERSION
+80/tcp   open  http    Apache httpd 2.4.62
+
+Nmap scan report for 172.28.0.3
+Host is up (0.00012s latency).
+
+PORT     STATE SERVICE VERSION
+80/tcp   open  http    nginx 1.24.0
+
+Nmap done: 254 IP addresses (2 hosts up) scanned in 12.50 seconds
+"""
+    findings = AnalyzerAgent()._finding_nmap(sweep, 'nmap')
+
+    endpoints = [finding['endpoint'] for finding in findings]
+    assert endpoints == ['172.28.0.2:80/tcp', '172.28.0.3:80/tcp']
+    # Two findings for the same port on different hosts, not one merged one.
+    assert len({finding['endpoint'] for finding in findings}) == 2
+    assert all('on 172.28.0.' in finding['description'] for finding in findings)
+
+
+def test_extract_nmap_hosts_prefers_addresses_and_deduplicates():
+    output = """Nmap scan report for router (10.0.0.1)
+Nmap scan report for 10.0.0.2
+Nmap scan report for router (10.0.0.1)
+"""
+    assert extract_nmap_hosts(output) == ['10.0.0.1', '10.0.0.2']
 
 
 # The bug this covers: the severity was title-cased ('Critical') and then

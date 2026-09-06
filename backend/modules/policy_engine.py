@@ -243,6 +243,20 @@ class PolicyEngine:
             return None
 
     def validate_target(self, target, authorized_scopes):
+        # A CIDR target is a whole range being scanned, not one address. It
+        # must fit INSIDE an authorized network: normalize_host strips the
+        # prefix ('192.168.1.0/24' -> '192.168.1.0'), so the membership check
+        # below used to pass a /24 sweep against a /25 authorization by
+        # validating only the base address - authorizing double the range.
+        if '/' in str(target):
+            requested = self._as_network(str(target).strip())
+            if requested is not None:
+                return any(
+                    (network := self._as_network(str(scope).strip())) is not None
+                    and requested.version == network.version
+                    and requested.subnet_of(network)
+                    for scope in filter(None, authorized_scopes)
+                )
         host = self.normalize_host(target)
         if not host:
             return False

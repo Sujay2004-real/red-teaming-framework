@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Generates the fictional client 'Request for Security Assessment Services' PDF.
 
-Phase-2 deep-assessment edition: same fictional client, escalated engagement.
-The letter is deliberately parser-compatible (label/value tables, numbered
-objectives, both restriction sentence shapes) while demanding far deeper
-coverage than the original request.
+Virtualization-lab edition (letter v4): the same fictional client, but the
+assessment now targets a dedicated virtualization laboratory of real systems
+rather than container-only lab machines. Every authorized asset is a virtual
+machine (or the segment they live on): the storefront and a deliberately
+weakened legacy training server as full VMs on the lab's host-only network
+(192.168.56.0/24), plus a discovery sweep of that segment. The letter is
+deliberately parser-compatible (label/value tables, numbered objectives, both
+restriction sentence shapes).
 """
 from datetime import date
 from pathlib import Path
@@ -22,9 +26,9 @@ OUT = Path(__file__).with_name('JuiceBox_Security_Assessment_Request.pdf')
 
 COMPANY = 'JuiceBox Retail Pvt. Ltd.'
 ADDRESS = '4th Floor, Orion Tech Park, Whitefield, Bengaluru, Karnataka 560066'
-ENGAGEMENT_REF = 'JB/SEC/2026/021'
-ENGAGEMENT_DATE = date(2026, 9, 2)
-TEST_WINDOW = '04 September 2026 to 10 September 2026 (both days inclusive)'
+ENGAGEMENT_REF = 'JB/SEC/2026/023'
+ENGAGEMENT_DATE = date(2026, 9, 6)
+TEST_WINDOW = '08 September 2026 to 14 September 2026 (both days inclusive)'
 PRIMARY_CONTACT = 'Ananya Rao — Chief Information Security Officer'
 PRIMARY_EMAIL = 'ciso.office@juiceboxretail.example'
 PRIMARY_PHONE = '+91 80 4XXX 2100 (ext. 401)'
@@ -110,7 +114,7 @@ def on_page(canvas, doc):
 doc = BaseDocTemplate(str(OUT), pagesize=A4, leftMargin=18 * mm,
                       rightMargin=18 * mm, topMargin=16 * mm,
                       bottomMargin=18 * mm,
-                      title='Request for Security Assessment Services — Deep Assessment',
+                      title='Request for Security Assessment Services — Virtualization Lab Assessment',
                       author=COMPANY)
 frame = Frame(18 * mm, 18 * mm, 174 * mm, 264 * mm, id='main')
 doc.addPageTemplates([PageTemplate(id='page', frames=[frame], onPage=on_page)])
@@ -138,13 +142,16 @@ story.append(Paragraph('1. Cover letter from the client', h2))
 story.append(Paragraph(f'Dear {PROVIDER},', body))
 story.append(Paragraph(
     f'{COMPANY} ("JuiceBox", "the Company") is preparing to launch a new customer-facing '
-    'e-commerce storefront. Under engagement JB/SEC/2026/014 your team performed the '
-    'initial pre-launch assessment of the release-candidate deployment. As launch '
-    'approaches, the Company now requires a substantially deeper second-pass '
-    'assessment of the same laboratory environment: full service and version '
-    'enumeration, a complete HTTP security-header audit, technology fingerprinting, '
-    'cookie and transport review, and rate-limited template-driven vulnerability '
-    'checks, all correlated into one prioritized report.', body))
+    'e-commerce storefront. Under engagement JB/SEC/2026/022 your team performed the '
+    'second-pass deep assessment of the container-based laboratory deployment. For this '
+    'final pre-launch review, the Company has commissioned a dedicated assessment '
+    'virtualization laboratory: full operating systems running as virtual machines on an '
+    'isolated network, rather than shared containers, so that the assessment exercises '
+    'real kernels, real network stacks and real multi-service hosts. The Company now '
+    'requires the same depth of assessment against this virtualization laboratory: full '
+    'service and version enumeration, a complete HTTP security-header audit, technology '
+    'fingerprinting, cookie and transport review, and rate-limited template-driven '
+    'vulnerability checks, all correlated into one prioritized report.', body))
 story.append(Paragraph(
     'We request your team to perform a non-destructive external and web-application '
     'security assessment of the assets identified in Section 3 of this document, '
@@ -154,9 +161,9 @@ story.append(Paragraph(
     'must be individually reviewed and approved by your human operator before '
     'execution. This is acceptable to the Company, and we specifically require that '
     'this human approval step remain in force for every command issued against our '
-    'assets. Given the depth requested, the Company also asks that the final report '
-    'quantify the coverage achieved relative to the manual effort an unaided tester '
-    'would have required, as described in Section 6.', body))
+    'assets. The Company also asks that the final report quantify the coverage '
+    'achieved relative to the manual effort an unaided tester would have required, '
+    'as described in Section 6.', body))
 story.append(Paragraph(
     'All systems listed in Section 3 are owned or controlled by the Company. No '
     'third-party, shared-hosting, or cloud-provider infrastructure is included in '
@@ -172,16 +179,18 @@ story.append(Paragraph(
     'JuiceBox Retail operates a loyalty and retail platform serving approximately 240,000 '
     'registered customers. The pre-release storefront (internally named "Juice Shop") is a '
     'new Node.js-based e-commerce application scheduled to go live at the end of Q3 2026. '
-    'The initial assessment under engagement JB/SEC/2026/014 confirmed basic exposure '
-    'but was deliberately shallow. The Company is now contractually obliged to its '
-    'payment partners to evidence a deeper pre-launch vulnerability assessment '
-    'covering the full external attack surface. The assessment requested here is that '
-    'evidence.', body))
+    'The Company is now contractually obliged to its payment partners to evidence a final '
+    'pre-launch vulnerability assessment performed against systems that behave as real '
+    'production hosts behave.', body))
 story.append(Paragraph(
-    'The Company additionally maintains an internal web-application security-training system '
-    '(internally named "DVWA Lab") used by the IT team. A baseline assessment of this '
-    'training system is requested under the same engagement for calibration purposes, as '
-    'described in Section 3.2.', body))
+    'To meet that obligation, the Company has built an assessment virtualization '
+    'laboratory on an isolated host-only network (192.168.56.0/24). The storefront '
+    'deployment to be assessed runs there as a full virtual machine on the '
+    'laboratory application host, alongside a deliberately weakened legacy training '
+    'host rebuilt as a full virtual machine, so the assessment exercises genuine '
+    'multi-service operating systems rather than single-purpose containers. The '
+    'assessment requested here covers that laboratory and is the evidence the '
+    'payment partners require.', body))
 
 # ------------------------------------------------------------- scope
 story.append(Paragraph('3. Authorized scope of the assessment', h2))
@@ -194,8 +203,8 @@ story.append(grid_table(
     ['Attribute', 'Value'],
     [
         ['System name', 'Juice Shop pre-release storefront'],
-        ['Authorized target address', 'juice-shop:3000 (assessment-lab network)'],
-        ['Authorized scope identifiers', 'juice-shop, juice-shop:3000'],
+        ['Authorized target address', '192.168.56.10:3000 (virtualization laboratory)'],
+        ['Authorized scope identifiers', '192.168.56.10, 192.168.56.10:3000'],
         ['Technology', 'Node.js / Express web application, HTTP on TCP port 3000'],
         ['Asset criticality (client-declared, 0-100)',
          '90 — customer-facing e-commerce platform, weeks from launch'],
@@ -203,23 +212,53 @@ story.append(grid_table(
          'Deep external and web-application assessment (full framework toolset, '
          'subject to Section 5.3)'],
         ['Environment',
-         'Isolated laboratory deployment (Docker), mirrors release-candidate build'],
+         'Full virtual machine (laboratory application host) on the isolated '
+         'laboratory network, mirrors release-candidate build'],
     ],
     [62 * mm, 112 * mm]))
 story.append(Spacer(1, 4))
 story.append(Paragraph(
-    '<b>3.2 Secondary asset — internal training system (in scope, baseline only)</b>', body))
+    '<b>3.2 Secondary asset — legacy multi-service training server (in scope, '
+    'baseline only)</b>', body))
 story.append(grid_table(
     ['Attribute', 'Value'],
     [
-        ['System name', 'DVWA internal security-training lab'],
-        ['Authorized target address', 'dvwa:80 (assessment-lab network)'],
-        ['Authorized scope identifiers', 'dvwa, dvwa:80'],
-        ['Technology', 'Apache / PHP / MySQL training application, HTTP on TCP port 80'],
+        ['System name', 'Legacy multi-service training server'],
+        ['Authorized target address', '192.168.56.20:80 (virtualization laboratory)'],
+        ['Authorized scope identifiers', '192.168.56.20, 192.168.56.20:80'],
+        ['Technology',
+         'Legacy multi-service Linux server (Apache / PHP / MySQL training '
+         'applications), HTTP on TCP port 80'],
         ['Asset criticality (client-declared, 0-100)',
-         '45 — internal training system, no production data'],
+         '50 — deliberately weakened training host, no production data'],
         ['Assessment type',
          'Service discovery and HTTP header baseline only (see Section 5.4)'],
+        ['Environment',
+         'Full virtual machine on the isolated laboratory network'],
+    ],
+    [62 * mm, 112 * mm]))
+story.append(Spacer(1, 4))
+story.append(Paragraph(
+    '<b>3.3 Network segment — laboratory virtualization range (in scope, discovery '
+    'sweep only)</b>', body))
+story.append(Paragraph(
+    'To confirm that no unmanaged service is exposed on the isolated laboratory '
+    'network, the Company additionally authorizes a network-level discovery sweep '
+    'of the segment below. This authorization is strictly limited to host and '
+    'service discovery: application-layer inspection of any system found on the '
+    'segment requires a separate authorization naming that system.', body))
+story.append(grid_table(
+    ['Attribute', 'Value'],
+    [
+        ['System name', 'Virtualization lab segment'],
+        ['Authorized target address', '192.168.56.0/24 (isolated laboratory network)'],
+        ['Authorized scope identifiers', '192.168.56.0/24'],
+        ['Technology',
+         'Isolated host-only network carrying the laboratory virtual machines'],
+        ['Asset criticality (client-declared, 0-100)',
+         '65 — dedicated laboratory infrastructure, no production data'],
+        ['Assessment type',
+         'Discovery sweep only (host and service enumeration, see Section 5.5)'],
     ],
     [62 * mm, 112 * mm]))
 story.append(Spacer(1, 4))
@@ -228,14 +267,17 @@ story.append(Paragraph(
     'framework when each target is registered, because they feed the risk-priority scoring '
     'of the findings in the final report.', body))
 
-story.append(Paragraph('3.3 Assets explicitly OUT OF SCOPE', body))
+story.append(Paragraph('3.4 Assets explicitly OUT OF SCOPE', body))
 story.append(Paragraph(
     'The following are <b>strictly out of scope</b>. Any traffic, scanning, probing or '
     'enumeration directed at these systems is a breach of this agreement and must not occur:',
     body))
 for item in [
-    'Any host other than the two assets named in Sections 3.1 and 3.2, including any address '
-    'obtained by DNS enumeration or referenced in application responses.',
+    'Any host other than the three assets named in Sections 3.1, 3.2 and 3.3, including any '
+    'address obtained by DNS enumeration or referenced in application responses. Hosts '
+    'discovered by the Section 3.3 sweep are in this category until separately authorized.',
+    'The virtualization host machine itself and the assessment team\'s own workstation '
+    'connected to the laboratory network.',
     'JuiceBox corporate network, employee endpoints, VPN concentrators and mail servers.',
     'Third-party payment gateways, CDN providers, analytics or any externally hosted service.',
     'Any production system of the Company, including the currently live legacy storefront.',
@@ -274,6 +316,10 @@ for item in [
     '<b>4.7 Findings correlation and prioritization:</b> consolidate all findings, '
     'remove duplicates, and rank them by severity, risk, business criticality and '
     'confidence, so that the Company can schedule remediation before launch.',
+    '<b>4.8 Network segment sweep:</b> enumerate the live hosts and exposed '
+    'services on the authorized laboratory segment (Section 3.3), strictly '
+    'rate-limited, so that any unmanaged or unexpected service on the shared '
+    'range is surfaced and reported per host.',
 ]:
     story.append(bullet(item))
 
@@ -322,15 +368,26 @@ story.append(Paragraph(
     'authorized for this target, subject to the rate limit in Section 5.1.', body))
 
 story.append(Paragraph(
-    '<b>5.4 Technique restrictions specific to the DVWA training system (Section 3.2)</b>',
+    '<b>5.4 Technique restrictions specific to the legacy training server (Section 3.2)</b>',
     body))
 story.append(Paragraph(
-    'Because the training system contains intentionally vulnerable code, only service '
+    'Because the legacy training host contains intentionally vulnerable code, only service '
     'discovery (nmap) and HTTP header inspection (curl, whatweb) are authorized against '
     'it. Template-driven vulnerability checks (e.g. nuclei) and every other tool must '
-    'not be run against the DVWA lab.', body))
+    'not be run against the legacy server.', body))
 
-story.append(Paragraph('<b>5.5 Incidents and escalation</b>', body))
+story.append(Paragraph(
+    '<b>5.5 Technique restrictions specific to the lab segment (Section 3.3)</b>',
+    body))
+story.append(Paragraph(
+    'The Section 3.3 authorization is for network-level discovery only. '
+    'Application-layer inspection (curl, whatweb, sslscan, nuclei) must not be '
+    'run against the 192.168.56.0/24 segment. A host discovered by the sweep is '
+    'not authorized for any further assessment by that fact alone; a separate '
+    'authorization naming the host is required first, subject to the rate limit '
+    'in Section 5.1.', body))
+
+story.append(Paragraph('<b>5.6 Incidents and escalation</b>', body))
 story.append(Paragraph(
     'If any activity causes an unintended service disruption, or if the team discovers '
     'evidence of an actual security compromise, all testing must stop immediately and the '

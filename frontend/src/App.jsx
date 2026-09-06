@@ -56,6 +56,14 @@ function App() {
   const [target, setTarget] = useState({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 })
   const [assessment, setAssessment] = useState({ target_id: '', objective: '', requirements: '' })
   const [requirementFile, setRequirementFile] = useState(null)
+  // Two ways into an assessment: mode 'letter' drives one registered target
+  // (the PDF import path), mode 'prompt' lets the operator pick several
+  // targets and describe the engagement in their own words.
+  const [assessmentMode, setAssessmentMode] = useState('letter')
+  // Mode 'prompt' state: which registered targets the operator picked, and
+  // the free-text engagement prompt the framework plans from.
+  const [promptTargetIds, setPromptTargetIds] = useState([])
+  const [promptText, setPromptText] = useState('')
   // The hidden file input behind the dropzone. The whole box is clickable,
   // so the picker is opened programmatically through this ref.
   const briefFileRef = useRef(null)
@@ -182,6 +190,31 @@ function App() {
   })
   const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean) }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
   const createAssessment = e => run('planner', async () => { e.preventDefault(); let requirements = assessment.requirements; if (requirementFile) { const form = new FormData(); form.append('file', requirementFile); const data = await request('/requirements/extract', { method: 'POST', body: form }); requirements = data.text } const selectedTarget = targets.find(t => t.id === Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t => t.address === selectedTarget.scope_domain_ip); const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ ...assessment, target_id: Number(assessment.target_id), requirements, ...(briefApplies ? { engagement_brief: brief } : {}) }) }); setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null); await refresh(); await openAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source === 'ai-filtered' ? 'ok' : 'info'); const dropped = a.restricted_steps_dropped || 0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped > 1 ? 's' : ''} using tools the client's letter restricts for this target.` : '')) })
+  // The second way in: the operator picks one or more registered targets
+  // and writes the engagement as their own prompt. The prompt becomes the
+  // objective the planner plans from — with an AI provider configured it
+  // steers the drafted commands, without one the policy-checked default
+  // plan for each target is used. One assessment is drafted per target so
+  // per-target scopes, criticality and letter restrictions still apply.
+  const createFromPrompt = e => run('planner', async () => {
+    e.preventDefault()
+    const text = promptText.trim()
+    if (!text) throw new Error('Write your prompt first — describe what this assessment should look for.')
+    if (!promptTargetIds.length) throw new Error('Pick at least one registered target for this prompt.')
+    const picked = promptTargetIds.map(id => targets.find(t => t.id === id)).filter(Boolean)
+    if (!picked.length) throw new Error('The selected targets are no longer registered; pick again.')
+    let firstId = null, totalDropped = 0
+    for (const t of picked) {
+      const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ target_id: t.id, objective: text }) })
+      totalDropped += a.restricted_steps_dropped || 0
+      if (firstId === null) firstId = a.id
+    }
+    await refresh(); await openAssessment(firstId)
+    setPromptTargetIds([])
+    pushFeed(`Drafted ${picked.length} plan${picked.length !== 1 ? 's' : ''} from your prompt for ${picked.map(t => t.name).join(', ')}. Nothing runs until you approve it.`, 'ok')
+    setNotice(`Drafted ${picked.length} plan${picked.length !== 1 ? 's' : ''} from your prompt${totalDropped ? ` — ${totalDropped} step${totalDropped > 1 ? 's' : ''} using tools the client's letter restricts were removed` : ''}. Review the commands, then approve each one when you're ready.`)
+  })
+  const togglePromptTarget = id => setPromptTargetIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
   const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan }) }); await openAssessment(id); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
   // The assessment id is captured up front so switching assessments
   // mid-request cannot write one assessment's results into another, and the
@@ -322,10 +355,23 @@ function App() {
           <div className="split"><label>Username<input value={settings.proxy_username || ''} onChange={e => setSettings({ ...settings, proxy_username: e.target.value })} /></label><label>Password<input type="password" placeholder={settings.proxy_password_configured ? 'Configured ••••••••' : 'Proxy password'} value={settings.proxy_password || ''} onChange={e => setSettings({ ...settings, proxy_password: e.target.value })} /><small>{settings.proxy_password_configured ? 'Leave blank to keep the stored password.' : 'Encrypted before storage and never returned by the API.'}</small></label></div>
           <button className="secondary" disabled={busy}>{busy ? 'Saving…' : 'Save configuration'}</button><small>Responses never return secret values.</small>
         </form></section>
-        <section className="panel"><h2>Add authorized target</h2><form onSubmit={addTarget}><label>Display name<input required value={target.name} onChange={e => setTarget({ ...target, name: e.target.value })} placeholder="Juice Shop lab" /></label><label>Primary host<input required value={target.scope_domain_ip} onChange={e => setTarget({ ...target, scope_domain_ip: e.target.value })} placeholder="juice-shop:3000" /></label><label>Allowed domains / CIDRs<input value={target.authorized_scopes} onChange={e => setTarget({ ...target, authorized_scopes: e.target.value })} placeholder="juice-shop, 172.18.0.0/16" /></label><label>Asset criticality<input type="number" min="0" max="100" required value={target.criticality} onChange={e => setTarget({ ...target, criticality: e.target.value })} /><small>0-100. Feeds the priority score of every finding on this target.</small></label><button disabled={busy}>{agentBusy('registrar') ? 'Registering…' : 'Add target'}</button></form></section>
-        {/* The requirements picker clears its value after reading the file,
-            so choosing the same document again still fires onChange. */}
-        <section className="panel"><h2>New assessment</h2><form onSubmit={createAssessment}><label>Target<select required value={assessment.target_id} onChange={e => setAssessment({ ...assessment, target_id: e.target.value })}><option value="">Select target</option>{targets.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Objective<textarea required value={assessment.objective} onChange={e => setAssessment({ ...assessment, objective: e.target.value })} placeholder="Identify high-risk web vulnerabilities before release" /></label><label>Client requirements<input type="file" accept=".txt,.md,.pdf,.docx" onChange={e => { const file = e.target.files?.[0] || null; e.target.value = ''; setRequirementFile(file) }} /><small>{assessment.requirements ? `Context from “${briefFilename}” is attached and will guide planning.` : 'Optional planning context; every command still needs HITL approval.'}</small></label><button disabled={busy}>{agentBusy('planner') ? 'Drafting the plan…' : brief ? 'Draft plan from the letter' : 'Generate command plan'}</button></form></section>
+        <section className="panel"><h2>Add authorized target</h2><form onSubmit={addTarget}><label>Display name<input required value={target.name} onChange={e => setTarget({ ...target, name: e.target.value })} placeholder="Juice Shop lab" /></label><label>Primary host or network (CIDR)<input required value={target.scope_domain_ip} onChange={e => setTarget({ ...target, scope_domain_ip: e.target.value })} placeholder="192.168.56.10:3000, 192.168.56.20:80 or 192.168.56.0/24" /><small>CIDR targets run a live-host and common-port discovery sweep. Ranges are limited to 256 addresses per assessment.</small></label><label>Allowed domains / CIDRs<input value={target.authorized_scopes} onChange={e => setTarget({ ...target, authorized_scopes: e.target.value })} placeholder="192.168.56.10, 192.168.56.0/24" /></label><label>Asset criticality<input type="number" min="0" max="100" required value={target.criticality} onChange={e => setTarget({ ...target, criticality: e.target.value })} /><small>0-100. Feeds the priority score of every finding on this target.</small></label><button disabled={busy}>{agentBusy('registrar') ? 'Registering…' : 'Add target'}</button></form></section>
+        {/* Two ways into an assessment: from a registered target (the letter
+            import path fills objective/requirements for you), or the operator
+            picks targets and writes their own engagement prompt. */}
+        <section className="panel"><h2>New assessment</h2>
+          <div className="mode-tabs" role="tablist" aria-label="Assessment entry mode">
+            <button type="button" role="tab" aria-selected={assessmentMode === 'letter'} className={`mode-tab${assessmentMode === 'letter' ? ' active' : ''}`} onClick={() => setAssessmentMode('letter')} disabled={busy}>From a letter</button>
+            <button type="button" role="tab" aria-selected={assessmentMode === 'prompt'} className={`mode-tab${assessmentMode === 'prompt' ? ' active' : ''}`} onClick={() => setAssessmentMode('prompt')} disabled={busy}>Your own prompt</button>
+          </div>
+          {assessmentMode === 'letter' ? <form onSubmit={createAssessment}><label>Target<select required value={assessment.target_id} onChange={e => setAssessment({ ...assessment, target_id: e.target.value })}><option value="">Select target</option>{targets.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Objective<textarea required value={assessment.objective} onChange={e => setAssessment({ ...assessment, objective: e.target.value })} placeholder="Identify high-risk web vulnerabilities before release" /></label><label>Client requirements<input type="file" accept=".txt,.md,.pdf,.docx" onChange={e => { const file = e.target.files?.[0] || null; e.target.value = ''; setRequirementFile(file) }} /><small>{assessment.requirements ? `Context from “${briefFilename}” is attached and will guide planning.` : 'Optional planning context; every command still needs HITL approval.'}</small></label><button disabled={busy}>{agentBusy('planner') ? 'Drafting the plan…' : brief ? 'Draft plan from the letter' : 'Generate command plan'}</button></form> :
+          <form onSubmit={createFromPrompt}>
+            <label>Targets{targets.length === 0 ? <small>No targets registered yet — add one in “Add authorized target” above.</small> : <div className="target-pick">{targets.map(t => <button type="button" key={t.id} className={`pick-chip${promptTargetIds.includes(t.id) ? ' picked' : ''}`} onClick={() => togglePromptTarget(t.id)} disabled={busy} aria-pressed={promptTargetIds.includes(t.id)}><b>{t.name}</b><small>{t.scope_domain_ip}</small>{!!t.restricted_tools?.length && <small className="pick-warn">no {t.restricted_tools.join(', ')}</small>}</button>)}</div>}</label>
+            <label>Your prompt<textarea required maxLength={1000} value={promptText} onChange={e => setPromptText(e.target.value)} placeholder="Run a deep pre-launch check on the storefront: enumerate services and versions, audit the HTTP security headers, fingerprint the stack, and report anything an attacker could use — stay non-destructive." /><small>{1000 - promptText.length} characters left. With an AI provider configured, your prompt steers the drafted commands; without one, each target gets the standard policy-checked plan.</small></label>
+            <button disabled={busy || !promptTargetIds.length || !promptText.trim()}>{agentBusy('planner') ? `Drafting ${promptTargetIds.length || ''} plan${promptTargetIds.length !== 1 ? 's' : ''}…` : `Generate plan${promptTargetIds.length !== 1 ? 's' : ''} from prompt`}</button>
+            <small>Pick one or more targets, describe the engagement in your own words, and the framework drafts a plan per target. Scopes, criticality and the letter's per-target tool restrictions still apply, and every command waits for your approval.</small>
+          </form>}
+        </section>
       </aside>
 
       <section className="main-column">
@@ -405,6 +451,7 @@ function App() {
 
         {selected && <>
           <section className="panel"><div className="panel-title"><div><span className="eyebrow">ASSESSMENT #{selected.id}</span><h2>Editable command plan</h2></div><button className="secondary compact" onClick={savePlan} disabled={busy || planLocked || !planDirty}>{agentBusy('planner') ? 'Saving…' : 'Save plan'}</button></div><p className="muted intro">Review every command before execution. Enabled steps require approval and pass policy checks.</p>
+            {selectedTarget?.scope_type === 'network' && <div className="network-inventory"><b>Discovered hosts</b><span>{selected.discovered_hosts?.length || 0} reported by nmap</span>{selected.discovered_hosts?.length ? <code>{selected.discovered_hosts.join(', ')}</code> : <small>Run the approved discovery steps to populate the inventory. Register any host separately before deeper testing.</small>}</div>}
             {!!selectedTarget?.restricted_tools?.length && <small className="plan-note">Client's letter for this target: {selectedTarget.restricted_tools.join(', ')} {selectedTarget.restricted_tools.length > 1 ? 'are' : 'is'} restricted and will be refused at approval.</small>}
             <div className="plan">{draftPlan.map((step, i) => {
               const execution = executionByStep.get(i)
