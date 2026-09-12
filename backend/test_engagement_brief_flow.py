@@ -16,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import Base, get_db
 from main import app
+from conftest import OPERATOR_TEST_KEY
 
 
 @pytest.fixture
@@ -37,7 +38,7 @@ def client():
 
     app.dependency_overrides[get_db] = override_db
     try:
-        yield TestClient(app)
+        yield TestClient(app, headers={'X-API-Key': OPERATOR_TEST_KEY})
     finally:
         app.dependency_overrides.clear()
         Base.metadata.drop_all(bind=engine)

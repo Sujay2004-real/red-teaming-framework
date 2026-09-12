@@ -6,9 +6,13 @@ class Reporter:
         self.template_dir = os.path.join(os.path.dirname(__file__), 'templates')
         self.env = Environment(loader=FileSystemLoader(self.template_dir), autoescape=select_autoescape(['html']))
 
-    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode=''):
+    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode='', current_phase='recon', phase_summary=None, attack_paths=None):
         template = self.env.get_template('report_template.html')
         severity_counts = {level: sum(1 for f in findings if f.get('severity') == level) for level in ('Critical','High','Medium','Low')}
+        verified_counts = {
+            'verified': sum(1 for f in findings if f.get('verification') == 'verified'),
+            'attempted': sum(1 for f in findings if f.get('verification') == 'attempted'),
+        }
         # Only the facts a report reader needs from the letter: who asked for
         # the work, under which reference, and what they ruled out. The raw
         # letter text stays out of the deliverable.
@@ -21,7 +25,7 @@ class Reporter:
             'out_of_scope': [str(o) for o in (brief.get('out_of_scope') or [])][:20],
             'prohibited': [str(o) for o in (brief.get('prohibited') or [])][:20],
         }
-        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, engagement=engagement, analysis_mode=analysis_mode or '')
+        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, verified_counts=verified_counts, engagement=engagement, analysis_mode=analysis_mode or '', current_phase=current_phase or 'recon', phase_summary=phase_summary or [], attack_paths=attack_paths or [])
         with open(output_path, 'w', encoding='utf-8') as stream:
             stream.write(html)
         return output_path

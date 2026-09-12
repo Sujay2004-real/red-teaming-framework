@@ -21,9 +21,12 @@ services:
     volumes:
       - ./backend:/app
       - data_volume:/app/data
-    # No depends_on the lab targets: they live behind the "lab" profile and
-    # the backend starts fine without them (a real engagement has its own
-    # authorized targets on the client network).
+    # Lets the scanners reach services on the Docker host itself (Docker
+    # Desktop provides host.docker.internal natively; host-gateway maps it
+    # on Linux). A service running on the host machine is reachable as
+    # host.docker.internal:<port>.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   frontend:
     build:
@@ -42,27 +45,11 @@ services:
       # the UI from another device on the network.
       - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
 
-  # The deliberately vulnerable lab targets are behind the "lab" profile so a
-  # real engagement can run the assessment toolkit alone:
-  #   docker compose up                    -> backend + frontend only (toolkit)
-  #   docker compose --profile lab up      -> toolkit + Juice Shop + DVWA (demo)
-  # On Linux, uncomment network_mode on the backend to put the scanners
-  # directly on the host network for accurate LAN subnet scans.
-  juice-shop:
-    image: docker.io/bkimminich/juice-shop:latest
-    profiles: ["lab"]
-    networks:
-      - labnet
-    ports:
-      - "3000:3000"
-
-  dvwa:
-    image: ghcr.io/digininja/dvwa:latest
-    profiles: ["lab"]
-    networks:
-      - labnet
-    ports:
-      - "8080:80"
+  # The toolkit runs alone: the assessment targets (a self-hosted application
+  # on the host, a Kali attacker VM, or any real authorized client system)
+  # live outside this Compose stack. On Linux, uncomment network_mode: host
+  # on the backend to put the scanners directly on the host network for
+  # accurate LAN subnet scans.
 
 volumes:
   data_volume:
@@ -70,15 +57,4 @@ volumes:
 
 networks:
   labnet:
-    # Fixed subnet so the Docker lab machines sit at stable, reproducible
-    # addresses for the container-based demo. No sample-letter target lives
-    # here any more: letter v4 (JB/SEC/2026/023) authorizes only the
-    # virtualization lab's host-only network (storefront 192.168.56.10:3000,
-    # legacy server 192.168.56.20:80, segment 192.168.56.0/24 — see
-    # .clinerules "Deployment modes"), so the lab profile is purely a
-    # fallback demo without the VMs. If this range collides with another
-    # network on the host, compose refuses to start; change it here.
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/24

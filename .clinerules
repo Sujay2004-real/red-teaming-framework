@@ -1,39 +1,68 @@
 # Project Context — AI-Assisted Red Teaming Framework ("Red Team Control Center")
 
-Human-in-the-loop security assessment platform: operator imports a client engagement
-letter (PDF/DOCX/MD/TXT), the framework parses scope/targets/rules deterministically,
-drafts a policy-checked command plan, runs each scanner command ONLY after explicit
-human approval, correlates findings, and emits an HTML report. Authorized lab use only.
+Human-in-the-loop security assessment platform covering the FULL authorized-testing
+lifecycle: operator imports a client engagement letter (PDF/DOCX/MD/TXT), the
+framework parses scope/targets/rules deterministically, drafts a policy-checked
+command plan, runs each scanner command ONLY after explicit human approval,
+correlates findings, verifies them with letter-gated controlled exploitation,
+collects bounded post-exploitation proof, and emits an HTML report. The phases
+(scoping → recon → vuln analysis → exploitation → post-exploitation → reporting)
+are visible in the UI stepper and drive the plan structure. Authorized lab use only.
 
 ## Architecture map
 
 - `frontend/src/App.jsx` — the ENTIRE single-page React 19 UI (one file). `App.css` styles it.
 - `backend/main.py` — FastAPI app: targets, assessments, execute, analyze, report,
-  settings, `/engagement/parse`, `/requirements/extract`, `/health`.
+  settings, `/engagement/parse`, `/requirements/extract`, `/capabilities`,
+  `/assessments/{id}/phases`, `/assessments/{id}/phases/{phase}/plan`, `/health`.
 - `backend/models.py` — Pydantic request schemas with bounds.
 - `backend/database.py` — SQLAlchemy/SQLite ORM + migrations.
-- `backend/modules/` — `engagement_parser` (letter → structured brief, deterministic),
-  `planner` (AI or default plan, policy-filtered), `policy_engine` (allowlist, fail-closed,
-  scope checks — THE security core), `executor` (async subprocess, 360s timeout, output
-  caps, env sandbox), `analyzer` (findings + scoring), `reporter` (Jinja2 HTML),
+- `backend/modules/` — `engagement_parser` (letter → structured brief, deterministic,
+  incl. per-target `exploitation_authorized` + `verification_endpoints`),
+  `planner` (AI or default recon plan, policy-filtered), `exploit_planner`
+  (findings → exploitation/post-exploitation steps, every step policy-validated),
+  `next_steps` (adaptive next-step proposals — state digest → ranked candidates
+  with verified finding provenance → policy-checked; ALWAYS proposes, NEVER
+  persists. See "Tier 1: adaptive next-step proposals" below),
+  `phases` (the phase model shared by backend and UI: PHASES, PLAN_PHASES,
+  ANALYSIS_ADVANCES_TO, EXPLOITATION_GATED_TOOLS, PAYLOAD_FLAGS, VM_ONLY_TOOLS),
+  `policy_engine` (allowlist, fail-closed, scope checks — THE security core; new
+  `exploitation` capability group for sqlmap/msfconsole/searchsploit, curl payload
+  flags gated on letter authorization, msfconsole `-x` scripts validated statement
+  by statement: module tree allowlist, set-key allowlist, RHOSTS scope-checked),
+  `executor` (async subprocess, 360s timeout, output caps, env sandbox; delegates
+  to the VM engine when remote settings are passed), `ssh_executor` (Kali
+  attacker-VM engine: paramiko SSH + tmux send-keys/capture-pane, per-run
+  attestation; EXPECTED_TOOLS now includes sqlmap/searchsploit/msfconsole),
+  `analyzer` (findings + scoring + sqlmap/searchsploit/msfconsole parsers +
+  `match_verification` linking exploitation results to recon findings),
+  `reporter` (Jinja2 HTML with phase summary + verification section),
   `secret_store` (Fernet encryption at rest).
-- `docker-compose.yml` — backend :8000, frontend :5173; Juice Shop :3000 and DVWA :8080
-  behind the `lab` profile (see "Deployment modes"). The custom `labnet` network is
-  pinned to `172.28.0.0/24` so the letter's segment target names a real range.
-- Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (letter v4, the virtualization-lab
-  engagement `JB/SEC/2026/023`). Every authorized asset lives on the lab's host-only network:
-  the storefront as a full VM at `192.168.56.10:3000`, a legacy multi-service VM at
-  `192.168.56.20:80`, and the `192.168.56.0/24` segment for a discovery sweep. No letter
-  target names a compose `lab`-profile container.
-- `backend/smoke_e2e.py` — one-shot end-to-end run against the live stack (letter → target
-  → plan → execute every step → analyze → report), printing each result.
+- `docker-compose.yml` — backend :8000, frontend :5173 only (the assessor's
+  toolkit). The backend maps `host.docker.internal` to `host-gateway` so Docker
+  execution mode can reach services on the host (e.g. the OmniRoute gateway).
+- Sample letter: `JuiceBox_Security_Assessment_Request.pdf` (letter v7, the
+  real-application engagement `JB/SEC/2026/026`). The assessed asset is a real,
+  self-hosted production app — the client's OmniRoute AI gateway (Node.js/
+  Next.js, OpenAI-compatible API + dashboard) running on the assessment host
+  at `192.168.198.86:20128` — plus the `192.168.198.0/24` lab segment for a
+  discovery sweep. No letter target names a compose container.
+  The v7 letter AUTHORIZES controlled vulnerability verification for the
+  gateway only (Section 5.2: bounded PoC payloads, one benign verification
+  record per flaw; a clean verification against the real app is a valid,
+  expected outcome), declares `/v1/chat/completions` as its verification
+  endpoint, and keeps brute-force / DoS / persistence / lateral movement
+  prohibited.
+- `backend/smoke_e2e.py` — one-shot end-to-end run against the live stack (letter →
+  target → plan → execute every phase → analyze → exploit → verify → report),
+  printing each result.
 
 ## Run / test
 
-- Demo stack: `docker compose --profile lab up --build` → UI at http://localhost:5173
-- Toolkit only (no lab targets): `docker compose up --build`
+- Toolkit stack: `docker compose up --build` → UI at http://localhost:5173
+  (the demo target — the OmniRoute gateway — runs on the host itself)
 - Frontend checks: `cd frontend; npm run lint; npm run build`
-- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (115 tests)
+- Backend tests: `cd backend; .\venv\Scripts\python.exe -m pytest -q` (188 tests)
 - End-to-end: `.\backend\venv\Scripts\python.exe backend\smoke_e2e.py` (stack must be up)
 - PowerShell gotcha: the path contains `[IMPLEMENTATION]`, so always use
   `Set-Location -LiteralPath "..."` (plain `cd` treats brackets as wildcards).
@@ -57,14 +86,59 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - SQLite DB + secret key persist in the `data_volume` Docker volume (`down` keeps it,
   `down -v` wipes it).
 
-## Phase-2 capabilities (current)
+## Phase-3 capabilities (current): the full phased lifecycle
 
+- **Phases** (backend/modules/phases.py): scoping → recon → vuln_analysis →
+  exploitation → post_exploitation → reporting. Plan steps carry a `phase` tag
+  (untagged = recon); `Assessment.current_phase` + `analyzed_phases` drive the
+  state machine. Analyzing a phase advances current_phase (recon →
+  vuln_analysis, exploitation → post_exploitation, post_exploitation →
+  reporting); `POST /assessments/{id}/phases/{phase}/plan` drafts the next
+  phase FROM THE FINDINGS (409 unless the previous phase is analyzed, 403 if
+  the letter does not authorize exploitation, 409 if the phase is already
+  drafted). The UI renders a six-step phase stepper, groups the plan by phase
+  with red accents on exploitation/post-exploition steps, and shows
+  verification badges on findings.
+- **Letter-gated exploitation**: `Target.exploitation_authorized` (parsed from
+  the letter's controlled-verification sentences) gates the whole exploitation
+  capability. The policy engine's `validate_command(..., allow_exploitation=)`
+  refuses sqlmap/msfconsole/curl-with-body with "the letter does not authorize
+  controlled exploitation" — at plan time (steps dropped from a supplied plan),
+  at draft time (403 on the phase-plan endpoint) and at execute time (403).
+- **Exploitation tools** (policy allowlists, all fail-closed):
+  - `sqlmap` — conservative verification flags only (--batch, risk/level 1,
+    technique B, bounded post-exploition facts --banner/--current-user/
+    --current-db/--is-dba/--hostname). --os-shell/--dump/--sql-shell/
+    --file-read/--all and every enumeration flag are refused.
+  - `searchsploit` — offline Exploit-DB lookup (spec `offline: True`, so no
+    explicit-target rule); -w/-p/-m/-x/--nmap refused.
+  - `msfconsole` — VM-ONLY (local mode refuses at the execute endpoint with a
+    clear 409). Driven with `-q -x "use …; set RHOSTS …; run; exit"`; the -x
+    script is validated statement-by-statement: modules must be under
+    auxiliary/scanner/ or exploit/{unix,linux,windows,multi}/, set keys are
+    limited to RHOST/RHOSTS/RPORT/PORTS/THREADS/TIMEOUT/SSL/VERBOSE, and
+    every RHOST/RHOSTS value must be in the authorized scopes.
+  - `curl` payload flags (-d/--data*/-F/--form*/--json) are exploitation-grade
+    and need the letter authorization; header-audit curl stays recon.
+- **Exploit planner** (modules/exploit_planner.py): searchsploit steps per
+  (service, version) fingerprint (cap 5), sqlmap verification per web endpoint
+  (cap 3), curl PoC per letter-declared verification endpoint, msfconsole
+  scanner steps for exposed mapped services; post-exploitation = one bounded
+  fact (--banner / --current-user) per verified endpoint. Every step is
+  policy-validated before it can be appended.
+- **Verification**: analyzing the exploitation phase links its findings to the
+  earlier phases' findings by endpoint/parameter (analyzer.match_verification),
+  setting `verification`='verified'/'attempted', `exploit_evidence`, and
+  `verified_by` on the recon finding — the report separates "a scanner matched
+  a signature" from "exploitation proved it". Finding rows carry a `phase`
+  column: re-analyzing one phase replaces only its own findings.
 - Default deterministic plan: **7 policy-legal steps** (nmap/traceroute/dig/curl/whatweb/
   sslscan/nuclei), rate-limited (`--max-rate 30`, `-rl 30`), targets formatted as
   host:port with the scheme added exactly once.
 - Deterministic analyzer: **per-tool parsers** (nmap service lines, nuclei template
   lines, curl header blocks incl. per-header missing-security-header findings +
-  cookie flags, whatweb plugins, sslscan deprecated protocols) with detailed
+  cookie flags, whatweb plugins, sslscan deprecated protocols, sqlmap injection
+  confirmations, searchsploit rows, msfconsole scanner banners) with detailed
   explanations, endpoint/parameter, distinct scoring drivers, concrete remediation.
 - **Subnet (CIDR) targets**: a target like `172.28.0.0/24` gets a 2-step discovery
   plan (`nmap -sn` live-host sweep, then `nmap -sV` over common ports), findings are
@@ -77,26 +151,101 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - Live execution terminal: executor keeps an in-memory capped buffer per in-flight
   execution (`live_registry`), `GET /assessments/{id}/executions/{eid}/live` streams
   it, frontend polls every 1 s and renders a black terminal panel in the step card.
-- Report: executive summary + severity bar, analysis-mode statement, remediation
-  summary table ordered by priority, scoring breakdown per finding, audit output,
-  print stylesheet (Ctrl+P → clean PDF).
-- Compose profiles: lab targets behind `--profile lab`; plain `docker compose up` is
-  the real-world assessment toolkit. Backend no longer depends_on the lab targets.
-- Letter v4 (`JB/SEC/2026/023`, virtualization-lab edition): criticalities 90/50/65,
-  8 objectives, deny-list (no traceroute on storefront, discovery-only on the segment)
-  + allow-list (legacy server) restrictions, rate-limit rules, automation-benefit
-  deliverable, and a third target authorizing the `192.168.56.0/24` host-only lab
-  segment for a discovery sweep only (Section 5.5: hosts found there need separate
-  authorization before deeper assessment). ALL targets are full VMs on the host-only
-  lab network — storefront `192.168.56.10:3000`, legacy server `192.168.56.20:80` —
-  so the letter's premise is a virtualization laboratory of real systems; the full
-  walkthrough (`smoke_e2e.py`, live demo) expects the lab VMs to be running.
+- Report: executive summary + severity bar, per-phase progress line, analysis-mode
+  statement, exploitation & verification section, remediation summary table ordered
+  by priority, scoring breakdown per finding, audit output, print stylesheet
+  (Ctrl+P → clean PDF).
+- Compose: toolkit only (backend + frontend). The demo target is NOT a compose
+  service — the OmniRoute gateway runs on the host itself; Docker execution mode
+  reaches it via `host.docker.internal:20128`.
+- Letter v7 (`JB/SEC/2026/026`, real-application edition): criticalities 90/65,
+  9 objectives (4.7 = controlled verification of critical findings), deny-list
+  restrictions (no traceroute on the gateway, discovery-only on the segment),
+  controlled-verification authorization for the gateway with
+  `/v1/chat/completions` as the declared verification endpoint, rate-limit
+  rules, and a second target authorizing the `192.168.198.0/24` lab LAN segment
+  for a discovery sweep only. The primary target is a real self-hosted
+  app (OmniRoute) on the assessment host, so a clean verification outcome in
+  the exploitation phase is a valid, expected result.
+
+## Tier 1: adaptive next-step proposals (the loop, with the human retained)
+
+The engagement loop used to be open: `planner.generate_plan` runs ONCE at
+assessment creation and never sees tool output, and the later phases are drafted
+by deterministic rule from findings. `next_steps` closes it — but as an advisor,
+not an actor.
+
+- **Endpoint**: `POST /assessments/{id}/next-steps`. No request body; the phase
+  is derived server-side from `current_phase`. **Persists nothing.** Precedent
+  for a non-persisting POST: `/engagement/parse`, `/settings/ssh-test`.
+- **Response**: `{phase, source, state{findings,executed_steps,plan_steps,headroom},
+  candidates[], refused[], notes[]}`. `refused` is a FEATURE — every candidate
+  the policy engine knocked back, with its reason. It is the guardrail's
+  receipt, and nothing comparable exists in tools that just hand you a command.
+- **`source`** extends planner's vocabulary: `ai-filtered`,
+  `deterministic-fallback` (no provider), `provider-error` (outage → fallback,
+  never a dead feature), `no-candidates`.
+- **Gates, in order**: 404 assessment/target; 409 when `current_phase` is not a
+  plan phase (`PHASE_PROPOSAL_REFUSALS` names the door to use instead — 409 of
+  a bare "no" is a worse answer); 409 while a step is running (`status ==
+  'running'` — proposing mid-run reasons about a half-written engagement); 409
+  at `MAX_PLAN_STEPS`.
+- **Proposals are tagged with `current_phase`** and only fire when it is a plan
+  phase. This is not a limitation to lift casually: `analyze_assessment` only
+  ever reads the CURRENT phase's executions, so a step tagged for a phase the
+  assessment is not working in could never be analyzed at all. Crossing phases
+  means changing the state machine.
+- **Accepting a proposal uses the existing `PUT /plan`** — there is deliberately
+  no second write path, so `normalize_plan`, executed-step immutability and
+  `MAX_PLAN_STEPS` keep living in one place. The UI merges picked candidates
+  into `draftPlan` and the operator hits the ordinary Save plan.
+- **Provenance is verified, not trusted**: `driven_by` finding ids that do not
+  exist in this assessment are dropped (the cheap analogue of PentestGPT's
+  leaf-node verification), and `confidence` is clamped 0-100.
+- **Candidate caps**, applied in order: every candidate through the gates, then
+  truncated to `MAX_NEXT_CANDIDATES` (6) with the truncation DISCLOSED in
+  `notes`, then headroom `MAX_PLAN_STEPS - len(plan)`.
+- **`restricted_tools` must be filtered in `next_steps` itself.** The policy
+  engine does not know the letter's per-target bans (they are letter-derived,
+  not capability rules), but `execute_step` refuses them outright — offering one
+  would offer a step that cannot be approved. Same reason `create_assessment`
+  drops them at plan time.
+- **The new attack surface is real and mitigated**: tool output now reaches a
+  model prompt, and nmap banners / HTTP headers are written by the TARGET. That
+  is a target-controlled prompt-injection channel. Defences: `strip_ansi` on
+  every tool-derived string, per-field and total bounds, a delimited
+  `<untrusted_observation>` block with a standing instruction that it is data
+  and never a direction, and — decisively — authorization never depends on model
+  text (scopes come from the Target row, the policy engine re-checks every
+  command). Worst case is a useless proposal, never an out-of-scope step.
 
 ## Deployment modes (real-world vs. lab)
 
+- **Execution engines:** `local` (subprocess on the backend host — the Docker
+  path, unchanged) and `kali_vm` (the attacker-VM engine). Mode + SSH host/
+  port/username/password live in `app_settings`; the password is a
+  Fernet-encrypted write-only secret like the proxy password. An incompletely
+  configured VM fails closed at the execute endpoint (409), never silently
+  falling back to local. `POST /settings/ssh-test` connects, verifies tmux +
+  all 7 tools, creates the `redteam` tmux session, and returns the VM's
+  attestation (hostname, OS, kernel, SSH host-key SHA256 fingerprint).
+- **Kali VM engine mechanics** (`modules/ssh_executor.py`): per-execution
+  paramiko connection (password auth, no pooling) → attestation snapshot →
+  ensure tmux session `redteam` (220x50, history-limit 100k) → type the
+  command with `tmux send-keys -l` + Enter, then queue `echo "__RT_EXIT_<token>__:$?"`
+  as a second typed line (the shell runs it when the command finishes; the
+  typed echo shows `$?` unexpanded so it can't false-match the exit regex).
+  Poll `tmux capture-pane -p -J -S -` ~1 s, diff by prefix (whole-capture
+  reset on scrollback churn), stream deltas to the live registry, and trim
+  prompts/echoes/marker from the stored stdout. Timeout sends `tmux C-c`.
+  One shared pane ⇒ `asyncio.Lock` serializes VM-mode executions. Client-
+  disconnect: a `threading.Event` stops the monitor thread and C-c fires via
+  a fresh connection. `tool_executions.execution_host` persists the
+  attestation per step; UI badges + report "Executed on" line cite it.
 - The framework is an **assessor's toolkit**, not a lab-only exhibit. `docker compose up`
   runs backend + frontend only; the operator registers whatever targets the client
-  letter authorizes. `--profile lab` adds Juice Shop + DVWA for the demo.
+  letter authorizes. The demo target — the self-hosted OmniRoute gateway — runs on
+  the Windows host itself (see the README's OmniRoute demo section).
 - Reachability is the only network requirement: scanners run inside the backend
   container, so the target must be routable from there (Docker DNS name, LAN IP, public
   host, or `host.docker.internal` for the Windows/macOS host itself). On Linux,
@@ -116,8 +265,13 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - Remote/LAN UI access: set `VITE_API_URL` (browser → backend) and
   `CORS_ALLOW_ORIGINS` (backend → allowed origin) to the machine's LAN IP.
 - Honest scope statement: non-destructive discovery/enumeration plus governance
-  (authorization, approval, audit) by design — not an exploitation framework. That
-  restraint is what makes it safe to point at a paying client's production estate.
+  (authorization, approval, audit) by design, WITH letter-gated controlled
+  exploitation: vulnerability verification with bounded, non-destructive
+  proof-of-concepts and a single benign verification record per flaw, only on
+  targets whose engagement letter explicitly authorizes it. No privilege
+  escalation, no persistence, no lateral movement, no data exfiltration beyond
+  that record. That restraint is what makes it safe to point at a paying
+  client's production estate.
 
 ## Manual effort vs. the framework (the demo's argument)
 
@@ -181,25 +335,94 @@ human approval, correlates findings, and emits an HTML report. Authorized lab us
 - Assessment rows are busy-guarded; execute/analyze/report capture the assessment id up
   front so switching assessments mid-request cannot cross-write results.
 - Uploads go through `request()` (timeouts + friendly errors), not raw `fetch`.
+- `PUT /plan` invalidation: a PURE APPEND (`normalized[:len(previous)] ==
+  previous and longer`) invalidates only the appended steps' phases; anything
+  else invalidates the whole assessment, as before. The blanket version meant
+  accepting one mid-engagement proposal deleted EVERY finding — including the
+  earlier phases' findings and the exploitation evidence linking them, the exact
+  material the report cites. Appending to the current phase is safe by
+  construction: a phase the assessment is working in has, by definition, not
+  been analyzed yet, so it has no findings to lose.
+- Frontend plan lock is PER STEP, not blanket: `locked = running || executed`.
+  The old `planLocked = executions.length > 0` froze the entire plan the moment
+  anything ran — including the "Add command" and "Save plan" buttons — which
+  contradicted the backend's documented rule ("executed steps are immutable;
+  unexecuted steps and later phases stay editable") and made accepting a
+  proposal mid-engagement impossible. `planEditable` now requires the executed
+  PREFIX to be intact; the backend refuses any change to it regardless.
+- `next_steps` must not rely on exact-string dedupe to catch near-duplicates:
+  `normalize_command` collapses whitespace/case only, so a candidate with
+  different FLAGS for the same tool+target is legitimately offered. That is
+  deliberate (a flags-differing re-run can be real deepening) — do not "fix" it
+  with a tool+host heuristic, which would suppress legitimate work.
 
 ## Demo runbook
 
-1. `docker compose down -v` (clean DB) then `docker compose --profile lab up --build`
+### Attacker-VM mode (the credibility demo)
+
+0. Kali VM (one-time): `sudo apt install -y openssh-server tmux nmap traceroute
+   dnsutils whatweb sslscan nuclei curl sqlmap metasploit-framework && sudo
+   systemctl enable --now ssh` + `git clone --depth 1
+   https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb && sudo
+   ln -s /opt/exploitdb/searchsploit /usr/local/bin/searchsploit`
+   (+ root SSH or NOPASSWD sudo for traceroute's raw sockets). Windows backend
+   needs `pip install paramiko` (in requirements.txt since v2.1).
+1. Boot the VirtualBox lab: Kali attacker VM (e.g. 192.168.198.15) attached to
+   the same network as the assessment host (the 192.168.198.0/24 lab LAN —
+   the host's Wi-Fi address is 192.168.198.86). The letter's primary target —
+   the OmniRoute gateway — runs on the Windows host itself at
+   192.168.198.86:20128 (server listening on 0.0.0.0, firewall rule for TCP
+   20128 scoped to the lab subnet; check with `netstat -ano | findstr :20128`).
+   A Metasploitable VM
+   works as an extra target: register it manually with
+   "controlled exploitation authorized" UNCHECKED (the letter does not name
+   it), watch the policy engine refuse the sqlmap step at approval — that
+   refusal is the guardrail demo — then register an authorized target to
+   show the same command passing.
+2. Windows: `uvicorn main:app --port 8000` (backend venv) + `npm run dev`
+   (frontend) — no Docker needed in this mode.
+3. UI → Configuration → Execution mode = Kali VM over SSH → host/port/user/
+   password → **Test connection**: project the attestation card (real OS,
+   kernel, host-key fingerprint) — this is the "not hardcoded" anchor.
+4. On the Kali console: `tmux attach -t redteam` — leave the VM on screen.
+5. Import the letter → set up targets → approve steps: the audience watches
+   the framework type each command into the Kali terminal; the UI live
+   terminal streams the same output; every audit row and the report carry
+   "ran on Kali VM user@host" with the attestation.
+6. Phases on the VM engine: recon → analyze → "Draft exploitation plan" →
+   the msfconsole scanner steps (VM-only) now run, typed into the tmux
+   session, and the phase stepper advances through exploitation and
+   post-exploitation with the report citing the VM attestation.
+7. Fallback: switch Execution mode back to Local/Docker in Settings.
+
+### Local / Docker mode (the original runbook)
+
+1. `docker compose down -v` (clean DB) then `docker compose up --build`
 2. Open http://localhost:5173 → import the PDF in "Read the client's letter"
 3. "Set up everything from this letter" → review the plan
 4. Demo policy rejection: edit a command dangerously (e.g. `nmap -oN out.txt ...` or
    retarget to google.com) → approve → refused with a clear reason
-5. Approve & execute each step → live terminal streams output → audit trail keeps it
-6. Analyze results → scored findings → Generate report (HTML, cites the engagement)
-7. Real-world proof: add `host.docker.internal:<port>` as a target and approve a step —
-   the scanners reach a machine outside the compose network (nmap resolves it to the
-   host's IP, traceroute shows the hop through the Docker gateway).
-8. Subnet sweep: register the letter's third target (`172.28.0.0/24`) — the 2-step
-   discovery plan lists the lab machines as live hosts and files per-host findings
-   (`172.28.0.x:3000/tcp`, `172.28.0.y:80/tcp`). Demo the guardrail too: application
-   tools are restricted for the segment, and a host found by the sweep still needs
-   separate authorization before deeper assessment.
+5. Approve & execute each recon step → live terminal streams output → audit trail
+6. Analyze results → the phase stepper advances to Vulnerability analysis
+7. "Draft exploitation plan" → searchsploit/sqlmap/curl-PoC steps from the
+   findings; msfconsole steps refuse in local mode (VM-only) with the reason —
+   demo that refusal too. Approve & execute → analyze → findings now carry
+   "✓ verified by exploitation" badges.
+8. "Draft post-exploitation plan" → bounded --banner/--current-user steps →
+   execute → analyze → Generate report (HTML, cites the engagement, phases,
+   and the verification evidence)
+9. Real-world proof: add `host.docker.internal:20128` as a target (the
+   OmniRoute gateway on the host) and approve a step — the scanners reach a
+   machine outside the compose network (nmap resolves it to the host's IP,
+   traceroute shows the hop through the Docker gateway).
+10. Subnet sweep: register the letter's second target (`192.168.198.0/24`) — the
+   2-step discovery plan lists the lab machines (Kali VM, the host) as live
+   hosts and files per-host findings (e.g. `192.168.198.86:20128/tcp`). Demo
+   the guardrail too: application tools are restricted for the segment, and
+   the exploitation gate refuses every exploit-grade command on it (the
+   letter authorizes verification for the gateway only).
 
-Two API gates that look like bugs during a demo but are deliberate: the plan is frozen
-once any step has executed, and analysis requires every *enabled* step to have run
-(disable steps before starting if you want a shorter run).
+API gates that look like bugs during a demo but are deliberate: executed steps are
+immutable (unexecuted steps and appended phases stay editable), analysis requires
+every *enabled* step of the CURRENT phase to have run (disable steps before starting
+if you want a shorter run), and a phase's plan can only be drafted once.

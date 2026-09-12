@@ -17,7 +17,8 @@ import re
 
 # Tools the framework can actually run. A restriction naming anything else is
 # already refused by the policy engine, so it needs no per-target rule.
-KNOWN_TOOLS = ('nmap', 'traceroute', 'dig', 'nslookup', 'curl', 'whatweb', 'sslscan', 'nuclei')
+KNOWN_TOOLS = ('nmap', 'traceroute', 'dig', 'nslookup', 'curl', 'whatweb', 'sslscan',
+               'nuclei', 'sqlmap', 'searchsploit', 'msfconsole')
 
 # reportlab-style page furniture repeats on every page between the sections;
 # reading it as content would splice footers into the parsed brief.
@@ -55,6 +56,7 @@ TARGET_LABELS = {
     'assessment type': 'assessment_type',
     'technology': 'technology',
     'environment': 'environment',
+    'verification endpoints': 'verification_endpoints',
 }
 
 DOC_LABELS = {
@@ -115,6 +117,14 @@ def _parse_scopes(value):
     return scopes
 
 
+# An API path the letter declares as a permitted verification endpoint:
+# '/rest/user/login' possibly followed by a parenthetical explanation.
+ENDPOINT_PATH_RE = re.compile(r'/[A-Za-z0-9._\-/]+')
+
+def _parse_endpoints(value):
+    return [match.group(0) for match in ENDPOINT_PATH_RE.finditer(value or '')]
+
+
 def _out_of_scope_indexes(lines):
     """Line indexes inside the out-of-scope section.
 
@@ -151,7 +161,8 @@ def _parse_targets(lines):
         if field == 'name':
             current = {'name': value, 'address': '', 'scopes': [], 'criticality': None,
                        'assessment_type': '', 'technology': '', 'environment': '',
-                       'restricted_tools': [], 'notes': []}
+                       'restricted_tools': [], 'notes': [], 'verification_endpoints': [],
+                       'exploitation_authorized': False}
             targets.append(current)
             continue
         if field and current is not None:
@@ -171,6 +182,10 @@ def _parse_targets(lines):
                     current['address'] = match.group(1) if match else value
             elif field == 'scopes':
                 current['scopes'] = _parse_scopes(value)
+            elif field == 'verification_endpoints':
+                # '/rest/user/login (authentication endpoint; ...)' — the
+                # path is the endpoint; the parenthetical is prose.
+                current['verification_endpoints'] = _parse_endpoints(value)
             else:
                 current[field] = value
 
@@ -189,14 +204,16 @@ def _parse_targets(lines):
                 host = address.split(':', 1)[0]
                 targets.append({'name': host, 'address': address, 'scopes': [address],
                                 'criticality': None, 'assessment_type': '', 'technology': '',
-                                'environment': '', 'restricted_tools': [], 'notes': []})
+                                'environment': '', 'restricted_tools': [], 'notes': [],
+                                'verification_endpoints': [], 'exploitation_authorized': False})
                 known_addresses.add(address)
         for match in NETWORK_RE.finditer(line):
             network = match.group(1)
             if network not in known_addresses:
                 targets.append({'name': f'subnet {network}', 'address': network, 'scopes': [network],
                                 'criticality': None, 'assessment_type': '', 'technology': '',
-                                'environment': '', 'restricted_tools': [], 'notes': []})
+                                'environment': '', 'restricted_tools': [], 'notes': [],
+                                'verification_endpoints': [], 'exploitation_authorized': False})
                 known_addresses.add(network)
     return targets
 
@@ -296,6 +313,42 @@ def _parse_restrictions(lines, targets):
     return targets
 
 
+def _parse_exploitation_authorization(lines, targets):
+    """Which targets the letter authorizes controlled exploitation on.
+
+    The authorization sentence names what is authorized and — critically —
+    what is NOT: 'No verification is authorized against the legacy server
+    (Section 3.2) or the lab segment (Section 3.3).' Both shapes are parsed
+    per SENTENCE and against the sentence's own target mentions, so a denial
+    naming one target never leaks into an authorization (or denial) for
+    another, and a target nobody mentions stays unauthorized (fail-closed).
+    """
+    for heading, body in _sections(lines):
+        for sentence in _sentences(body):
+            lowered = sentence.lower()
+            authorizes = (
+                re.search(r'\bcontrolled (?:vulnerability )?verification\b.*\bauthorized\b', lowered)
+                or re.search(r'\bauthorizes?\b.*\bcontrolled (?:vulnerability )?verification\b', lowered)
+                or re.search(r'\bcontrolled exploitation\b.*\bauthorized\b', lowered)
+            )
+            forbids = (
+                re.search(r'\bno (?:verification|exploitation|controlled \w+)\b.*\bauthorized\b', lowered)
+                or re.search(r'\b(?:exploitation|verification)\b.*\bnot authorized\b', lowered)
+                or re.search(r'\bprohibits?\b.*\b(?:exploitation|verification)\b', lowered)
+            )
+            if not (authorizes or forbids):
+                continue
+            named = _mentioned_targets(sentence, targets)
+            for target in targets:
+                if target not in named:
+                    continue
+                if authorizes:
+                    target['exploitation_authorized'] = True
+                if forbids:
+                    target['exploitation_authorized'] = False
+    return targets
+
+
 def _parse_objectives(lines):
     """Numbered items like '4.1 Service discovery: identify ...'.
 
@@ -354,6 +407,7 @@ def parse_engagement(text):
     unbulleted = [_strip_bullet(line) if BULLET_RE.match(line) else line for line in lines]
     targets = _parse_targets(unbulleted)
     targets = _parse_restrictions(lines, targets)
+    targets = _parse_exploitation_authorization(lines, targets)
     fields = _parse_doc_fields(lines, text)
     objectives = _parse_objectives(lines)
     out_of_scope = _parse_bullet_block(lines, re.compile(r'out of scope', re.IGNORECASE))

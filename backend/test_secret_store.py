@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import AppSettings, Base, get_db
 from main import app
+from conftest import OPERATOR_TEST_KEY
 from modules.secret_store import PREFIX, decrypt_secret, encrypt_secret, is_encrypted
 
 API_KEY = 'sk-live-do-not-leak-me'
@@ -42,7 +43,7 @@ def client(session_factory):
 
     app.dependency_overrides[get_db] = override_db
     try:
-        yield TestClient(app)
+        yield TestClient(app, headers={'X-API-Key': OPERATOR_TEST_KEY})
     finally:
         app.dependency_overrides.clear()
 

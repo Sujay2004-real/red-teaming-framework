@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
+from modules.phases import is_plan_phase
+
 MAX_AUTHORIZED_SCOPES = 50
 MAX_SCOPE_CHARS = 255
 MAX_SUBNET_ADDRESSES = int(os.getenv('MAX_SUBNET_ADDRESSES', '256'))
@@ -56,6 +58,10 @@ class TargetCreate(BaseModel):
     # Tools the client's engagement letter rules out for this target; enforced
     # at approval time in addition to the global policy engine.
     restricted_tools: List[str] = Field(default_factory=list)
+    # True only when the letter authorizes controlled exploitation against
+    # this target; the policy engine refuses exploitation-grade commands
+    # (sqlmap, msfconsole, curl with a request body) otherwise.
+    exploitation_authorized: bool = False
 
     _strip_name = field_validator('name', 'scope_domain_ip')(_required_text)
 
@@ -100,7 +106,20 @@ class TargetCreate(BaseModel):
 
 
 MAX_BRIEF_ITEMS = 100
-MAX_BRIEF_CHARS = 20000
+MAX_BRIEF_CHARS = 30000
+
+
+def _checked_plan_step_phase(step: Dict[str, Any]) -> None:
+    """Reject a plan step whose phase tag is not a real plan phase.
+
+    A mistyped phase would silently orphan the step: it would never count
+    toward any phase's completion, and the phase stepper would ignore it.
+    """
+    phase = step.get('phase', 'recon')
+    if phase is None:
+        return
+    if not isinstance(phase, str) or not is_plan_phase(phase):
+        raise ValueError(f'plan step phase must be one of recon / exploitation / post_exploitation, not {phase!r}')
 
 
 class AssessmentCreate(BaseModel):
@@ -113,6 +132,16 @@ class AssessmentCreate(BaseModel):
     engagement_brief: Optional[Dict[str, Any]] = None
 
     _strip_objective = field_validator('objective')(_required_text)
+
+    @field_validator('plan')
+    @classmethod
+    def _checked_plan_phases(cls, value: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        if value is None:
+            return value
+        for step in value:
+            if isinstance(step, dict):
+                _checked_plan_step_phase(step)
+        return value
 
     @field_validator('engagement_brief')
     @classmethod
@@ -136,6 +165,11 @@ class SettingsUpdate(BaseModel):
     proxy_url: Optional[str] = Field(default=None, max_length=2000)
     proxy_username: Optional[str] = Field(default=None, max_length=255)
     proxy_password: Optional[str] = Field(default=None, max_length=10000)
+    execution_mode: Optional[str] = Field(default=None, max_length=32)
+    ssh_host: Optional[str] = Field(default=None, max_length=255)
+    ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    ssh_username: Optional[str] = Field(default=None, max_length=255)
+    ssh_password: Optional[str] = Field(default=None, max_length=10000)
 
     @field_validator('api_base_url')
     @classmethod
@@ -147,6 +181,23 @@ class SettingsUpdate(BaseModel):
     def _proxy_scheme(cls, value: Optional[str]) -> Optional[str]:
         return _checked_url(value, PROXY_SCHEMES)
 
+    @field_validator('execution_mode')
+    @classmethod
+    def _execution_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        stripped = value.strip()
+        if stripped not in ('local', 'kali_vm'):
+            raise ValueError('must be either "local" or "kali_vm"')
+        return stripped
+
+    @field_validator('ssh_host', 'ssh_username')
+    @classmethod
+    def _strip_ssh_text(cls, value: Optional[str]) -> Optional[str]:
+        # Not _required_text: an empty submission means "clear the field",
+        # which is how every other settings field behaves.
+        return value.strip() if isinstance(value, str) else value
+
 
 class ExecuteRequest(BaseModel):
     step_index: int = Field(ge=0)
@@ -155,3 +206,11 @@ class ExecuteRequest(BaseModel):
 
 class PlanUpdate(BaseModel):
     plan: List[Dict[str, Any]]
+
+    @field_validator('plan')
+    @classmethod
+    def _checked_plan_phases(cls, value: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        for step in value:
+            if isinstance(step, dict):
+                _checked_plan_step_phase(step)
+        return value

@@ -3,6 +3,8 @@ import re
 import shlex
 from urllib.parse import urlparse
 
+from modules.phases import EXPLOITATION_GATED_TOOLS, PAYLOAD_FLAGS
+
 # Commands run through create_subprocess_exec, never a shell, so shell
 # metacharacters carry no injection risk and must stay legal: query strings
 # routinely contain '&' and '$'. Only real control characters are refused,
@@ -18,6 +20,21 @@ PUBLIC_RESOLVERS = {
     '149.112.112.112', '208.67.222.222', '208.67.220.220',
     '64.6.64.6', '64.6.65.6', 'dns.google', 'one.one.one.one',
 }
+
+# msfconsole -x script validation. The console is driven by a semicolon-
+# separated statement list; each statement must be one of these shapes, and
+# the module must sit under an allowed tree. Remote-target set keys are
+# scope-checked; LHOST/USER/PASS-style keys stay out so a resource script
+# cannot quietly become a credential attack or a listener bind.
+MSF_ALLOWED_PREFIXES = (
+    'auxiliary/scanner/', 'exploit/unix/', 'exploit/linux/',
+    'exploit/windows/', 'exploit/multi/',
+)
+MSF_ALLOWED_SET_KEYS = {
+    'RHOST', 'RHOSTS', 'RPORT', 'PORTS', 'THREADS', 'TIMEOUT', 'SSL', 'VERBOSE',
+}
+MSF_TARGET_KEYS = {'RHOST', 'RHOSTS'}
+MSF_ALLOWED_VERBS = ('run', 'exploit', 'exit', 'back')
 
 
 class PolicyEngine:
@@ -128,6 +145,15 @@ class PolicyEngine:
                         '--connect-timeout', '--max-redirs', '--retry',
                         '--retry-delay', '--retry-max-time', '--limit-rate',
                         '--tls-max',
+                        # Request-body flags: legal for curl only when the
+                        # letter authorizes controlled exploitation (a body
+                        # carrying a payload is a proof-of-concept, not a
+                        # header audit) — enforced via PAYLOAD_FLAGS at
+                        # validation time, so they are listed here for shape
+                        # and gated separately for permission.
+                        '-d', '--data', '--data-ascii', '--data-binary',
+                        '--data-raw', '--data-urlencode', '-F', '--form',
+                        '--form-string', '--json',
                     },
                     'target_flags': {'--url'},
                 },
@@ -193,6 +219,106 @@ class PolicyEngine:
                         '-max-host-error', '-H', '-header', '-bs', '-bulk-size',
                     },
                     'target_flags': {'-u', '-target'},
+                },
+                'zap-baseline.py': {
+                    'risk': 'low',
+                    # The OWASP ZAP baseline: a PASSIVE crawl-and-audit (it
+                    # sends no attack payloads), so it sits in the recon
+                    # capability beside curl/whatweb, not with the exploit
+                    # tools. The flag surface is kept deliberately tiny.
+                    # Absent by design: -a enables ACTIVE scanning (attack
+                    # payloads - that is exploitation-grade and belongs behind
+                    # the letter's authorization, which this spec can never
+                    # grant); -c/-i/-n load rule/context CONFIG FILES; -u
+                    # fetches a remote config; -z passes arbitrary options
+                    # straight to the ZAP daemon (an escape hatch around this
+                    # whole table); -U drives authenticated scanning with
+                    # credentials; -x/-w/-r/-J write report files to disk.
+                    'bool_flags': {'-d', '-s', '-I'},
+                    'value_flags': {
+                        # -m spider minutes, -D start delay, -p daemon port,
+                        # -l minimum level to show (PASS..FAIL).
+                        '-m', '-D', '-p', '-l',
+                    },
+                    'target_flags': {'-t'},
+                },
+            }
+        },
+        'exploitation': {
+            'tools': {
+                'sqlmap': {
+                    'risk': 'high',
+                    # Controlled verification only. Absent by design:
+                    # --os-shell/--os-pwn/--os-cmd* hand over an interactive
+                    # shell or spawn listeners; --file-read/--file-write move
+                    # arbitrary files; --sql-shell is an interactive prompt;
+                    # --dump/--all/--users/--passwords/--privileges/--dbs/
+                    # --tables/--columns enumerate data beyond the bounded
+                    # single record the letter authorizes; -z and --wizard
+                    # take free-form over-rides of everything below.
+                    'bool_flags': {
+                        '--batch', '--flush-session', '--fresh-queries',
+                        '--no-color', '--colour=never', '--color=never',
+                        '--disable-coloring', '-v', '--verbose', '--eta',
+                        '--smart', '--null-connection', '--no-cast',
+                        '--no-escape', '--parse-errors',
+                        # The bounded post-exploitation facts: banner, current
+                        # user, current database, DBA status, hostname. Each
+                        # prints a single line of evidence, which is exactly
+                        # the "one verification record" the letter permits.
+                        '--banner', '--current-user', '--current-db',
+                        '--is-dba', '--hostname',
+                    },
+                    'value_flags': {
+                        '--data', '--cookie', '--user-agent',
+                        '--referer', '--headers', '--timeout', '--retries',
+                        '--delay', '--threads', '--risk', '--level',
+                        '--technique', '--dbms', '--method', '--time-sec',
+                        '--string', '--not-string', '--regexp', '--code',
+                        '--csrf-url', '--csrf-token', '--csrf-method',
+                        '--csrf-data', '--tamper', '--charset', '--prefix',
+                        '--suffix', '--param-del', '--cookie-del',
+                        '--union-cols', '--union-char', '--union-from',
+                        '--second-order', '--exclude', '--identify-tags',
+                    },
+                    'target_flags': {'-u', '--url'},
+                    'attached_patterns': (
+                        r'^--(risk|level|timeout|retries|delay|threads|technique|dbms|method|time-sec)=\S+$',
+                    ),
+                },
+                'msfconsole': {
+                    'risk': 'high',
+                    # msfconsole runs ONLY on the attacker VM (VM_ONLY_TOOLS);
+                    # the local executor refuses it outright. The console is
+                    # driven non-interactively with -q (no banner) and -x (the
+                    # resource script). The -x payload is validated statement
+                    # by statement in _validate_msf_script: only use/set/run/
+                    # exploit/exit, an allowed module tree, and RHOSTS/RHOST
+                    # values inside the authorized scopes. Anything else — a
+                    # shell payload, an arbitrary module, an out-of-scope
+                    # target — fails closed here, before HITL approval.
+                    'bool_flags': {'-q', '--quiet'},
+                    'value_flags': {'-x', '--execute-command'},
+                    'attached_patterns': (r'^--execute-command=\S+$',),
+                    'msf': True,
+                },
+                'searchsploit': {
+                    'risk': 'low',
+                    # Offline Exploit-DB lookup: no network interaction with the
+                    # target at all, so positionals are search terms rather
+                    # than targets and the explicit-target rule does not apply.
+                    # -w/--www (print exploit URLs), -p/--path and -m/--mirror
+                    # (copy exploit files), -x/--examine (open in editor),
+                    # --nmap (read an nmap XML file) and file-writing/export
+                    # flags stay out by design.
+                    'risk_note': 'offline database lookup',
+                    'offline': True,
+                    'bool_flags': {
+                        '-t', '--title', '-c', '--case', '--strict', '-j',
+                        '--json', '--summary', '-v', '--verbose', '--colour',
+                        '--color', '--no-colour', '--no-color', '--id',
+                    },
+                    'value_flags': {'-e', '--exclude'},
                 },
             }
         },
@@ -276,6 +402,69 @@ class PolicyEngine:
     def validate_resolver(self, resolver, authorized_scopes):
         host = self.normalize_host(resolver)
         return bool(host) and (host in PUBLIC_RESOLVERS or self.validate_target(resolver, authorized_scopes))
+
+    def _msf_script_errors(self, script, authorized_scopes):
+        """Validate an msfconsole -x resource script statement by statement.
+
+        Returns a list of human-readable problems; empty means the script is
+        policy-legal. Only use/set/<verb> statements are permitted, modules
+        must sit under an allowed tree, RHOST/RHOSTS values must be inside the
+        authorized scopes, and set keys are restricted to remote-target and
+        benign option keys. Everything else — payloads, credentials, listeners
+        — has no legal spelling here, so it fails closed.
+        """
+        errors = []
+        used_module = False
+        for statement in (script or '').split(';'):
+            statement = statement.strip()
+            if not statement:
+                continue
+            lowered = statement.lower()
+            if lowered.startswith('use '):
+                module = statement[4:].strip()
+                used_module = True
+                if not any(module.startswith(prefix) for prefix in MSF_ALLOWED_PREFIXES):
+                    errors.append(f'msf module {module} is outside the permitted module trees')
+                continue
+            if lowered.startswith('set '):
+                parts = statement.split(None, 2)
+                if len(parts) < 3:
+                    errors.append(f'set statement needs a key and a value: {statement!r}')
+                    continue
+                key, value = parts[1], parts[2]
+                if key.upper() not in MSF_ALLOWED_SET_KEYS:
+                    errors.append(f'msf set key {key} is not in the permitted option set')
+                    continue
+                if key.upper() in MSF_TARGET_KEYS:
+                    # RHOSTS accepts a space- or comma-separated list; each
+                    # entry must itself be an authorized target.
+                    for candidate in re.split(r'[ ,]+', value):
+                        if candidate and not self.validate_target(candidate, authorized_scopes):
+                            errors.append(f'msf {key} value {candidate} is outside the authorized scope')
+                continue
+            if statement.lower() in MSF_ALLOWED_VERBS:
+                continue
+            errors.append(f'msf statement is not a permitted use/set/run/exit form: {statement!r}')
+        if not used_module and not errors:
+            errors.append('msf script must select a module with "use"')
+        return errors
+
+    @staticmethod
+    def _command_uses_payload_flag(tokens, spec, tool):
+        """True when the command carries a request-body (payload) flag.
+
+        shlex splits '-d' and its value into separate tokens; '--data=x' keeps
+        the value attached. Both spellings must count, and only for the tools
+        whose PAYLOAD_FLAGS entry names them.
+        """
+        payload_flags = PAYLOAD_FLAGS.get(tool, ())
+        if not payload_flags:
+            return False
+        for token in tokens[1:]:
+            base = token.split('=', 1)[0]
+            if base in payload_flags:
+                return True
+        return False
 
     def _is_flag(self, token, spec):
         if token in ('-', '--'):
@@ -381,7 +570,7 @@ class PolicyEngine:
             targets.extend(positionals)
         return targets, resolvers, None
 
-    def validate_command(self, command, authorized_scopes, expected_tool=None):
+    def validate_command(self, command, authorized_scopes, expected_tool=None, allow_exploitation=False):
         if not command or not command.strip():
             return False, 'A command is required.', None
         if any(char in command for char in CONTROL_CHARS):
@@ -396,10 +585,43 @@ class PolicyEngine:
         if expected_tool and tokens[0] != expected_tool:
             return False, f'Declared tool {expected_tool} does not match command executable {tokens[0]}.', None
 
-        rules = registry[tokens[0]]
+        tool = tokens[0]
+        rules = registry[tool]
+
+        # The exploitation gate: a tool (sqlmap, msfconsole) or a payload
+        # (curl with a request body) is exploitation-grade, and the client's
+        # engagement letter must authorize controlled exploitation for this
+        # target before any of it is even reviewable. Fail closed with the
+        # reason, so the refusal reads as the letter's decision, not a glitch.
+        exploitation_grade = tool in EXPLOITATION_GATED_TOOLS or self._command_uses_payload_flag(tokens, rules, tool)
+        if exploitation_grade and not allow_exploitation:
+            return False, ("The client's engagement letter does not authorize controlled exploitation "
+                           'against this target, so this command is refused.'), rules
+
         targets, resolvers, rejected = self.scan_arguments(tokens, rules)
         if rejected is not None:
-            return False, f'Blocked flag for {tokens[0]}: {rejected} is not in the permitted flag set for this capability.', rules
+            return False, f'Blocked flag for {tool}: {rejected} is not in the permitted flag set for this capability.', rules
+
+        # msfconsole's -x value is a script, not a single target: validate it
+        # statement by statement (module tree, set keys, RHOSTS scope) after
+        # the ordinary flag walk found the flag itself. Scope enforcement
+        # lives inside the script check, so success returns here.
+        if rules.get('msf'):
+            script = next((tokens[i + 1] for i, token in enumerate(tokens[1:-1], 1) if token in ('-x', '--execute-command')), None)
+            if script is None:
+                return False, 'msfconsole requires a -x resource script (use ...; set ...; run; exit).', rules
+            errors = self._msf_script_errors(script, authorized_scopes)
+            if errors:
+                return False, f'Blocked msfconsole resource script: {errors[0]}', rules
+            return True, 'Allowed exploitation capability (high risk); resource script scope-checked; HITL approval required.', rules
+
+        if rules.get('offline'):
+            # An offline lookup takes search terms as positionals; there is no
+            # network destination to scope-check. The command still had to
+            # pass the flag walk above, and no targetless exploit path exists
+            # because offline tools cannot reach a target at all.
+            return True, 'Allowed offline capability (no target interaction).', rules
+
         if not targets:
             return False, 'The command must contain an explicit target.', rules
         outside = [target for target in targets if not self.validate_target(target, authorized_scopes)]

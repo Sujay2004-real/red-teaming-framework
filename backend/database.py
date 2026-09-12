@@ -29,6 +29,11 @@ class Target(Base):
     # Tools the client's engagement letter rules out for this target, kept as
     # plain names; the execute endpoint refuses them before policy review.
     restricted_tools = Column(JSON, default=list)
+    # True only when the client's letter authorizes controlled exploitation
+    # (vulnerability verification with bounded evidence) against this target.
+    # The policy engine refuses every exploitation-grade command otherwise,
+    # fail-closed like every other letter-derived restriction.
+    exploitation_authorized = Column(Boolean, default=False)
     created_at = Column(DateTime, default=utcnow)
 
 class AppSettings(Base):
@@ -43,6 +48,17 @@ class AppSettings(Base):
     proxy_url = Column(String, default='')
     proxy_username = Column(String, default='')
     proxy_password = Column(Text, default='')
+    # Where approved commands run: 'local' (subprocess on this host, the
+    # Docker path) or 'kali_vm' (typed into the attacker VM's tmux over SSH).
+    execution_mode = Column(String, default='local')
+    ssh_host = Column(String, default='')
+    ssh_port = Column(Integer, default=22)
+    ssh_username = Column(String, default='')
+    ssh_password = Column(Text, default='')
+    # SHA-256 digest of the operator API key (or '' when REDTEAM_API_KEY is
+    # used instead). The plaintext is printed to the console on the first
+    # start and never stored anywhere.
+    operator_key_hash = Column(String, default='')
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 class Assessment(Base):
@@ -61,6 +77,15 @@ class Assessment(Base):
     # 'deterministic-fallback'). The client letter requires the report to
     # state it so findings can be weighed accordingly.
     analysis_mode = Column(String, default='')
+    # The engagement lifecycle phase this assessment currently sits in
+    # ('recon', 'vuln_analysis', 'exploitation', 'post_exploitation',
+    # 'reporting'). Plan steps carry their own phase tag; this column says
+    # which phase the operator is currently working through.
+    current_phase = Column(String, default='recon')
+    # Phase-level analysis bookkeeping: which plan phases have had their
+    # outputs analyzed, so the next phase's plan is only draftable from
+    # findings that actually exist.
+    analyzed_phases = Column(JSON, default=list)
     created_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
 
@@ -79,6 +104,10 @@ class ToolExecution(Base):
     approved_by_user = Column(Boolean, default=False)
     attempt = Column(Integer, default=1)
     executed_at = Column(DateTime, default=utcnow)
+    # Where this command actually ran (kali_vm attestation: hostname, OS,
+    # kernel, SSH host-key fingerprint) - the proof the output came from the
+    # attacker VM and not from anywhere the operator could have staged it.
+    execution_host = Column(JSON, default=None)
 
 class Finding(Base):
     __tablename__ = 'findings'
@@ -103,7 +132,47 @@ class Finding(Base):
     exploitability = Column(Integer, default=FINDING_DRIVER_DEFAULTS['exploitability'])
     impact = Column(Integer, default=FINDING_DRIVER_DEFAULTS['impact'])
     exposure = Column(Integer, default=FINDING_DRIVER_DEFAULTS['exposure'])
+    # Exploitation-phase outcome for this finding: '' (not attempted),
+    # 'attempted', 'verified', or 'refuted'. A recon finding the
+    # exploitation phase confirmed carries the proof here, so the report can
+    # separate "a scanner matched a signature" from "exploitation proved it".
+    verification = Column(String, default='')
+    # The exact exploitation output that verified the finding (sqlmap
+    # vulnerability confirmation, curl PoC response, msfconsole result).
+    exploit_evidence = Column(Text, default='')
+    # Which exploitation-phase tools produced the verification.
+    verified_by = Column(JSON, default=list)
+    # The plan phase whose analysis produced this finding ('recon',
+    # 'exploitation', 'post_exploitation'). A phase's analysis replaces only
+    # its own findings; earlier phases' findings are the evidence the later
+    # phases were planned from and survive re-analysis.
+    phase = Column(String, default='recon')
     source_tools = Column(JSON, default=list)
+    created_at = Column(DateTime, default=utcnow)
+
+class Recommendation(Base):
+    """What the framework proposed, automatically, after each executed step.
+
+    The automatic recommendation loop is read-only advice: nothing here
+    becomes a plan step without the operator accepting it through the plan
+    endpoint. Persisting the proposals is for the audit trail - *what the
+    system suggested at every juncture* is engagement evidence worth keeping,
+    including the candidates the policy engine refused (with reasons).
+    """
+    __tablename__ = 'recommendations'
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    # The execution whose completion triggered this batch, so the UI can
+    # match a poll to the step it just ran.
+    trigger_execution_id = Column(Integer)
+    # The phase the proposals belong to (proposals are phase-scoped by design).
+    phase = Column(String, default='recon')
+    # The full proposal payload: candidates, refused (with reasons), source,
+    # notes, state digest counts.
+    payload = Column(JSON, default=dict)
+    # 'auto' for the post-execution loop; the manual /next-steps endpoint
+    # stays ephemeral by design and never writes here.
+    origin = Column(String, default='auto')
     created_at = Column(DateTime, default=utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -122,11 +191,14 @@ def _migrate_sqlite():
             ('api_base_url', "VARCHAR DEFAULT ''"), ('model_name', "VARCHAR DEFAULT ''"),
             ('proxy_url', "VARCHAR DEFAULT ''"), ('proxy_username', "VARCHAR DEFAULT ''"),
             ('proxy_password', "TEXT DEFAULT ''"), ('updated_at', 'DATETIME'),
+            ('execution_mode', "VARCHAR DEFAULT 'local'"), ('ssh_host', "VARCHAR DEFAULT ''"),
+            ('ssh_port', 'INTEGER DEFAULT 22'), ('ssh_username', "VARCHAR DEFAULT ''"),
+            ('ssh_password', "TEXT DEFAULT ''"), ('operator_key_hash', "VARCHAR DEFAULT ''"),
         ],
-        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70'), ('restricted_tools', "JSON DEFAULT '[]'")],
-        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON'), ('analysis_mode', "VARCHAR DEFAULT ''")],
-        'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1')],
-        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME'), ('endpoint', "VARCHAR DEFAULT ''"), ('parameter', "VARCHAR DEFAULT ''"), ('exploitability', 'INTEGER DEFAULT 3'), ('impact', 'INTEGER DEFAULT 3'), ('exposure', 'INTEGER DEFAULT 3')],
+        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70'), ('restricted_tools', "JSON DEFAULT '[]'"), ('exploitation_authorized', 'BOOLEAN DEFAULT 0')],
+        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON'), ('analysis_mode', "VARCHAR DEFAULT ''"), ('current_phase', "VARCHAR DEFAULT 'recon'"), ('analyzed_phases', "JSON DEFAULT '[]'")],
+        'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1'), ('execution_host', 'JSON')],
+        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME'), ('endpoint', "VARCHAR DEFAULT ''"), ('parameter', "VARCHAR DEFAULT ''"), ('exploitability', 'INTEGER DEFAULT 3'), ('impact', 'INTEGER DEFAULT 3'), ('exposure', 'INTEGER DEFAULT 3'), ('verification', "VARCHAR DEFAULT ''"), ('exploit_evidence', "TEXT DEFAULT ''"), ('verified_by', "JSON DEFAULT '[]'"), ('phase', "VARCHAR DEFAULT 'recon'")],
     }
     with engine.begin() as conn:
         known = inspect(engine)

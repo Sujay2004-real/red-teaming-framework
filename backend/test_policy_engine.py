@@ -151,3 +151,133 @@ def test_ipv6_cidr_target_refused_by_a_narrower_network():
 
     assert not valid
     assert 'outside the authorized scope' in reason
+
+
+# ------------------------------------------------------------------ exploitation
+
+SCOPES = ['192.168.56.10']
+
+
+def test_exploitation_gate_refuses_sqlmap_without_authorization():
+    engine = PolicyEngine()
+    command = f'sqlmap -u http://192.168.56.10:3000 --batch'
+    valid, reason, _ = engine.validate_command(command, SCOPES)
+    assert not valid
+    assert 'does not authorize controlled exploitation' in reason
+    # With the letter's authorization, the same command is allowed.
+    valid, reason, _ = engine.validate_command(command, SCOPES, allow_exploitation=True)
+    assert valid, reason
+
+
+def test_curl_payload_flag_requires_exploitation_authorization():
+    engine = PolicyEngine()
+    benign = 'curl -sSI http://192.168.56.10:3000'
+    payload = 'curl -sS -i --data "email=x" http://192.168.56.10:3000/rest/user/login'
+    # A header audit is recon and needs no letter authorization.
+    valid, reason, _ = engine.validate_command(benign, SCOPES)
+    assert valid, reason
+    # The same tool carrying a request body is a proof-of-concept.
+    valid, reason, _ = engine.validate_command(payload, SCOPES)
+    assert not valid
+    assert 'does not authorize controlled exploitation' in reason
+    valid, reason, _ = engine.validate_command(payload, SCOPES, allow_exploitation=True)
+    assert valid, reason
+
+
+def test_sqlmap_dangerous_flags_are_refused():
+    engine = PolicyEngine()
+    for forbidden in ('--os-shell', '--dump', '--sql-shell', '--file-read', '--all'):
+        command = f'sqlmap -u http://192.168.56.10:3000 {forbidden}'
+        valid, _, _ = engine.validate_command(command, SCOPES, allow_exploitation=True)
+        assert not valid, forbidden
+
+
+def test_sqlmap_out_of_scope_target_refused():
+    engine = PolicyEngine()
+    valid, reason, _ = engine.validate_command('sqlmap -u http://8.8.8.8:3000 --batch', SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'outside the authorized scope' in reason
+
+
+def test_searchsploit_is_offline_and_needs_no_target():
+    engine = PolicyEngine()
+    valid, reason, _ = engine.validate_command('searchsploit openssh 7.2', SCOPES)
+    assert valid, reason
+    # Offline capability: no exploitation gate either — an Exploit-DB lookup
+    # interacts with no target at all.
+    valid, _, _ = engine.validate_command('searchsploit --title nodejs', SCOPES)
+    assert valid
+
+
+def test_searchsploit_browser_and_copy_flags_refused():
+    engine = PolicyEngine()
+    for forbidden in ('-w', '-p', '-m', '-x', '--nmap'):
+        command = f'searchsploit openssh {forbidden}'
+        valid, _, _ = engine.validate_command(command, SCOPES)
+        assert not valid, forbidden
+
+
+def test_msfconsole_script_validation():
+    engine = PolicyEngine()
+    good = ('msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; '
+            'set RHOSTS 192.168.56.10; set RPORT 22; run; exit"')
+    valid, reason, _ = engine.validate_command(good, SCOPES, allow_exploitation=True)
+    assert valid, reason
+
+
+def test_msfconsole_gate_and_missing_script():
+    engine = PolicyEngine()
+    good = ('msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; '
+            'set RHOSTS 192.168.56.10; run; exit"')
+    # Letter gate first, like every exploitation-grade tool.
+    valid, reason, _ = engine.validate_command(good, SCOPES)
+    assert not valid
+    assert 'does not authorize controlled exploitation' in reason
+    # Without a resource script the console is interactive - refused.
+    valid, reason, _ = engine.validate_command('msfconsole -q', SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'resource script' in reason
+
+
+def test_msfconsole_refuses_out_of_scope_rhosts():
+    engine = PolicyEngine()
+    bad = ('msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; '
+           'set RHOSTS 8.8.8.8; run; exit"')
+    valid, reason, _ = engine.validate_command(bad, SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'outside the authorized scope' in reason
+
+
+def test_msfconsole_refuses_payload_and_handler_modules():
+    engine = PolicyEngine()
+    # The multi/handler module with a payload set key: both the module tree
+    # (allowed) and the set key (PAYLOAD, not allowed) are checked — the set
+    # key refusal is the deterministic one here.
+    bad = ('msfconsole -q -x "use exploit/multi/handler; '
+           'set PAYLOAD windows/x64/meterpreter/reverse_tcp; run; exit"')
+    valid, reason, _ = engine.validate_command(bad, SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'set key' in reason or 'permitted module trees' in reason
+    # A module outside every allowed tree is refused on the tree check.
+    bad2 = 'msfconsole -q -x "use post/multi/manage/shell; run; exit"'
+    valid, reason, _ = engine.validate_command(bad2, SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'permitted module trees' in reason
+
+
+def test_msfconsole_refuses_arbitrary_statements():
+    engine = PolicyEngine()
+    bad = ('msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; '
+           'set RHOSTS 192.168.56.10; shell; exit"')
+    valid, reason, _ = engine.validate_command(bad, SCOPES, allow_exploitation=True)
+    assert not valid
+    assert 'not a permitted' in reason
+
+
+def test_msfconsole_rhosts_list_all_must_be_in_scope():
+    engine = PolicyEngine()
+    command = ('msfconsole -q -x "use auxiliary/scanner/ssh/ssh_version; '
+               'set RHOSTS 192.168.56.10,8.8.8.8; run; exit"')
+    valid, reason, _ = engine.validate_command(command, SCOPES, allow_exploitation=True)
+    assert not valid
+    assert '8.8.8.8' in reason

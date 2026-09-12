@@ -1,57 +1,43 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import {
+  API, EXECUTE_TIMEOUT_MS, HEALTH_POLL_MS, LIVE_POLL_MS,
+  createRequest, fetchProtectedObjectUrl, getOperatorKey, loadStoredKey, setOperatorKey,
+} from './lib/api'
+import {
+  FALLBACK_CAPABILITIES, PHASES, PHASE_LABEL, PLAN_SOURCE_NOTE, samePlan, suggestedObjective,
+} from './lib/constants'
+import { AppContext } from './lib/AppContext'
+import ApiKeyGate from './components/ApiKeyGate'
+import ConfigurationPanel from './components/ConfigurationPanel'
+import TargetPanel from './components/TargetPanel'
+import NewAssessmentPanel from './components/NewAssessmentPanel'
+import LetterPanel from './components/LetterPanel'
+import CrewPanel from './components/CrewPanel'
+import PhasePipeline from './components/PhasePipeline'
+import AssessmentsPanel from './components/AssessmentsPanel'
+import PlanEditor from './components/PlanEditor'
+import AnalysisPanel from './components/AnalysisPanel'
+import FindingsPanel from './components/FindingsPanel'
+import AuditTrailPanel from './components/AuditTrailPanel'
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
-// Only used until /capabilities answers. The backend policy engine owns the
-// real list, so a tool hardcoded here that policy rejects would just produce a
-// step that fails at approval time.
-const FALLBACK_CAPABILITIES = [{ id: 'tools', tools: ['nmap', 'traceroute', 'dig', 'nslookup', 'curl', 'whatweb', 'sslscan', 'nuclei'].map(name => ({ name })) }]
-const emptyStep = tool => ({ tool: tool || 'nmap', command: '', reason: '', enabled: true })
-// The backend falls back to a built-in plan for four different reasons; saying
-// which one keeps a provider outage from looking like a successful AI plan.
-const PLAN_SOURCE_NOTE = {
-  'ai-filtered': 'Plan drafted by the configured AI provider and cleared by policy review.',
-  'default-unconfigured': 'No AI provider is configured, so the built-in default plan was used. Add a base URL, model name, and API key to enable AI planning.',
-  'default-provider-error': 'The AI provider could not be reached, so the built-in default plan was used.',
-  'default-policy-rejected': 'Every AI-suggested command failed policy review, so the built-in default plan was used.',
-  user: 'Using the plan you supplied.',
-}
-const detailText = detail => Array.isArray(detail) ? detail.map(item => item?.msg || JSON.stringify(item)).join('; ') : typeof detail === 'string' ? detail : ''
-const samePlan = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || [])
-// The same formats and size cap the backend enforces on uploads, checked
-// client-side so a wrong pick gets a readable message instead of silence or
-// a raw 4xx from the server.
-const ALLOWED_UPLOAD_SUFFIXES = ['.txt', '.md', '.pdf', '.docx']
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-const fileSuffix = name => (name.match(/\.[^.]+$/) || [''])[0].toLowerCase()
-// Request budgets. The backend caps a scanner run at 360 s and AI provider
-// calls at 60 s, so the browser gives up only after the server itself
-// certainly has, and `busy` can never wedge on a request that never answers.
-const REQUEST_TIMEOUT_MS = 75_000
-const EXECUTE_TIMEOUT_MS = 400_000
-const HEALTH_POLL_MS = 10_000
-// How often the in-flight execution terminal polls the backend for new
-// output while a command runs.
-const LIVE_POLL_MS = 1_000
-
-// An objective drafted from the letter keeps the client's own framing: a
-// baseline-restricted target says so plainly, a full assessment carries the
-// letter's numbered objectives.
-const suggestedObjective = (brief, target) => {
-  const goals = (brief?.objectives || []).map(o => o.replace(/^[\d.]+\s*/, '')).join('; ')
-  const baseline = (target.assessment_type || '').toLowerCase().includes('baseline')
-  const headline = baseline
-    ? `Baseline assessment of ${target.name}: ${target.assessment_type}`
-    : `Assess ${target.name} per engagement ${brief?.engagement_ref || ''}`
-  return (goals ? `${headline}. Objectives: ${goals}` : headline).slice(0, 1000)
-}
-
+// The single-page control center. App owns the shared state and the request
+// lifecycle; each panel in components/ renders one slice of it and receives
+// exactly the data it needs. The panels never hold secrets and read only
+// server-confirmed state.
 function App() {
   const [targets, setTargets] = useState([]), [assessments, setAssessments] = useState([])
   const [selected, setSelected] = useState(null), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
   // Server plan lives on `selected`; `draftPlan` holds unsaved edits so the
   // progress gauges below can never describe a plan the backend has not seen.
   const [draftPlan, setDraftPlan] = useState([])
+  // The adaptive next-step proposals for the assessment in view: the last
+  // /next-steps response (manual or automatic), and which of its candidates
+  // the operator has ticked. Proposals are never a plan on their own — they
+  // only become one when the operator adds them to the draft and saves,
+  // exactly like a hand-typed step.
+  const [nextProposals, setNextProposals] = useState(null)
+  const [pickedCandidates, setPickedCandidates] = useState(new Set())
   const [capabilities, setCapabilities] = useState(FALLBACK_CAPABILITIES)
   const [target, setTarget] = useState({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 })
   const [assessment, setAssessment] = useState({ target_id: '', objective: '', requirements: '' })
@@ -64,14 +50,16 @@ function App() {
   // the free-text engagement prompt the framework plans from.
   const [promptTargetIds, setPromptTargetIds] = useState([])
   const [promptText, setPromptText] = useState('')
-  // The hidden file input behind the dropzone. The whole box is clickable,
-  // so the picker is opened programmatically through this ref.
-  const briefFileRef = useRef(null)
   // The parsed client engagement letter: what the agent was asked to do.
   const [brief, setBrief] = useState(null), [briefFilename, setBriefFilename] = useState(''), [briefText, setBriefText] = useState('')
   // Blank, not pre-filled: the operator chooses their own provider endpoint and
   // model. The input placeholders show the expected shape without submitting it.
-  const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: '', model_name: '', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false, proxy_configured: false, proxy_password_configured: false, provider_ready: false })
+  const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: '', model_name: '', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false, proxy_configured: false, proxy_password_configured: false, provider_ready: false, execution_mode: 'local', ssh_host: '', ssh_port: 22, ssh_username: '', ssh_password: '', ssh_password_configured: false })
+  // The last "Test connection" result against the Kali attacker VM: the
+  // machine's real identity (OS, kernel, SSH host key) and tool inventory,
+  // shown so the operator — and an audience — can see which box will run
+  // the approved commands.
+  const [sshTest, setSshTest] = useState(null)
   const [loading, setLoading] = useState(true)
   // Which agent card is mid-flight right now; '' means the crew is idle. Bound
   // to real request lifecycles rather than a timer, so an agent only ever
@@ -98,27 +86,18 @@ function App() {
   // between polls so the terminal never looks frozen.
   const [liveElapsed, setLiveElapsed] = useState(0)
 
-  const request = async (path, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
-    // FormData bodies set their own multipart boundary; a JSON header on top
-    // would corrupt the upload.
-    const headers = options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-      const res = await fetch(API + path, { headers, ...options, signal: controller.signal })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(detailText(data.detail) || `Request failed (${res.status})`)
-      return data
-    } catch (e) {
-      // "TypeError: Failed to fetch" points at the code; the stopped
-      // container is the actual cause. An abort is the timeout firing.
-      if (e.name === 'AbortError') throw new Error(`The backend did not answer within ${Math.round(timeoutMs / 1000)} seconds — it may be overloaded or restarting.`)
-      if (e instanceof TypeError) throw new Error(`Cannot reach the backend at ${API} — is the stack running?`)
-      throw e
-    } finally {
-      clearTimeout(timer)
-    }
-  }
+  // The operator API key, entered once and remembered per browser. A 401 from
+  // the backend raises the key prompt; until a valid key is saved, protected
+  // endpoints are unreachable by design. The live value lives in api.js (the
+  // request wrapper reads it at call time); this state only drives re-render.
+  const [apiKey, setApiKey] = useState(loadStoredKey)
+  const [keyInput, setKeyInput] = useState('')
+  const [keyPrompt, setKeyPrompt] = useState(false)
+
+  const request = useMemo(
+    () => createRequest(getOperatorKey, () => setKeyPrompt(true)),
+    [])
+
   const refresh = async () => {
     const [t, a, s, c] = await Promise.all([request('/targets/'), request('/assessments/'), request('/settings'), request('/capabilities').catch(() => null)])
     setTargets(t); setAssessments(a); setSettings(v => ({ ...v, ...s }))
@@ -129,8 +108,20 @@ function App() {
     catch (e) { setNotice(e.message) }
   }
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [])
+  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [apiKey])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
+
+  // Saving the key retries the whole refresh immediately, so the operator
+  // sees the workspace the moment the key is right instead of reloading.
+  const saveApiKey = e => {
+    e.preventDefault()
+    const value = keyInput.trim()
+    if (!value) return
+    setOperatorKey(value)
+    setApiKey(value)
+    setKeyInput('')
+    setKeyPrompt(false)
+  }
   /* eslint-disable react-hooks/exhaustive-deps */
   // Live terminal polling: while a step shows as still running in the audit
   // trail, fetch its partial output every second and stop when the command
@@ -152,13 +143,13 @@ function App() {
     tick()
     const interval = setInterval(tick, LIVE_POLL_MS)
     return () => { cancelled = true; clearInterval(interval) }
-     
+
   }, [runningStep, selected?.id, selected?.executions?.length])
 
   // A dead backend turns every button into a silent no-op, so reachability is
   // polled on its own schedule and announced in a banner. Coming back online
   // triggers a refresh, because the UI's data is stale by the length of the
-  // outage.
+  // outage. /health needs no operator key, so the poll works pre-unlock.
   useEffect(() => {
     const check = async () => {
       let up = false
@@ -180,15 +171,51 @@ function App() {
   // the request is in flight; the finally clause guarantees it clears even on
   // failure, so no agent is ever left "working" after a crash.
   const run = async (agent, fn) => { setBusy(true); setNotice(''); setActiveAgent(agent || ''); try { await fn() } catch (e) { setNotice(e.message) } finally { setBusy(false); setActiveAgent('') } }
+  // Buttons explain themselves while their own agent works, so a minute-long
+  // request reads as progress instead of a dead UI.
+  const agentBusy = agent => busy && activeAgent === agent
+
+  // The single payload both "Save configuration" and "Test connection" send,
+  // so the connection test always probes exactly what is on screen.
+  const settingsPayload = () => JSON.stringify({
+    gemini_api_key: settings.gemini_api_key || '', api_base_url: settings.api_base_url || '',
+    model_name: settings.model_name || '', proxy_url: settings.proxy_url || '',
+    proxy_username: settings.proxy_username || '', proxy_password: settings.proxy_password || '',
+    execution_mode: settings.execution_mode || 'local', ssh_host: settings.ssh_host || '',
+    ssh_port: Math.min(65535, Math.max(1, Number(settings.ssh_port) || 22)),
+    ssh_username: settings.ssh_username || '', ssh_password: settings.ssh_password || '',
+  })
   const saveSettings = e => run('', async () => {
     e.preventDefault()
     // Compare against what was stored before this save. Testing the submitted
     // proxy_url alone announced "clearing the proxy URL also cleared its stored
     // credentials" to every operator who had never configured a proxy at all.
     const clearedProxy = settings.proxy_configured && !settings.proxy_url
-    await request('/settings', { method: 'PUT', body: JSON.stringify({ gemini_api_key: settings.gemini_api_key || '', api_base_url: settings.api_base_url || '', model_name: settings.model_name || '', proxy_url: settings.proxy_url || '', proxy_username: settings.proxy_username || '', proxy_password: settings.proxy_password || '' }) }); setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '' })); await refresh(); setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : 'Settings saved. Secrets are masked after storage.')
+    const clearedVm = settings.ssh_password_configured && !settings.ssh_host
+    await request('/settings', { method: 'PUT', body: settingsPayload() })
+    setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '', ssh_password: '' }))
+    await refresh()
+    setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : clearedVm ? 'Settings saved. Clearing the VM host also cleared its stored password.' : 'Settings saved. Secrets are masked after storage.')
   })
-  const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean) }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70 }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
+  // Saves the form first, then connects: the endpoint tests the stored
+  // configuration, so what gets verified is what executions will use.
+  const testSshConnection = () => run('', async () => {
+    await request('/settings', { method: 'PUT', body: settingsPayload() })
+    setSettings(v => ({ ...v, ssh_password: '' }))
+    try {
+      const result = await request('/settings/ssh-test', { method: 'POST' })
+      setSshTest(result)
+      pushFeed(`Reached the attacker VM ${result.user}@${result.host} — ${result.os}.`, 'ok')
+      const problems = [...(result.tmux_ok ? [] : ['tmux']), ...(result.missing || [])]
+      setNotice(problems.length
+        ? `Connected to ${result.host}, but the VM is missing: ${problems.join(', ')}. Run “${result.install_hint}” inside the VM.`
+        : `Kali VM verified: ${result.user}@${result.host} — ${result.os}, kernel ${result.kernel}. Approved commands will run in its tmux session.`)
+    } catch (e) {
+      setSshTest(null)
+      throw e
+    }
+  })
+  const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean), exploitation_authorized: !!target.exploitation_authorized }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70, exploitation_authorized: false }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
   const createAssessment = e => run('planner', async () => { e.preventDefault(); let requirements = assessment.requirements; if (requirementFile) { const form = new FormData(); form.append('file', requirementFile); const data = await request('/requirements/extract', { method: 'POST', body: form }); requirements = data.text } const selectedTarget = targets.find(t => t.id === Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t => t.address === selectedTarget.scope_domain_ip); const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ ...assessment, target_id: Number(assessment.target_id), requirements, ...(briefApplies ? { engagement_brief: brief } : {}) }) }); setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null); await refresh(); await openAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source === 'ai-filtered' ? 'ok' : 'info'); const dropped = a.restricted_steps_dropped || 0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped > 1 ? 's' : ''} using tools the client's letter restricts for this target.` : '')) })
   // The second way in: the operator picks one or more registered targets
   // and writes the engagement as their own prompt. The prompt becomes the
@@ -221,19 +248,48 @@ function App() {
   // timeout exceeds the executor's own 360 s cap so the server always decides
   // how a command ends. runningStep lights the exact button that is
   // mid-flight, so a long command reads as progress rather than a dead UI.
-  const execute = index => { setRunningStep(index); setLiveExec(null); setLiveElapsed(0); run('executor', async () => { const id = selected.id; const d = await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true }) }, EXECUTE_TIMEOUT_MS); const r = d.result || {}; pushFeed(r.return_code === 0 ? `Step ${index + 1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index + 1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code === 0 ? 'ok' : 'warn'); await openAssessment(id); await refresh() }).finally(() => setRunningStep(null)) }
-  const analyze = () => run('analyst', async () => { const id = selected.id; const d = await request(`/assessments/${id}/analyze`, { method: 'POST' }); await openAssessment(id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count || 0} finding${(d.findings_count || 0) !== 1 ? 's' : ''} (${d.analyzer} mode).`, 'ok'); const failed = d.failed_steps || []; setNotice(failed.length ? `Analysis complete, but ${failed.length > 1 ? 'steps' : 'step'} ${failed.map(i => i + 1).join(', ')} failed to run — findings may be incomplete.` : `Analysis complete (${d.analyzer}).`) })
-  const report = () => run('reporter', async () => { const id = selected.id; const d = await request(`/assessments/${id}/report`, { method: 'POST' }); const url = API + d.download_url; const opened = window.open(url, '_blank', 'noopener'); // A window.open that follows an await has lost its user gesture, so popup
-  // blockers swallow it silently; a plain link needs no gesture, so the
-  // report stays one click away instead of looking like a dead button.
-  setReportUrl(opened ? '' : url); await openAssessment(id); await refresh(); pushFeed(opened ? 'Report written and opened in a new tab — it cites the engagement brief and every command.' : 'Report written — your browser blocked the automatic tab; open it from the link below.', 'ok') })
-  // Validation runs before any request so a bad pick — wrong type, too
-  // large, or a dropped folder, which arrives as no file at all — gets a
-  // plain sentence instead of silence or a raw 4xx from the server.
+  const execute = index => { setRunningStep(index); setLiveExec(null); setLiveElapsed(0); run('executor', async () => { const id = selected.id; const d = await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true }) }, EXECUTE_TIMEOUT_MS); const r = d.result || {}; pushFeed(r.return_code === 0 ? `Step ${index + 1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index + 1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code === 0 ? 'ok' : 'warn'); await openAssessment(id); await refresh(); pollRecommendations(id, d.execution_id) }).finally(() => setRunningStep(null)) }
+  // Level 2 of the recommendation loop: the backend proposes next steps
+  // after each finished command; this polls until that batch appears and
+  // shows it in the proposals panel. The batch is advice only — accepting
+  // anything still goes through Save plan and per-step approval.
+  const pollRecommendations = async (assessmentId, executionId) => {
+    for (let attempt = 0; attempt < 15; attempt++) {
+      let batch = null
+      try {
+        const feed = await request(`/assessments/${assessmentId}/recommendations`)
+        batch = (feed.recommendations || []).find(r => r.trigger_execution_id === executionId) || null
+      } catch { /* transient poll failure; the next attempt retries */ }
+      if (batch) {
+        setNextProposals(batch); setPickedCandidates(new Set())
+        pushFeed(`Proposed ${batch.candidates.length} next step${batch.candidates.length !== 1 ? 's' : ''} automatically after this command${batch.refused?.length ? ` — ${batch.refused.length} refused by the policy engine` : ''}. Nothing runs until you approve it.`, batch.candidates.length ? 'ok' : '')
+        return
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+  }
+  const analyze = () => run('analyst', async () => { const id = selected.id; const d = await request(`/assessments/${id}/analyze`, { method: 'POST' }); await openAssessment(id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count || 0} finding${(d.findings_count || 0) !== 1 ? 's' : ''} (${d.analyzer} mode).`, 'ok'); const failed = d.failed_steps || []; const auto = d.auto_drafted; if (auto && auto.steps > 0) pushFeed(`Auto-drafted ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} from the findings — review and approve each one.`, 'ok'); if (auto && auto.note) pushFeed(`Next phase not drafted: ${auto.note}`, 'warn'); setNotice(failed.length ? `Analysis complete, but ${failed.length > 1 ? 'steps' : 'step'} ${failed.map(i => i + 1).join(', ')} failed to run — findings may be incomplete.` : (auto && auto.steps > 0 ? `Analysis complete (${d.analyzer}). ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} drafted from the findings — review them below.` : `Analysis complete (${d.analyzer}).`)) })
+  // The report is downloaded through a key-authenticated blob fetch: the
+  // plain /reports/{id} URL now requires the X-API-Key header, which a
+  // browser tab link cannot send.
+  const report = () => run('reporter', async () => {
+    const id = selected.id
+    const d = await request(`/assessments/${id}/report`, { method: 'POST' })
+    const url = await fetchProtectedObjectUrl(d.download_url, getOperatorKey)
+    const opened = window.open(url, '_blank', 'noopener')
+    // A window.open that follows an await has lost its user gesture, so popup
+    // blockers swallow it silently; a plain link needs no gesture, so the
+    // report stays one click away instead of looking like a dead button.
+    setReportUrl(opened ? '' : url)
+    await openAssessment(id); await refresh()
+    pushFeed(opened ? 'Report written and opened in a new tab — it cites the engagement brief and every command.' : 'Report written — your browser blocked the automatic tab; open it from the link below.', 'ok')
+  })
+  const downloadReport = () => run('reporter', async () => {
+    const url = await fetchProtectedObjectUrl(`/reports/${selected.id}`, getOperatorKey)
+    const opened = window.open(url, '_blank', 'noopener')
+    if (!opened) setReportUrl(url)
+  })
   const importBrief = file => {
-    if (!file) { setNotice('No file was selected. Click anywhere in the box to browse, or drop the letter onto it.'); return }
-    if (!ALLOWED_UPLOAD_SUFFIXES.includes(fileSuffix(file.name))) { setNotice(`“${file.name}” is not a supported format. Use PDF, Word, Markdown or text.`); return }
-    if (file.size > MAX_UPLOAD_BYTES) { setNotice(`“${file.name}” is larger than 5 MB, the maximum the reader accepts.`); return }
     return run('reader', async () => {
       const form = new FormData(); form.append('file', file)
       const data = await request('/engagement/parse', { method: 'POST', body: form })
@@ -251,42 +307,66 @@ function App() {
         authorized_scopes: (t.scopes && t.scopes.length) ? t.scopes : [t.address],
         criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
         restricted_tools: t.restricted_tools || [],
+        exploitation_authorized: !!t.exploitation_authorized,
       })
     })
     await refresh()
     setAssessment({ target_id: String(created.id), objective: suggestedObjective(brief, t), requirements: briefText })
-    pushFeed(`Registered “${created.name}”${created.restricted_tools?.length ? ` (no ${created.restricted_tools.join(', ')} per the letter)` : ''}.`, 'ok')
-    setNotice(`“${created.name}” is registered${created.restricted_tools?.length ? ` — ${created.restricted_tools.join(', ')} will be refused on this target per the client's letter` : ''}. Now generate its command plan.`)
+    // The backend refuses to fork a second target for an address already on
+    // file, so a stale register click says "already registered" instead of
+    // silently creating the duplicate the letter never asked for.
+    if (created.already_registered) {
+      pushFeed(`“${created.name}” was already on file — reusing the registered target.`)
+      setNotice(`“${created.name}” was already registered; the existing target is selected. Generate its command plan below.`)
+      return
+    }
+    pushFeed(`Registered “${created.name}”${created.restricted_tools?.length ? ` (no ${created.restricted_tools.join(', ')})` : ''}${created.exploitation_authorized ? ' — the letter authorizes controlled verification' : ''}.`, 'ok')
+    setNotice(`“${created.name}” is registered${created.restricted_tools?.length ? ` — ${created.restricted_tools.join(', ')} will be refused on this target per the client's letter` : ''}${created.exploitation_authorized ? ' and the letter authorizes controlled exploitation for it' : ''}. Now generate its command plan.`)
   })
   // One click from letter to ready-to-approve plans: register every target in
   // the brief, then draft an assessment for each so the operator lands on a
   // plan they can review. The crew cards alternate registrar/planner as the
-  // loop moves between the two kinds of work.
+  // loop moves between the two kinds of work. A target this same letter
+  // already has an assessment for is skipped — re-running setup used to stack
+  // a duplicate of every plan on top of the first run's (the "3 assessments
+  // show as 6" bug). Clear the workspace first for a genuinely fresh run.
   const setupFromBrief = () => run('registrar', async () => {
-    let firstId = null, registered = 0, drafted = 0
+    let firstId = null, registered = 0, drafted = 0, skipped = 0
+    const letterRef = brief.engagement_ref
+    const existingPlanFor = targetId => letterRef
+      ? assessments.find(a => a.target_id === targetId && a.engagement_brief?.engagement_ref === letterRef)
+      : null
     for (const t of brief.targets) {
       const existing = targets.find(x => x.scope_domain_ip === t.address)
-      const target = existing || await request('/targets/', {
+      const created = existing || await request('/targets/', {
         method: 'POST', body: JSON.stringify({
           name: t.name || t.address,
           scope_domain_ip: t.address,
           authorized_scopes: (t.scopes && t.scopes.length) ? t.scopes : [t.address],
           criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
           restricted_tools: t.restricted_tools || [],
+          exploitation_authorized: !!t.exploitation_authorized,
         })
       })
       if (!existing) registered++
+      const prior = existingPlanFor(created.id)
+      if (prior) {
+        skipped++
+        if (firstId === null) firstId = prior.id
+        continue
+      }
       setActiveAgent('planner')
-      const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ target_id: target.id, objective: suggestedObjective(brief, t), requirements: briefText, engagement_brief: brief }) })
+      const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ target_id: created.id, objective: suggestedObjective(brief, t), requirements: briefText, engagement_brief: brief }) })
       drafted++
       if (firstId === null) firstId = a.id
       setActiveAgent('registrar')
     }
-    await refresh(); await openAssessment(firstId)
-    pushFeed(`Set up the whole letter: ${registered} target${registered !== 1 ? 's' : ''} registered, ${drafted} plan${drafted !== 1 ? 's' : ''} drafted. Each waits for your approval.`, 'ok')
-    setNotice(`All set — ${drafted} plan${drafted !== 1 ? 's' : ''} drafted from the letter. Review the commands, then approve each one when you're ready.`)
+    await refresh(); if (firstId !== null) await openAssessment(firstId)
+    pushFeed(`Set up the whole letter: ${registered} target${registered !== 1 ? 's' : ''} registered, ${drafted} plan${drafted !== 1 ? 's' : ''} drafted${skipped ? `, ${skipped} already set up earlier` : ''}. Each waits for your approval.`, 'ok')
+    setNotice(skipped
+      ? `This letter was already set up: ${drafted} new plan${drafted !== 1 ? 's' : ''} drafted, ${skipped} target${skipped !== 1 ? 's' : ''} kept their existing assessment${skipped !== 1 ? 's' : ''}. Use “Clear workspace” first if you want a completely fresh run.`
+      : `All set — ${drafted} plan${drafted !== 1 ? 's' : ''} drafted from the letter. Review the commands, then approve each one when you're ready.`)
   })
-  const patchStep = (i, key, value) => setDraftPlan(plan => plan.map((s, n) => n === i ? { ...s, [key]: value } : s))
   const toolNames = useMemo(() => new Set(capabilities.flatMap(group => (group.tools || []).map(tool => tool.name))), [capabilities])
   const executionByStep = useMemo(() => new Map((selected?.executions || []).map(execution => [execution.step_index, execution])), [selected])
   // Gauges and the Analyze gate read the *saved* plan. Reading the draft let a
@@ -294,28 +374,141 @@ function App() {
   // the step to run, and the request then failed with a 409.
   const enabledSteps = useMemo(() => (selected?.plan || []).map((step, index) => ({ step, index })).filter(({ step }) => step.enabled !== false), [selected])
   const completedSteps = useMemo(() => enabledSteps.filter(({ index }) => executionByStep.get(index)?.complete), [enabledSteps, executionByStep])
+  // Analysis is gated on the CURRENT phase's steps only: earlier phases were
+  // already analyzed, and later phases have not been drafted yet.
+  const currentPhase = selected?.current_phase || 'recon'
+  const phaseSteps = useMemo(() => enabledSteps.filter(({ step }) => (step.phase || 'recon') === currentPhase), [enabledSteps, currentPhase])
+  const phaseCompleted = useMemo(() => phaseSteps.filter(({ index }) => executionByStep.get(index)?.complete), [phaseSteps, executionByStep])
   const planLocked = (selected?.executions?.length || 0) > 0
+  // What is actually frozen is the executed prefix, not the plan: an executed
+  // step is an audit fact and keeps its tool, command and position, while an
+  // unexecuted step — including one just proposed mid-engagement, or a whole
+  // phase not yet run — stays editable. This is the same per-step rule the
+  // plan-update endpoint enforces, and the reason a proposal can be accepted
+  // in a phase that is already under way. Any change to the frozen prefix is
+  // refused here and refused again by the backend.
+  const executedPrefixIntact = !!selected && draftPlan.length >= (selected.plan?.length || 0)
+    && samePlan(draftPlan.slice(0, selected.plan?.length || 0), selected.plan)
+  const planEditable = !planLocked || executedPrefixIntact
   const planDirty = !!selected && !samePlan(draftPlan, selected.plan)
   const selectedTarget = useMemo(() => targets.find(t => t.id === selected?.target_id), [targets, selected])
-  const canAnalyze = !!selected && !planDirty && enabledSteps.length > 0 && completedSteps.length === enabledSteps.length
+  const canAnalyze = !!selected && !planDirty && phaseSteps.length > 0 && phaseCompleted.length === phaseSteps.length
   const canReport = selected?.status === 'analyzed' || selected?.status === 'reported'
 
-  // The agent pipeline the stepper visualises. Each stage reads only saved
-  // state, so the tracker never claims progress the backend has not made.
-  const stages = useMemo(() => {
+  // The engagement phases the stepper visualises. Each phase reads only
+  // saved state (registered targets, parsed brief, current phase, analysis
+  // records, report status), so the tracker never claims progress the
+  // backend has not made.
+  const phases = useMemo(() => {
     const registered = targets.length > 0
     const hasBrief = !!brief
-    const planned = !!selected && (selected.plan || []).length > 0
-    const findings = selected?.findings?.length || 0
-    return [
-      { key: 'read', label: 'Read the engagement letter', caption: hasBrief ? `Parsed ${brief.targets.length} target${brief.targets.length > 1 ? 's' : ''} from “${briefFilename}”` : 'Import the client PDF to set scope and rules', done: hasBrief },
-      { key: 'register', label: 'Register authorized targets', caption: registered ? `${targets.length} target${targets.length > 1 ? 's' : ''} with scopes and criticality` : 'Scopes and criticality feed every policy check and score', done: registered },
-      { key: 'plan', label: 'Draft the command plan', caption: planned ? `${enabledSteps.length} command${enabledSteps.length !== 1 ? 's' : ''} awaiting your approval` : 'The agent proposes; nothing runs until you approve', done: planned },
-      { key: 'run', label: 'Approve & execute', caption: selected ? `${completedSteps.length} of ${enabledSteps.length} approved commands complete` : 'Every command needs your explicit approval', done: !!selected && completedSteps.length === enabledSteps.length && enabledSteps.length > 0 },
-      { key: 'analyze', label: 'Correlate findings', caption: findings ? `${findings} correlated finding${findings > 1 ? 's' : ''}` : 'Dedupe and score severity, risk and confidence', done: selected?.status === 'analyzed' || selected?.status === 'reported' },
-      { key: 'report', label: 'Deliver the report', caption: selected?.status === 'reported' ? 'Ready to download' : 'Signed-off evidence for the client', done: selected?.status === 'reported' },
-    ]
-  }, [targets, brief, briefFilename, selected, enabledSteps, completedSteps])
+    const current = selected?.current_phase || 'recon'
+    const analyzed = new Set(selected?.analyzed_phases || [])
+    const reported = selected?.status === 'reported'
+    const plan = selected?.plan || []
+    const phaseCount = p => plan.filter(step => (step.phase || 'recon') === p).length
+    const phaseDone = p => phaseCount(p) > 0 && plan.filter(step => (step.phase || 'recon') === p && step.enabled !== false).every(step => executionByStep.get(plan.indexOf(step))?.complete)
+    return PHASES.map(phase => {
+      const { key, label, caption } = phase
+      let done = false, captionText = caption
+      if (key === 'scoping') {
+        done = hasBrief && registered
+        captionText = hasBrief && registered ? 'Letter read; targets registered' : caption
+      } else if (key === 'recon') {
+        done = analyzed.has('recon')
+        captionText = selected ? (analyzed.has('recon') ? 'Recon executed and analyzed' : `${phaseDone('recon') ? 'All' : 'Some'} recon steps executed${analyzed.has('recon') ? '' : ' — analysis pending'}`) : caption
+      } else if (key === 'vuln_analysis') {
+        done = analyzed.has('recon') && (current !== 'vuln_analysis' || !!selected)
+        captionText = analyzed.has('recon') ? `${selected?.findings?.length || 0} correlated findings` : 'Analyze the recon output to complete this phase'
+      } else if (key === 'exploitation') {
+        done = analyzed.has('exploitation')
+        captionText = done ? 'Findings verified with controlled exploits' : phaseCount('exploitation') ? `${phaseCount('exploitation')} verification steps planned` : selectedTarget?.exploitation_authorized ? 'Ready to draft verification steps from the findings' : 'Letter does not authorize exploitation for this target'
+      } else if (key === 'post_exploitation') {
+        done = analyzed.has('post_exploitation')
+        captionText = done ? 'Bounded impact evidence collected' : phaseCount('post_exploitation') ? `${phaseCount('post_exploitation')} bounded steps planned` : 'Drafted after exploitation findings are analyzed'
+      } else if (key === 'reporting') {
+        done = reported
+        captionText = reported ? 'Report ready to download' : 'Generated after the engagement evidence is complete'
+      }
+      return { key, label, caption: captionText, done }
+    })
+  }, [targets, brief, selected, selectedTarget, executionByStep])
+
+  // Can the next phase's plan be drafted right now? Requires the previous
+  // phase analyzed, and the letter's authorization for exploitation phases.
+  const nextDraftable = useMemo(() => {
+    if (!selected) return null
+    const current = selected.current_phase || 'recon'
+    const analyzed = new Set(selected.analyzed_phases || [])
+    if (current === 'vuln_analysis' && analyzed.has('recon')) return 'exploitation'
+    if (current === 'post_exploitation' && analyzed.has('exploitation')) return 'post_exploitation'
+    return null
+  }, [selected])
+
+  const draftPhase = phase => run('planner', async () => {
+    const id = selected.id
+    const d = await request(`/assessments/${id}/phases/${phase}/plan`, { method: 'POST' })
+    await openAssessment(id)
+    await refresh()
+    pushFeed(`Drafted ${d.drafted_steps} ${PHASE_LABEL(phase)} steps for assessment #${id}. Nothing runs until you approve it.`, 'ok')
+    setNotice(`Drafted ${d.drafted_steps} ${PHASE_LABEL(phase)} step${d.drafted_steps !== 1 ? 's' : ''} from the analysis — review each one, then approve it when you're ready.`)
+  })
+
+  // Ask what to do next, given what has actually been observed. This proposes
+  // and nothing else: candidates land in the panel for the operator to pick
+  // from, and accepting them goes through the ordinary Save plan path, so the
+  // policy checks and the immutability rules apply to them identically.
+  const proposeNextSteps = () => run('planner', async () => {
+    const id = selected.id
+    const data = await request(`/assessments/${id}/next-steps`, { method: 'POST' })
+    setNextProposals(data)
+    setPickedCandidates(new Set())
+    const refused = data.refused.length ? `, ${data.refused.length} refused by the policy engine` : ''
+    pushFeed(`Proposed ${data.candidates.length} next step${data.candidates.length !== 1 ? 's' : ''} for assessment #${id}${refused}. Nothing runs until you approve it.`, data.candidates.length ? 'ok' : '')
+  })
+
+  const addPickedCandidates = () => {
+    if (!nextProposals || !pickedCandidates.size) return
+    const chosen = nextProposals.candidates.filter((_, index) => pickedCandidates.has(index))
+    setDraftPlan(plan => [...plan, ...chosen])
+    setNextProposals(null)
+    setPickedCandidates(new Set())
+    pushFeed(`Added ${chosen.length} proposed step${chosen.length !== 1 ? 's' : ''} to the plan for assessment #${selected.id}. Save the plan so approvals run them.`, 'ok')
+    setNotice(`Added ${chosen.length} proposed step${chosen.length !== 1 ? 's' : ''} to the plan — review and edit them, then save the plan.`)
+  }
+
+  // Everything below is view state for the run being inspected: clearing the
+  // workspace or one assessment must drop it all, or the panels would keep
+  // describing an assessment the backend no longer has.
+  const forgetAssessment = () => { setSelected(null); setDraftPlan([]); setReportUrl(''); setLiveExec(null); setRunningStep(null); setNextProposals(null); setPickedCandidates(new Set()) }
+  const deleteAssessment = id => {
+    if (!window.confirm(`Delete assessment #${id} with its executions, findings and report? This cannot be undone.`)) return
+    run('', async () => {
+      await request(`/assessments/${id}`, { method: 'DELETE' })
+      if (selected?.id === id) forgetAssessment()
+      await refresh()
+      pushFeed(`Deleted assessment #${id}.`)
+      setNotice(`Assessment #${id} deleted.`)
+    })
+  }
+  // The persisted database is why every reload showed the last engagement's
+  // results: assessments survive across sessions until they are explicitly
+  // removed. This is the fresh board between two letters or two demos; the
+  // provider and VM configuration stays because it describes the operator's
+  // setup, not the engagement.
+  const resetWorkspace = () => {
+    if (!window.confirm('Clear the whole workspace? Every registered target, assessment, execution, finding and report is permanently deleted. Your provider and VM configuration is kept.')) return
+    run('', async () => {
+      const d = await request('/workspace/reset', { method: 'POST' })
+      forgetAssessment()
+      setBrief(null); setBriefFilename(''); setBriefText('')
+      setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null)
+      setPromptTargetIds([]); setPromptText(''); setFeed([])
+      await refresh()
+      pushFeed(`Cleared the workspace — ${d.deleted.assessments} assessment${d.deleted.assessments !== 1 ? 's' : ''} and ${d.deleted.targets} target${d.deleted.targets !== 1 ? 's' : ''} removed.`, 'ok')
+      setNotice('Workspace cleared — ready for a new engagement letter.')
+    })
+  }
 
   // The agent crew the cards animate. `working` comes from the live request
   // lifecycle (`activeAgent`); `done` reads saved state only, so a card never
@@ -323,186 +516,93 @@ function App() {
   const crew = useMemo(() => {
     const findings = selected?.findings?.length || 0
     const planned = !!selected && (selected.plan || []).length > 0
+    const current = selected?.current_phase || 'recon'
+    const analyzed = new Set(selected?.analyzed_phases || [])
     return [
       { key: 'reader', emoji: '📄', name: 'Brief reader', idle: 'Waiting for the client letter', working: 'Reading the letter…', done: !!brief, doneText: briefFilename ? `Read “${briefFilename}”` : '' },
       { key: 'registrar', emoji: '🗂️', name: 'Registrar', idle: 'Registers authorized targets', working: 'Registering targets…', done: targets.length > 0, doneText: targets.length ? `${targets.length} target${targets.length !== 1 ? 's' : ''} on file` : '' },
       { key: 'planner', emoji: '🧭', name: 'Planner', idle: 'Drafts commands for your approval', working: 'Drafting the command plan…', done: planned, doneText: planned ? `${(selected.plan || []).length} steps awaiting approval` : '' },
       { key: 'executor', emoji: '⚡', name: 'Executor', idle: 'Runs only what you approve', working: 'Running the approved command…', done: completedSteps.length > 0, doneText: completedSteps.length ? `${completedSteps.length}/${enabledSteps.length} commands complete` : '' },
+      { key: 'exploiter', emoji: '🎯', name: 'Exploiter', idle: 'Verifies findings when the letter allows', working: 'Planning controlled verification…', done: analyzed.has('exploitation'), doneText: analyzed.has('exploitation') ? 'Findings verified' : current === 'exploitation' ? 'Exploitation phase active' : '' },
       { key: 'analyst', emoji: '🔎', name: 'Analyst', idle: 'Correlates and scores findings', working: 'Correlating outputs…', done: selected?.status === 'analyzed' || selected?.status === 'reported', doneText: findings ? `${findings} finding${findings !== 1 ? 's' : ''} scored` : '' },
       { key: 'reporter', emoji: '📝', name: 'Reporter', idle: 'Writes the client report', working: 'Writing the report…', done: selected?.status === 'reported', doneText: selected?.status === 'reported' ? 'Report ready to download' : '' },
     ]
   }, [brief, briefFilename, targets, selected, completedSteps, enabledSteps])
-  const workingAgent = crew.find(agent => agent.key === activeAgent)
-  // Buttons explain themselves while their own agent works, so a minute-long
-  // request reads as progress instead of a dead button.
-  const agentBusy = agent => busy && activeAgent === agent
+
+  const app = { request, run, pushFeed, busy, activeAgent, agentBusy, notice, setNotice }
 
   if (loading) return <main className="loading-screen"><div className="loading-mark" /><p>Loading control center...</p></main>
 
-  return <main>
-    {busy && <div className="busy-bar" aria-hidden="true" />}
-    {!backendUp && <div className="offline-banner">⚠ Cannot reach the backend at <code>{API}</code> — buttons will not respond until the stack is running again.</div>}
-    <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="health"><i /> Lab environment</div></header>
-    {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>×</button></div>}
-    <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a => a.status === 'reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>Configured analyzer</span></div></section>
+  return <AppContext.Provider value={app}>
+    <main>
+      {busy && <div className="busy-bar" aria-hidden="true" />}
+      {!backendUp && <div className="offline-banner">⚠ Cannot reach the backend at <code>{API}</code> — buttons will not respond until the stack is running again.</div>}
+      {keyPrompt && <ApiKeyGate keyInput={keyInput} setKeyInput={setKeyInput} onSave={saveApiKey} />}
+      <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="health"><i /> Lab environment</div></header>
+      {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>×</button></div>}
+      <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a => a.status === 'reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>Configured analyzer</span></div></section>
 
-    <div className="workspace">
-      <aside>
-        <section className="panel"><div className="panel-title"><h2>Configuration</h2><span className={settings.provider_ready ? 'tag good' : 'tag'}>{settings.provider_ready ? 'AI provider ready' : 'Fallback mode'}</span></div><form onSubmit={saveSettings}>
-          <div className="provider-fields"><label>Base URL<input type="url" placeholder="https://your-provider.example/v1" value={settings.api_base_url || ''} onChange={e => setSettings({ ...settings, api_base_url: e.target.value })} /><small>Your own OpenAI-compatible endpoint. No provider is assumed.</small></label><label>Model name<input placeholder="your-model-name" value={settings.model_name || ''} onChange={e => setSettings({ ...settings, model_name: e.target.value })} /></label><label>API key<input type="password" placeholder={settings.gemini_configured ? 'Configured ••••••••' : 'Enter your own API key'} value={settings.gemini_api_key} onChange={e => setSettings({ ...settings, gemini_api_key: e.target.value })} /><small>{settings.gemini_configured ? 'Leave blank to keep the stored key.' : 'Encrypted before storage and never returned by the API.'}</small></label></div>
-          <small className="plan-note">All three are needed for AI planning and analysis. Leave them blank to run entirely on the local deterministic analyzer.</small>
-          <label>HTTP/S proxy<input placeholder="http://proxy:8080" value={settings.proxy_url || ''} onChange={e => setSettings({ ...settings, proxy_url: e.target.value })} /><small>Clearing this also clears the credentials below.</small></label>
-          <div className="split"><label>Username<input value={settings.proxy_username || ''} onChange={e => setSettings({ ...settings, proxy_username: e.target.value })} /></label><label>Password<input type="password" placeholder={settings.proxy_password_configured ? 'Configured ••••••••' : 'Proxy password'} value={settings.proxy_password || ''} onChange={e => setSettings({ ...settings, proxy_password: e.target.value })} /><small>{settings.proxy_password_configured ? 'Leave blank to keep the stored password.' : 'Encrypted before storage and never returned by the API.'}</small></label></div>
-          <button className="secondary" disabled={busy}>{busy ? 'Saving…' : 'Save configuration'}</button><small>Responses never return secret values.</small>
-        </form></section>
-        <section className="panel"><h2>Add authorized target</h2><form onSubmit={addTarget}><label>Display name<input required value={target.name} onChange={e => setTarget({ ...target, name: e.target.value })} placeholder="Juice Shop lab" /></label><label>Primary host or network (CIDR)<input required value={target.scope_domain_ip} onChange={e => setTarget({ ...target, scope_domain_ip: e.target.value })} placeholder="192.168.56.10:3000, 192.168.56.20:80 or 192.168.56.0/24" /><small>CIDR targets run a live-host and common-port discovery sweep. Ranges are limited to 256 addresses per assessment.</small></label><label>Allowed domains / CIDRs<input value={target.authorized_scopes} onChange={e => setTarget({ ...target, authorized_scopes: e.target.value })} placeholder="192.168.56.10, 192.168.56.0/24" /></label><label>Asset criticality<input type="number" min="0" max="100" required value={target.criticality} onChange={e => setTarget({ ...target, criticality: e.target.value })} /><small>0-100. Feeds the priority score of every finding on this target.</small></label><button disabled={busy}>{agentBusy('registrar') ? 'Registering…' : 'Add target'}</button></form></section>
-        {/* Two ways into an assessment: from a registered target (the letter
-            import path fills objective/requirements for you), or the operator
-            picks targets and writes their own engagement prompt. */}
-        <section className="panel"><h2>New assessment</h2>
-          <div className="mode-tabs" role="tablist" aria-label="Assessment entry mode">
-            <button type="button" role="tab" aria-selected={assessmentMode === 'letter'} className={`mode-tab${assessmentMode === 'letter' ? ' active' : ''}`} onClick={() => setAssessmentMode('letter')} disabled={busy}>From a letter</button>
-            <button type="button" role="tab" aria-selected={assessmentMode === 'prompt'} className={`mode-tab${assessmentMode === 'prompt' ? ' active' : ''}`} onClick={() => setAssessmentMode('prompt')} disabled={busy}>Your own prompt</button>
-          </div>
-          {assessmentMode === 'letter' ? <form onSubmit={createAssessment}><label>Target<select required value={assessment.target_id} onChange={e => setAssessment({ ...assessment, target_id: e.target.value })}><option value="">Select target</option>{targets.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Objective<textarea required value={assessment.objective} onChange={e => setAssessment({ ...assessment, objective: e.target.value })} placeholder="Identify high-risk web vulnerabilities before release" /></label><label>Client requirements<input type="file" accept=".txt,.md,.pdf,.docx" onChange={e => { const file = e.target.files?.[0] || null; e.target.value = ''; setRequirementFile(file) }} /><small>{assessment.requirements ? `Context from “${briefFilename}” is attached and will guide planning.` : 'Optional planning context; every command still needs HITL approval.'}</small></label><button disabled={busy}>{agentBusy('planner') ? 'Drafting the plan…' : brief ? 'Draft plan from the letter' : 'Generate command plan'}</button></form> :
-          <form onSubmit={createFromPrompt}>
-            <label>Targets{targets.length === 0 ? <small>No targets registered yet — add one in “Add authorized target” above.</small> : <div className="target-pick">{targets.map(t => <button type="button" key={t.id} className={`pick-chip${promptTargetIds.includes(t.id) ? ' picked' : ''}`} onClick={() => togglePromptTarget(t.id)} disabled={busy} aria-pressed={promptTargetIds.includes(t.id)}><b>{t.name}</b><small>{t.scope_domain_ip}</small>{!!t.restricted_tools?.length && <small className="pick-warn">no {t.restricted_tools.join(', ')}</small>}</button>)}</div>}</label>
-            <label>Your prompt<textarea required maxLength={1000} value={promptText} onChange={e => setPromptText(e.target.value)} placeholder="Run a deep pre-launch check on the storefront: enumerate services and versions, audit the HTTP security headers, fingerprint the stack, and report anything an attacker could use — stay non-destructive." /><small>{1000 - promptText.length} characters left. With an AI provider configured, your prompt steers the drafted commands; without one, each target gets the standard policy-checked plan.</small></label>
-            <button disabled={busy || !promptTargetIds.length || !promptText.trim()}>{agentBusy('planner') ? `Drafting ${promptTargetIds.length || ''} plan${promptTargetIds.length !== 1 ? 's' : ''}…` : `Generate plan${promptTargetIds.length !== 1 ? 's' : ''} from prompt`}</button>
-            <small>Pick one or more targets, describe the engagement in your own words, and the framework drafts a plan per target. Scopes, criticality and the letter's per-target tool restrictions still apply, and every command waits for your approval.</small>
-          </form>}
-        </section>
-      </aside>
+      <div className="workspace">
+        <aside>
+          <ConfigurationPanel settings={settings} setSettings={setSettings} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} />
+          <TargetPanel target={target} setTarget={setTarget} onAdd={addTarget} />
+          <NewAssessmentPanel
+            targets={targets} brief={brief} briefFilename={briefFilename}
+            mode={assessmentMode} setMode={setAssessmentMode}
+            assessment={assessment} setAssessment={setAssessment}
+            setRequirementFile={setRequirementFile}
+            promptTargetIds={promptTargetIds} togglePromptTarget={togglePromptTarget}
+            promptText={promptText} setPromptText={setPromptText}
+            onCreateFromLetter={createAssessment} onCreateFromPrompt={createFromPrompt}
+          />
+        </aside>
 
-      <section className="main-column">
-        <section className="panel brief-panel">
-          <div className="panel-title"><div><span className="eyebrow">START HERE</span><h2>Read the client's letter</h2></div>{brief && <button className="secondary compact" onClick={() => { setBrief(null); setBriefFilename(''); setBriefText('') }} disabled={busy}>Clear</button>}</div>
-          {/* The whole box is the picker: clicks and Enter/Space forward to
-              the hidden input, which clears itself after every pick so
-              re-choosing the same file still fires onChange. */}
-          {!brief ? <div className="dropzone" role="button" tabIndex={0} aria-label="Import the client engagement letter"
-            onClick={() => { if (!busy) briefFileRef.current?.click() }}
-            onKeyDown={e => { if (!busy && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); briefFileRef.current?.click() } }}
-            onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (!busy) importBrief(e.dataTransfer.files?.[0]) }}>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-            <label className="drop-pick" htmlFor="brief-file" onClick={e => e.stopPropagation()}>{briefFilename || 'Drop the request letter here'}</label>
-            <input id="brief-file" type="file" accept=".txt,.md,.pdf,.docx" hidden ref={briefFileRef}
-              onChange={e => { const file = e.target.files?.[0] || null; e.target.value = ''; importBrief(file) }} />
-            <small>PDF, Word or text. I'll read it and work out the scope, targets, criticality and rules of engagement — then wait for your approval on every command.</small>
-          </div> : <>
-            <p className="brief-meta"><b>{brief.client_name || 'Client'}</b>{brief.engagement_ref && <> · engagement <code>{brief.engagement_ref}</code></>}{brief.test_window && <> · test window {brief.test_window}</>}</p>
-            <div className="brief-targets">
-              {brief.targets.map((t, i) => {
-                const registered = targets.some(existing => existing.scope_domain_ip === t.address)
-                return <div className="brief-target" key={i}>
-                  <div className="brief-target-head">
-                    <div><b>{t.name || t.address}</b><small>{t.address}{t.technology ? ` · ${t.technology}` : ''}</small></div>
-                    <div className="criticality"><span style={{ '--level': (Number.isFinite(t.criticality) ? t.criticality : 70) }}><b>{Number.isFinite(t.criticality) ? t.criticality : '—'}</b></span><small>criticality</small></div>
-                  </div>
-                  <div className="chip-row">
-                    {(t.scopes || []).map(s => <span className="chip" key={s}>{s}</span>)}
-                    {!!t.restricted_tools?.length && <span className="chip warn" title="The client's letter rules these tools out for this target">no {t.restricted_tools.join(', ')}</span>}
-                    {t.assessment_type && <span className="chip">{t.assessment_type}</span>}
-                  </div>
-                  {registered
-                    ? <span className="registered-note">Registered ✓</span>
-                    : <button className="compact" onClick={() => registerBriefTarget(t)} disabled={busy}>{agentBusy('registrar') ? 'Registering…' : 'Register this target'}</button>}
-                </div>
-              })}
-            </div>
-            <div className="brief-actions">
-              <button onClick={setupFromBrief} disabled={busy}>{agentBusy('registrar') || agentBusy('planner') ? 'Setting up…' : 'Set up everything from this letter'}</button>
-              <small>Registers every target above and drafts a plan for each. Still your call on every command — nothing runs until you approve it.</small>
-            </div>
-            {!!brief.objectives?.length && <details className="brief-details" open><summary>What the client asked for ({brief.objectives.length})</summary><ol>{brief.objectives.map((o, i) => <li key={i}>{o}</li>)}</ol></details>}
-            {(!!brief.out_of_scope?.length || !!brief.prohibited?.length) && <details className="brief-details"><summary>Out of scope ({brief.out_of_scope?.length || 0}) & prohibited techniques ({brief.prohibited?.length || 0})</summary>
-              {!!brief.out_of_scope?.length && <><b>Never touch</b><ul>{brief.out_of_scope.map((o, i) => <li key={i}>{o}</li>)}</ul></>}
-              {!!brief.prohibited?.length && <><b>Never do</b><ul>{brief.prohibited.map((p, i) => <li key={i}>{p}</li>)}</ul></>}
-            </details>}
+        <section className="main-column">
+          <LetterPanel
+            brief={brief} briefFilename={briefFilename} targets={targets}
+            onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }}
+            onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={setupFromBrief}
+          />
+          <CrewPanel crew={crew} activeAgent={activeAgent} feed={feed} onClearFeed={() => setFeed([])} />
+          <PhasePipeline
+            selected={selected} selectedTarget={selectedTarget} phases={phases}
+            nextDraftable={nextDraftable} currentPhase={currentPhase}
+            nextProposals={nextProposals} pickedCandidates={pickedCandidates}
+            setPickedCandidates={setPickedCandidates} planEditable={planEditable}
+            onDraftPhase={draftPhase} onPropose={proposeNextSteps}
+            onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }}
+            onAddPicked={addPickedCandidates}
+          />
+          <AssessmentsPanel
+            assessments={assessments} targets={targets} selected={selected}
+            onOpen={id => { setReportUrl(''); openAssessment(id) }}
+            onDelete={deleteAssessment} onReset={resetWorkspace}
+          />
+
+          {selected && <>
+            <PlanEditor
+              selected={selected} selectedTarget={selectedTarget}
+              draftPlan={draftPlan} setDraftPlan={setDraftPlan}
+              executionByStep={executionByStep} runningStep={runningStep}
+              liveExec={liveExec} liveElapsed={liveElapsed}
+              planLocked={planLocked} planEditable={planEditable} planDirty={planDirty}
+              capabilities={capabilities} toolNames={toolNames}
+              onSave={savePlan} onExecute={execute}
+            />
+            <AnalysisPanel
+              selected={selected} currentPhase={currentPhase}
+              phaseSteps={phaseSteps} phaseCompleted={phaseCompleted}
+              planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport}
+              reportUrl={reportUrl} onAnalyze={analyze} onReport={report}
+              onDownloadReport={downloadReport}
+            />
+            <FindingsPanel findings={selected.findings} />
+            <AuditTrailPanel executions={selected.executions} />
           </>}
         </section>
-
-        <section className="panel crew-panel"><div className="panel-title"><div><span className="eyebrow">LIVE</span><h2>The agent crew</h2></div><span className={activeAgent ? 'tag good' : 'tag'}>{workingAgent ? `${workingAgent.name} is working…` : 'Standing by'}</span></div>
-          <div className="crew">
-            {crew.map(agent => <div className={`crew-card${activeAgent === agent.key ? ' working' : ''}${agent.done && activeAgent !== agent.key ? ' done' : ''}`} key={agent.key}>
-              <span className="crew-avatar" aria-hidden="true">{agent.emoji}</span>
-              <b>{agent.name}</b>
-              <small>{activeAgent === agent.key ? agent.working : agent.done ? agent.doneText : agent.idle}</small>
-            </div>)}
-          </div>
-          {!!feed.length && <div className="feed-wrap"><div className="panel-title"><h2>What just happened</h2><button className="secondary compact" onClick={() => setFeed([])} disabled={busy}>Clear</button></div>
-            <ul className="feed">{feed.map((entry, i) => <li key={entry.at + '-' + i} className={entry.kind}><span className="feed-time">{new Date(entry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>{entry.text}</li>)}</ul>
-          </div>}
-        </section>
-
-        <section className="panel pipeline-panel"><div className="panel-title"><h2>Where the agent is</h2><span className="muted">{selected ? `Assessment #${selected.id} · ${targets.find(t => t.id === selected.target_id)?.name || ''}` : 'No assessment selected yet'}</span></div>
-          <ol className="pipeline">
-            {stages.map((stage, i) => {
-              const active = !stage.done && stages.slice(0, i).every(s => s.done)
-              return <li key={stage.key} className={`${stage.done ? 'done' : ''} ${active ? 'active' : ''}`}>
-                <span className="stage-dot">{stage.done ? '✓' : i + 1}</span>
-                <span className="stage-body"><b>{stage.label}</b><small>{stage.caption}</small></span>
-              </li>
-            })}
-          </ol>
-        </section>
-
-        <section className="panel"><div className="panel-title"><h2>Assessments</h2><span className="muted">Select a run to inspect</span></div><div className="assessment-list">{assessments.length === 0 ? <div className="empty">Create your first authorized assessment.</div> : assessments.map(a => <button key={a.id} className={`assessment-row ${selected?.id === a.id ? 'active' : ''}`} onClick={() => { setReportUrl(''); openAssessment(a.id) }} disabled={busy}><span><b>#{a.id} · {targets.find(t => t.id === a.target_id)?.name || 'Target'}</b><small>{a.objective}</small></span><span className={`status ${a.status}`}>{a.status.replaceAll('_', ' ')}</span></button>)}</div></section>
-
-        {selected && <>
-          <section className="panel"><div className="panel-title"><div><span className="eyebrow">ASSESSMENT #{selected.id}</span><h2>Editable command plan</h2></div><button className="secondary compact" onClick={savePlan} disabled={busy || planLocked || !planDirty}>{agentBusy('planner') ? 'Saving…' : 'Save plan'}</button></div><p className="muted intro">Review every command before execution. Enabled steps require approval and pass policy checks.</p>
-            {selectedTarget?.scope_type === 'network' && <div className="network-inventory"><b>Discovered hosts</b><span>{selected.discovered_hosts?.length || 0} reported by nmap</span>{selected.discovered_hosts?.length ? <code>{selected.discovered_hosts.join(', ')}</code> : <small>Run the approved discovery steps to populate the inventory. Register any host separately before deeper testing.</small>}</div>}
-            {!!selectedTarget?.restricted_tools?.length && <small className="plan-note">Client's letter for this target: {selectedTarget.restricted_tools.join(', ')} {selectedTarget.restricted_tools.length > 1 ? 'are' : 'is'} restricted and will be refused at approval.</small>}
-            <div className="plan">{draftPlan.map((step, i) => {
-              const execution = executionByStep.get(i)
-              const running = !!execution && !execution.complete
-              const executed = !!execution && execution.complete
-              const retryable = !!execution?.retryable
-              const savedStep = selected.plan?.[i]
-              const locked = planLocked || running
-              const inFlight = runningStep === i
-              const execLive = inFlight && liveExec ? liveExec : null
-              const label = inFlight ? 'Running…' : running ? 'Running...' : retryable ? 'Re-approve & retry' : executed ? 'Executed' : 'Approve & execute'
-              const state = inFlight || running ? 'Execution in progress'
-                : executed && execution.return_code === 0 ? `Execution logged${execution.attempt > 1 ? ` (attempt ${execution.attempt})` : ''}`
-                  : executed ? `Did not succeed (exit ${execution.return_code}) after ${execution.attempt} attempt${execution.attempt > 1 ? 's' : ''}`
-                    : planDirty ? 'Save the plan before approving'
-                      : 'Awaiting explicit approval'
-              return <div className={`step ${step.enabled === false ? 'disabled-step' : ''}`} key={i}>
-                {execLive && <div className="live-terminal" role="log" aria-live="polite">
-                  <div className="terminal-bar"><span className="terminal-dot" /><span className="terminal-title">{selectedTarget?.name || 'target'} — live</span><span className="terminal-status">{execLive.running ? `running · ${liveElapsed}s` : 'finishing…'}</span></div>
-                  <pre className="terminal-body"><span className="terminal-prompt">$ {step.command}</span>{'\n'}{execLive.output || 'connecting…'}{'\u2588'}</pre>
-                </div>}
-                <div className="step-head"><span className="step-number">{i + 1}</span>
-                  <select value={step.tool} onChange={e => patchStep(i, 'tool', e.target.value)} disabled={locked}>
-                    {!toolNames.has(step.tool) && <option value={step.tool}>{step.tool} (not permitted)</option>}
-                    {capabilities.map(group => <optgroup key={group.id} label={String(group.id).replaceAll('_', ' ')}>{(group.tools || []).map(tool => <option key={tool.name} value={tool.name}>{tool.name}</option>)}</optgroup>)}
-                  </select>
-                  <label className="toggle"><input type="checkbox" checked={step.enabled !== false} onChange={e => patchStep(i, 'enabled', e.target.checked)} disabled={locked} /><span /> Enabled</label>
-                  <button className="icon-btn" title="Remove step" aria-label="Remove step" onClick={() => setDraftPlan(plan => plan.filter((_, n) => n !== i))} disabled={locked}>×</button>
-                </div>
-                <input className="command" value={step.command} onChange={e => patchStep(i, 'command', e.target.value)} disabled={locked} />
-                <input value={step.reason || ''} onChange={e => patchStep(i, 'reason', e.target.value)} placeholder="Why this command is needed" disabled={locked} />
-                <div className="step-actions"><span className={executed && execution.return_code === 0 ? 'step-complete' : retryable ? 'step-failed' : ''}>{state}</span>
-                  <button disabled={busy || step.enabled === false || running || (executed && !retryable) || planDirty || !savedStep} onClick={() => execute(i)}>{label}</button>
-                </div>
-              </div>
-            })}</div>
-            <button className="secondary" onClick={() => setDraftPlan(plan => [...plan, emptyStep(capabilities[0]?.tools?.[0]?.name)])} disabled={planLocked}>Add command</button>
-            {draftPlan.length === 0 && <div className="empty">Add at least one command to continue.</div>}
-            {planLocked && <small className="plan-note">Execution has started, so this plan is locked. Failed or abandoned steps can still be re-approved individually.</small>}
-            {!planLocked && planDirty && <small className="plan-note">Unsaved plan edits. Save the plan so approvals run the commands shown here.</small>}
-          </section>
-
-          <section className="panel action-panel"><div><h2>Analysis & report</h2><p>Correlates outputs, removes duplicate findings, and calculates transparent risk and priority scores.</p><span className="action-status">{canAnalyze ? 'All enabled steps complete' : `${completedSteps.length}/${enabledSteps.length || 0} enabled steps complete${planDirty ? ' · unsaved plan edits' : ''}`}</span>{selected.analysis_mode && <span className="analysis-mode">Analyzed with: {selected.analysis_mode === 'ai-provider' ? 'AI provider' : 'deterministic local analyzer'}</span>}</div><div><button className="secondary" onClick={analyze} disabled={busy || !canAnalyze}>{agentBusy('analyst') ? 'Analyzing…' : 'Analyze results'}</button><button onClick={report} disabled={busy || !canReport}>{agentBusy('reporter') ? 'Writing the report…' : 'Generate report'}</button>{reportUrl && <a className="download-link report-fallback" href={reportUrl} target="_blank" rel="noreferrer">Your browser blocked the report tab — open it here</a>}{selected.status === 'reported' && <a className="download-link" href={`${API}/reports/${selected.id}`} target="_blank" rel="noreferrer">Download last report</a>}</div></section>
-
-          {!!selected.findings?.length && <section className="panel"><div className="panel-title"><h2>Prioritized findings</h2><span className="tag good">{selected.findings.length} correlated</span></div><div className="findings">{selected.findings.map(f => <article key={f.id}><div><span className={`severity ${f.severity}`}>{f.severity}</span><h3>{f.title}</h3>{(f.endpoint || f.parameter) && <div className="finding-loc">{f.endpoint}{f.parameter ? ` · param: ${f.parameter}` : ''}</div>}<p>{f.description}</p><div className="score-chips"><span>Exploit {f.exploitability || 3}/5</span><span>Impact {f.impact || 3}/5</span><span>Exposure {f.exposure || 3}/5</span></div>{!!f.source_tools?.length && <small>Reported by {f.source_tools.join(', ')}</small>}</div><div className="scores"><span><b>{f.priority_score}</b>Priority</span><span><b>{f.risk_score}</b>Risk / 125</span><span><b>{f.confidence_score}%</b>Confidence</span></div><details><summary>Evidence and remediation</summary><pre>{f.evidence}</pre><p><b>Fix:</b> {f.remediation}</p></details></article>)}</div></section>}
-
-          {!!selected.executions?.length && <section className="panel"><h2>Execution audit trail</h2><div className="audit">{selected.executions.map(e => <details key={e.id}><summary><b>{e.tool_name}</b><code>{e.command}</code><span className={!e.complete ? 'muted' : e.return_code === 0 ? 'ok' : 'fail'}>{e.complete ? `exit ${e.return_code} · ${e.duration_ms} ms` : 'still running'}{e.attempt > 1 ? ` · attempt ${e.attempt}` : ''}</span></summary><pre>{e.stdout || 'No standard output returned.'}</pre>{!!e.stderr && <pre className="stderr">{e.stderr}</pre>}</details>)}</div></section>}
-        </>}
-      </section>
-    </div>
-    <footer>For authorized laboratory environments only · Human approval required before every command</footer>
-  </main>
+      </div>
+      <footer>For authorized laboratory environments only · Human approval required before every command</footer>
+    </main>
+  </AppContext.Provider>
 }
 export default App

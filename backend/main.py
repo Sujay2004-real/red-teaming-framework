@@ -1,5 +1,7 @@
+import asyncio
 import os
 import ipaddress
+import shlex
 from datetime import timedelta
 from urllib.parse import quote, urlparse
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
@@ -9,17 +11,22 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 
-from database import AppSettings, Assessment, Finding, Target, ToolExecution, get_db, utcnow
+from database import SessionLocal, AppSettings, Assessment, Finding, Recommendation, Target, ToolExecution, get_db, utcnow
 from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
-from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent, extract_nmap_hosts
+from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent, extract_nmap_hosts, match_verification
+from modules.api_auth import API_KEY_ENV_VAR, ensure_operator_key, verify_operator_key
+from modules.attack_paths import derive_paths, narrate_paths
 from modules.engagement_parser import parse_engagement
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor, live_registry
+from modules.exploit_planner import exploit_planner
+from modules.next_steps import PHASE_PROPOSAL_REFUSALS, PROPOSAL_PHASES, next_steps_planner
+from modules.phases import ANALYSIS_ADVANCES_TO, EXPLOITATION_GATED_TOOLS, NEXT_DRAFTABLE_PHASE, PHASES, PHASE_LABELS, PLAN_PHASES, VM_ONLY_TOOLS, phase_index, validate_phase
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
 from modules.reporter import reporter
 from modules.secret_store import decrypt_secret, encrypt_secret
 
-app = FastAPI(title='Red Teaming Framework API', version='2.0')
+app = FastAPI(title='Red Teaming Framework API', version='2.1')
 # The dev server's origin is the default, but it is not the only place this UI
 # can be served from; a hardcoded origin meant any other deployment silently
 # failed every request in the browser with no server-side sign of why. Both
@@ -31,6 +38,10 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials
 REPORTS_DIR = Path('./data/reports')
 MAX_REQUIREMENT_BYTES = 5 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 65_536
+# Every route below declares `dependencies=PROTECTED` except /health, which
+# the UI's reachability poll must be able to reach without a key. A route
+# without this list is an anonymous route - grep for decorators missing it.
+PROTECTED = [Depends(verify_operator_key)]
 # A plan is stored as opaque JSON, so nothing else bounds what a client can put
 # in one. Long enough for any real scanner invocation, short enough that fifty
 # steps cannot become a multi-megabyte row.
@@ -41,7 +52,8 @@ MAX_PLAN_FIELD_CHARS = {'tool': 100, 'command': 4000, 'reason': 2000}
 EXECUTION_STALE_AFTER = timedelta(seconds=EXECUTION_TIMEOUT_SECONDS + 60)
 # The UI blanks these inputs after saving, so an empty submission means "keep
 # what is stored" rather than "erase it".
-SECRET_SETTING_FIELDS = ('gemini_api_key', 'proxy_password')
+SECRET_SETTING_FIELDS = ('gemini_api_key', 'proxy_password', 'ssh_password')
+EXECUTION_MODES = ('local', 'kali_vm')
 
 
 def serialize_target(row):
@@ -50,11 +62,11 @@ def serialize_target(row):
         network = ipaddress.ip_network(row.scope_domain_ip, strict=False)
     except ValueError:
         pass
-    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'restricted_tools': row.restricted_tools or [], 'created_at': row.created_at, 'scope_type': 'network' if network else 'host', 'network_address_count': network.num_addresses if network else None, 'network_prefix': network.prefixlen if network else None}
+    return {'id': row.id, 'name': row.name, 'scope_domain_ip': row.scope_domain_ip, 'authorized_scopes': row.authorized_scopes or [row.scope_domain_ip], 'criticality': row.criticality if row.criticality is not None else DEFAULT_ASSET_CRITICALITY, 'restricted_tools': row.restricted_tools or [], 'exploitation_authorized': bool(row.exploitation_authorized), 'created_at': row.created_at, 'scope_type': 'network' if network else 'host', 'network_address_count': network.num_addresses if network else None, 'network_prefix': network.prefixlen if network else None}
 
 
 def serialize_assessment(row):
-    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'created_at': row.created_at, 'completed_at': row.completed_at}
+    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'current_phase': row.current_phase or 'recon', 'analyzed_phases': row.analyzed_phases or [], 'created_at': row.created_at, 'completed_at': row.completed_at}
 
 
 def discovered_hosts_for(executions):
@@ -82,6 +94,9 @@ def serialize_execution(row):
         'duration_ms': row.duration_ms, 'approved_by_user': row.approved_by_user,
         'attempt': row.attempt or 1, 'executed_at': row.executed_at,
         'complete': row.return_code is not None,
+        # Where the command physically ran (the Kali VM attestation when VM
+        # mode is active) so the UI and report can state it per step.
+        'execution_host': row.execution_host,
         # A step that never finished or finished badly may be approved again;
         # a successful one may not, so the audit trail stays append-only in
         # the case that matters.
@@ -100,6 +115,11 @@ def serialize_finding(row):
         'endpoint': row.endpoint or '', 'parameter': row.parameter or '',
         'exploitability': row.exploitability or 3, 'impact': row.impact or 3, 'exposure': row.exposure or 3,
         'source_tools': row.source_tools,
+        # The exploitation-phase outcome: '' (not attempted), 'attempted',
+        # 'verified', or 'refuted', with the proof and the tools that
+        # produced it.
+        'verification': row.verification or '', 'exploit_evidence': row.exploit_evidence or '',
+        'verified_by': row.verified_by or [],
     }
 
 
@@ -160,6 +180,12 @@ def normalize_plan(plan):
         item = dict(step)
         item['tool'] = item['tool'].strip()
         item['command'] = item['command'].strip()
+        # Steps default to the recon phase: an untagged step belongs to the
+        # phase the assessment started with, so older plans and operator-added
+        # commands read as recon without a schema bump.
+        item.setdefault('phase', 'recon')
+        if item['phase'] not in PLAN_PHASES:
+            raise HTTPException(422, "Plan step phase must be one of 'recon', 'exploitation', or 'post_exploitation'")
         if 'enabled' in item and not isinstance(item['enabled'], bool):
             raise HTTPException(422, 'Plan step enabled must be a boolean')
         item.setdefault('enabled', True)
@@ -183,18 +209,68 @@ def proxy_environment(settings):
     return {'HTTP_PROXY': url, 'HTTPS_PROXY': url, 'http_proxy': url, 'https_proxy': url}
 
 
+def remote_execution_settings(settings):
+    """The Kali VM SSH settings when VM mode is active, else None.
+
+    Failing closed: an incompletely configured VM is reported as an error by
+    the caller rather than silently falling back to local execution, which
+    would put scanner commands on a host the operator did not choose.
+    """
+    if (settings.execution_mode or 'local') != 'kali_vm':
+        return None
+    return {
+        'host': (settings.ssh_host or '').strip(),
+        'port': settings.ssh_port or 22,
+        'username': (settings.ssh_username or '').strip(),
+        'password': decrypt_secret(settings.ssh_password),
+    }
+
+
 def report_path(assessment_id):
     return REPORTS_DIR / f'report_{assessment_id}.html'
 
 
-def invalidate_analysis(db, assessment_id):
-    """Drop findings and the rendered report for an assessment.
+def _ensure_operator_key_at_startup():
+    """Generate (once) and announce the operator API key.
 
-    Called whenever the executions an analysis was derived from change, so
-    /reports/{id} can never serve a document describing findings that no
-    longer exist.
+    Runs at import time, the same pattern database.py uses for migrations.
+    When REDTEAM_API_KEY is set, nothing is generated and the env var is the
+    key - that is the documented path for Docker, CI and the scripted flows,
+    and the recovery path for a generated key nobody wrote down.
     """
-    db.query(Finding).filter(Finding.assessment_id == assessment_id).delete()
+    if (os.getenv(API_KEY_ENV_VAR) or '').strip():
+        return
+    db = SessionLocal()
+    try:
+        plaintext = ensure_operator_key(db)
+    finally:
+        db.close()
+    if plaintext:
+        # The only place the plaintext ever appears. Not logged again, not
+        # written to disk, not returned by any endpoint.
+        print('=' * 72)
+        print('Operator API key (shown once, copy it into the UI now):')
+        print(f'  {plaintext}')
+        print(f'Lost it? Set {API_KEY_ENV_VAR} in the environment to choose a new one.')
+        print('=' * 72)
+
+
+_ensure_operator_key_at_startup()
+
+
+def invalidate_analysis(db, assessment_id, phase=None):
+    """Drop findings (and the rendered report) for an assessment.
+
+    With `phase`, only that phase's findings are dropped: re-running or
+    re-analyzing one phase's steps invalidates that phase's findings, while
+    earlier phases' findings — the evidence the later phases were planned
+    from — survive. The report always goes, since it describes the whole
+    finding set.
+    """
+    query = db.query(Finding).filter(Finding.assessment_id == assessment_id)
+    if phase:
+        query = query.filter(Finding.phase == phase)
+    query.delete()
     try:
         report_path(assessment_id).unlink(missing_ok=True)
     except OSError:
@@ -288,14 +364,32 @@ def record_abandoned_execution(db, execution_id, detail):
         session.close()
 
 
+def phase_steps(row):
+    """The plan indices belonging to the assessment's current phase."""
+    return [index for index, step in enumerate(row.plan or [])
+            if step.get('phase', 'recon') == (row.current_phase or 'recon')]
+
+
+def phase_steps_all(row, phase):
+    return [index for index, step in enumerate(row.plan or [])
+            if step.get('phase', 'recon') == phase]
+
+
+def enabled_phase_steps(row):
+    return [index for index in phase_steps(row)
+            if (row.plan or [])[index].get('enabled', True)]
+
+
 def refresh_assessment_status(db, row, extra_executed=()):
-    enabled = [index for index, step in enumerate(row.plan or []) if step.get('enabled', True)]
+    enabled = enabled_phase_steps(row)
     executed = {
         execution.step_index
         for execution in db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id, ToolExecution.return_code.is_not(None)).all()
     } | set(extra_executed)
     # 'running' must not stick between steps: once a command returns, the
-    # assessment is idle again and waiting on the next human approval.
+    # assessment is idle again and waiting on the next human approval. Scope
+    # is the CURRENT phase only: later phases are drafted later, and an
+    # earlier phase's complete step count says nothing about this one.
     row.status = 'ready_for_analysis' if enabled and all(index in executed for index in enabled) else 'awaiting_approval'
     return row.status
 
@@ -319,7 +413,7 @@ def reconcile_running_status(db, row, executions):
     return True
 
 
-@app.get('/capabilities')
+@app.get('/capabilities', dependencies=PROTECTED)
 def get_capabilities():
     return policy_engine.public_capabilities()
 
@@ -361,7 +455,7 @@ def extract_upload_text(suffix, content):
     return text.strip()
 
 
-@app.post('/requirements/extract')
+@app.post('/requirements/extract', dependencies=PROTECTED)
 async def extract_requirements(file: UploadFile = File(...)):
     allowed = {'.txt', '.md', '.pdf', '.docx'}
     suffix = Path(file.filename or '').suffix.lower()
@@ -377,7 +471,7 @@ async def extract_requirements(file: UploadFile = File(...)):
     return {'filename': file.filename, 'text': text[:30000]}
 
 
-@app.post('/engagement/parse')
+@app.post('/engagement/parse', dependencies=PROTECTED)
 async def parse_engagement_letter(file: UploadFile = File(...)):
     """Import a client engagement letter and hand back what the agent should do.
 
@@ -408,7 +502,7 @@ def health():
     return {'status': 'ok'}
 
 
-@app.get('/settings')
+@app.get('/settings', dependencies=PROTECTED)
 def get_settings(db: Session = Depends(get_db)):
     row = get_settings_row(db)
     # Whether a key is stored is a separate question from whether the provider is
@@ -426,6 +520,7 @@ def get_settings(db: Session = Depends(get_db)):
         # without this flag a stored password is indistinguishable from a
         # never-entered one once the page reloads.
         'proxy_password_configured': bool(decrypt_secret(row.proxy_password)),
+        'ssh_password_configured': bool(decrypt_secret(row.ssh_password)),
         # A key with no endpoint or model cannot reach a provider, so the UI is
         # told the difference between "configured" and "partly filled in".
         'provider_ready': bool(stored_key and base_url and model_name),
@@ -433,10 +528,14 @@ def get_settings(db: Session = Depends(get_db)):
         'model_name': row.model_name or '',
         'proxy_url': row.proxy_url or '',
         'proxy_username': row.proxy_username or '',
+        'execution_mode': row.execution_mode or 'local',
+        'ssh_host': row.ssh_host or '',
+        'ssh_port': row.ssh_port or 22,
+        'ssh_username': row.ssh_username or '',
     }
 
 
-@app.put('/settings')
+@app.put('/settings', dependencies=PROTECTED)
 def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     row = get_settings_row(db)
     for key, value in payload.model_dump(exclude_unset=True).items():
@@ -448,32 +547,78 @@ def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     if not (row.proxy_url or '').strip():
         row.proxy_username = ''
         row.proxy_password = ''
+    # Same rule for the VM: no host means the stored credentials can never be
+    # used, so they do not linger in the database.
+    if not (row.ssh_host or '').strip():
+        row.ssh_username = ''
+        row.ssh_password = ''
     db.commit()
     return get_settings(db)
 
 
-@app.post('/targets/')
+@app.post('/settings/ssh-test', dependencies=PROTECTED)
+def test_ssh_connection(db: Session = Depends(get_db)):
+    """Connect to the configured Kali VM and report what is actually there.
+
+    The operator sees the machine's real identity (OS, kernel, SSH host-key
+    fingerprint) and which tools are installed before approving any command -
+    and the tmux session the framework will type into is created, so the VM
+    console can attach to it right away. Tests the SAVED SSH fields regardless
+    of the execution mode, so the VM can be verified before switching to it.
+    """
+    settings = get_settings_row(db)
+    remote = {
+        'host': (settings.ssh_host or '').strip(),
+        'port': settings.ssh_port or 22,
+        'username': (settings.ssh_username or '').strip(),
+        'password': decrypt_secret(settings.ssh_password),
+    }
+    if not (remote['host'] and remote['username'] and remote['password']):
+        raise HTTPException(409, 'Save the Kali VM host, username, and password first')
+    # Lazy so a deployment without paramiko still serves every other endpoint.
+    try:
+        from modules.ssh_executor import ssh_executor
+    except ImportError as exc:
+        raise HTTPException(503, f'SSH support is not installed on the backend: {exc}')
+    try:
+        return ssh_executor.test_connection(remote)
+    except Exception as exc:
+        detail = str(exc) or type(exc).__name__
+        raise HTTPException(502, f'Could not reach the Kali VM ({remote["host"]}:{remote["port"]}): {detail}')
+
+
+@app.post('/targets/', dependencies=PROTECTED)
 def create_target(payload: TargetCreate, db: Session = Depends(get_db)):
     primary_scope = payload.scope_domain_ip.strip()
+    # Re-registering an address that is already on file must not fork a second
+    # target: the letter-import path can be re-run, and a duplicate row would
+    # leave two targets answering to the same scope with different letter
+    # restrictions. The existing target is returned with a flag so the caller
+    # can say it was already registered.
+    existing = db.query(Target).filter(Target.scope_domain_ip == primary_scope).first()
+    if existing:
+        result = serialize_target(existing)
+        result['already_registered'] = True
+        return result
     scopes = [scope.strip() for scope in payload.authorized_scopes if scope and scope.strip()] or [primary_scope]
     # A restriction can only bind tools the framework is able to run, so names
     # outside the policy registry are dropped here rather than refused - a
     # misparsed letter should not block target registration.
     runnable = set(policy_engine.tool_registry())
     restricted = [tool for tool in dict.fromkeys(payload.restricted_tools) if tool in runnable]
-    row = Target(name=payload.name.strip(), scope_domain_ip=primary_scope, authorized_scopes=scopes, criticality=payload.criticality, restricted_tools=restricted)
+    row = Target(name=payload.name.strip(), scope_domain_ip=primary_scope, authorized_scopes=scopes, criticality=payload.criticality, restricted_tools=restricted, exploitation_authorized=payload.exploitation_authorized)
     db.add(row)
     db.commit()
     db.refresh(row)
     return serialize_target(row)
 
 
-@app.get('/targets/')
+@app.get('/targets/', dependencies=PROTECTED)
 def get_targets(db: Session = Depends(get_db)):
     return [serialize_target(row) for row in db.query(Target).all()]
 
 
-@app.post('/assessments/')
+@app.post('/assessments/', dependencies=PROTECTED)
 def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     target = db.query(Target).filter(Target.id == payload.target_id).first()
     if not target:
@@ -518,8 +663,39 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
         plan = kept
     else:
         dropped = 0
+    # An exploitation-grade step (sqlmap, msfconsole, or curl carrying a
+    # request body) is dropped here for exactly the reason the policy engine
+    # refuses it at approval time: the letter did not authorize controlled
+    # exploitation against this target. Same pattern as the restricted-tool
+    # filter, so the operator sees the count instead of a surprise 403 later.
+    if not target.exploitation_authorized and plan:
+        gated = 0
+        kept = []
+        for step in plan:
+            tool = step.get('tool')
+            is_gated = tool in EXPLOITATION_GATED_TOOLS
+            if not is_gated and tool == 'curl':
+                try:
+                    tokens = shlex.split(step.get('command') or '', posix=True)
+                except ValueError:
+                    tokens = []
+                is_gated = any(token.split('=', 1)[0] in
+                               {'-d', '--data', '--data-ascii', '--data-binary', '--data-raw',
+                                '--data-urlencode', '-F', '--form', '--form-string', '--json'}
+                               for token in tokens[1:])
+            if is_gated:
+                gated += 1
+                continue
+            kept.append(step)
+        plan = kept
+        dropped += gated
+    if not plan and payload.plan:
+        # The operator supplied a plan and every step of it was dropped by
+        # the letter's gates: a plan-shaped 403 reads better than an empty
+        # plan failing later with a generic 422.
+        raise HTTPException(403, "Every step of the supplied plan was refused: the client's engagement letter does not authorize controlled exploitation against this target, and the policy engine refused each command")
     plan = normalize_plan(plan)
-    row = Assessment(target_id=payload.target_id, objective=payload.objective, plan=plan, engagement_brief=payload.engagement_brief, status='awaiting_approval')
+    row = Assessment(target_id=payload.target_id, objective=payload.objective, plan=plan, engagement_brief=payload.engagement_brief, status='awaiting_approval', current_phase='recon', analyzed_phases=[])
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -529,12 +705,12 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     return result
 
 
-@app.get('/assessments/')
+@app.get('/assessments/', dependencies=PROTECTED)
 def get_assessments(db: Session = Depends(get_db)):
     return [serialize_assessment(row) for row in db.query(Assessment).order_by(Assessment.id.desc()).all()]
 
 
-@app.get('/assessments/{assessment_id}')
+@app.get('/assessments/{assessment_id}', dependencies=PROTECTED)
 def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
@@ -549,7 +725,48 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     return result
 
 
-@app.get('/assessments/{assessment_id}/discovered-hosts')
+def running_executions(db, assessment_ids=None):
+    """Execution rows a command is still writing to, stale ones excluded.
+
+    A row with a NULL return code that is older than the executor's timeout
+    belongs to a dead run and may be cleaned up with its assessment; a fresh
+    one is a live command whose completion write would resurrect rows the
+    operator just asked to delete.
+    """
+    query = db.query(ToolExecution).filter(ToolExecution.return_code.is_(None))
+    if assessment_ids is not None:
+        query = query.filter(ToolExecution.assessment_id.in_(assessment_ids))
+    return [row for row in query.all() if not execution_is_stale(row)]
+
+
+def delete_assessment_rows(db, row):
+    """Drop one assessment with everything derived from it."""
+    db.query(Finding).filter(Finding.assessment_id == row.id).delete(synchronize_session=False)
+    db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id).delete(synchronize_session=False)
+    db.query(Recommendation).filter(Recommendation.assessment_id == row.id).delete(synchronize_session=False)
+    report_path(row.id).unlink(missing_ok=True)
+    db.delete(row)
+
+
+@app.delete('/assessments/{assessment_id}', dependencies=PROTECTED)
+def delete_assessment(assessment_id: int, db: Session = Depends(get_db)):
+    """Remove one assessment so its run does not crowd the workspace.
+
+    Everything the assessment produced goes with it - executions, findings and
+    the rendered report - but the registered target stays, because the target
+    is the client's asset record, not this run's output.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    if running_executions(db, [assessment_id]):
+        raise HTTPException(409, 'A command of this assessment is still executing; wait for it to finish or time out before deleting it')
+    delete_assessment_rows(db, row)
+    db.commit()
+    return {'message': 'Assessment deleted', 'deleted': assessment_id}
+
+
+@app.get('/assessments/{assessment_id}/discovered-hosts', dependencies=PROTECTED)
 def get_discovered_hosts(assessment_id: int, db: Session = Depends(get_db)):
     """Expose nmap inventory without authorizing any follow-up scan."""
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
@@ -562,21 +779,379 @@ def get_discovered_hosts(assessment_id: int, db: Session = Depends(get_db)):
     return {'assessment_id': assessment_id, 'target_id': row.target_id, 'hosts': discovered_hosts_for(executions)}
 
 
-@app.put('/assessments/{assessment_id}/plan')
+@app.put('/assessments/{assessment_id}/plan', dependencies=PROTECTED)
 def update_plan(assessment_id: int, payload: PlanUpdate, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
         raise HTTPException(404, 'Assessment not found')
-    if db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).first():
-        raise HTTPException(409, 'Plan cannot be edited after execution begins')
-    row.plan = normalize_plan(payload.plan)
+    # The freeze is per step now that phases append: an executed step is an
+    # audit fact and keeps its tool, command, and position, while unexecuted
+    # steps (including whole not-yet-run phases) stay fully editable. This is
+    # what lets the operator add a payload module step while phase 1's
+    # recorded output stays immutable.
+    executed_indices = {
+        execution.step_index
+        for execution in db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).all()
+    }
+    previous = row.plan or []
+    normalized = normalize_plan(payload.plan)
+    if any(index >= len(normalized) for index in executed_indices):
+        raise HTTPException(409, 'Executed steps cannot be removed from the plan')
+    for index in sorted(executed_indices):
+        old, new = previous[index], normalized[index]
+        if (old.get('tool'), old.get('command')) != (new['tool'], new['command']):
+            raise HTTPException(409, 'Executed steps cannot be edited; re-approving a failed step reuses its own row')
+    row.plan = normalized
     row.status = 'awaiting_approval'
-    invalidate_analysis(db, assessment_id)
+    # A pure append — the existing plan untouched and steps added after it —
+    # only affects the phases those new steps belong to, so invalidate exactly
+    # those. Any other edit keeps the whole-assessment invalidation: changing a
+    # step in an earlier phase can change what that phase's analysis produces,
+    # and there is no cheap way to know which findings survive that.
+    #
+    # This matters most for mid-engagement proposals, which append to the phase
+    # the assessment is working in. Without it, accepting one proposal would
+    # delete the earlier phases' findings and the exploitation evidence linking
+    # them — the exact material the report cites.
+    if normalized[:len(previous)] == previous and len(normalized) > len(previous):
+        appended_phases = {step.get('phase', 'recon') for step in normalized[len(previous):]}
+        for phase in sorted(appended_phases):
+            invalidate_analysis(db, assessment_id, phase=phase)
+    else:
+        invalidate_analysis(db, assessment_id)
     db.commit()
     return serialize_assessment(row)
 
 
-@app.post('/assessments/{assessment_id}/execute')
+def try_draft_phase(db, row, target, phase):
+    """The drafting core shared by the phase-plan endpoint and the auto-draft.
+
+    Returns (steps, notes, refusal):
+      steps    - the drafted plan steps, or None when drafting was refused
+      notes    - planner notes on success, the human-readable refusal reason
+                 otherwise
+      refusal  - None on success, else a key into DRAFT_REFUSALS
+    """
+    phase = validate_phase(phase)
+    if phase not in PLAN_PHASES:
+        return None, f'Phase must be one of {", ".join(PLAN_PHASES)}', 'invalid_phase'
+    current = row.current_phase or 'recon'
+    # A phase may only be drafted when the assessment sits at the phase that
+    # precedes it OR has already advanced into it (analysis of the preceding
+    # phase advances current_phase to the next bookkeeping state, so drafting
+    # the newly unlocked phase means drafting the phase we are "in").
+    order = {p: i for i, p in enumerate(PLAN_PHASES)}
+    if order[phase] not in (order.get(current, 0), order.get(current, 0) + 1):
+        return None, f'Phase {phase.replace("_", " ")} cannot be drafted while the assessment is in the {current.replace("_", " ")} phase', 'order'
+    required_analysis = {'exploitation': 'recon', 'post_exploitation': 'exploitation'}[phase]
+    if required_analysis not in (row.analyzed_phases or []):
+        return None, f'Analyze the {required_analysis.replace("_", " ")} phase results before drafting the {phase.replace("_", " ")} plan', 'analysis'
+    if phase_steps_all(row, phase):
+        # A drafted phase is append-only like the rest of the plan: its steps
+        # exist, are awaiting approval or already executed, and a re-draft
+        # would orphan them.
+        return None, f'The {phase.replace("_", " ")} phase has already been drafted; edit or add steps in the plan instead', 'already_drafted'
+    if phase == 'exploitation' and not target.exploitation_authorized:
+        return None, "The client's engagement letter does not authorize controlled exploitation against this target", 'unauthorized'
+
+    findings = [serialize_finding(f) for f in db.query(Finding).filter(Finding.assessment_id == row.id).order_by(Finding.priority_score.desc()).all()]
+    verification_endpoints = _verification_endpoints_for(row, target)
+    steps, notes = exploit_planner.draft_plan(
+        phase, findings, target.scope_domain_ip,
+        authorized_scopes_for(target), verification_endpoints=verification_endpoints)
+    if not steps:
+        # Nothing draftable is a legitimate outcome (a clean target has
+        # nothing to exploit), but it must be reported rather than silently
+        # leaving the phase empty.
+        return None, (' | '.join(notes) or 'No steps could be drafted for this phase'), 'nothing_draftable'
+    return steps, notes, None
+
+
+@app.post('/assessments/{assessment_id}/phases/{phase}/plan', dependencies=PROTECTED)
+def draft_phase_plan(assessment_id: int, phase: str, db: Session = Depends(get_db)):
+    """Draft the next engagement phase's steps from the current findings.
+
+    The lifecycle is strictly sequential: each phase's plan is drafted from
+    the previous phase's ANALYZED findings, so an exploitation step can only
+    exist because vulnerability analysis actually produced something to
+    verify. Drafting also refuses (403) an exploitation phase for a target
+    whose letter did not authorize controlled exploitation - the same gate
+    the execute endpoint enforces, applied before a single command is
+    proposed.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    if not target:
+        raise HTTPException(404, 'Target not found')
+    steps, notes, refusal = try_draft_phase(db, row, target, phase)
+    if refusal == 'invalid_phase':
+        raise HTTPException(422, notes)
+    if refusal == 'order':
+        raise HTTPException(409, notes)
+    if refusal == 'analysis':
+        raise HTTPException(409, notes)
+    if refusal == 'already_drafted':
+        raise HTTPException(409, notes)
+    if refusal == 'unauthorized':
+        raise HTTPException(403, notes)
+    if refusal == 'nothing_draftable':
+        raise HTTPException(422, notes)
+
+    # Copy before extending: row.plan is the loaded JSON object, and mutating
+    # it in place would also mutate SQLAlchemy's snapshot of the committed
+    # value, so the change-detection at flush would see no difference and
+    # silently persist nothing. A copy makes the assignment a real change.
+    plan = list(row.plan or []) + steps
+    row.plan = normalize_plan(plan)
+    row.current_phase = phase
+    row.status = 'awaiting_approval'
+    # The report is invalidated (it describes the whole finding set, and the
+    # engagement is not finished), but the findings are NOT: they are the
+    # evidence this phase's plan was drafted from and the next phase's input.
+    try:
+        report_path(assessment_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+    db.commit()
+    result = serialize_assessment(row)
+    result['drafted_steps'] = len(steps)
+    result['planner_notes'] = notes
+    return result
+
+
+def _verification_endpoints_for(row, target):
+    """The letter-declared verification endpoint paths for this target.
+
+    The parsed engagement brief carries them per target; the exploit planner
+    turns each into a curl proof-of-concept step.
+    """
+    brief = row.engagement_brief if isinstance(row.engagement_brief, dict) else {}
+    for entry in brief.get('targets') or []:
+        address = (entry.get('address') or '').strip()
+        if address and address.split(':')[0] == (target.scope_domain_ip or '').split(':')[0]:
+            return [str(path) for path in (entry.get('verification_endpoints') or [])]
+    return []
+
+
+def gather_proposal_inputs(db, row, target):
+    """Everything `next_steps_planner.propose` needs, read from the database.
+
+    Shared by the operator-driven /next-steps endpoint and the automatic
+    post-execution loop so both reason from byte-identical engagement state.
+    """
+    findings = [
+        {**serialize_finding(finding), 'phase': finding.phase}
+        for finding in db.query(Finding).filter(Finding.assessment_id == row.id)
+            .order_by(Finding.priority_score.desc()).all()
+    ]
+    executions = [
+        {'step_index': execution.step_index, 'tool_name': execution.tool_name,
+         'command': execution.command, 'return_code': execution.return_code}
+        for execution in db.query(ToolExecution)
+            .filter(ToolExecution.assessment_id == row.id,
+                    ToolExecution.return_code.is_not(None))
+            .order_by(ToolExecution.step_index).all()
+    ]
+    settings = get_settings_row(db)
+    api_key, base_url, model_name = provider_credentials(settings)
+    return {
+        'phase': row.current_phase or 'recon',
+        'target_address': target.scope_domain_ip,
+        'objective': row.objective,
+        'criticality': (target.criticality if target.criticality is not None
+                        else DEFAULT_ASSET_CRITICALITY),
+        'authorized_scopes': authorized_scopes_for(target),
+        'restricted_tools': restricted_tools_for(target),
+        'exploitation_authorized': bool(target.exploitation_authorized),
+        'verification_endpoints': _verification_endpoints_for(row, target),
+        'findings': findings,
+        'executions': executions,
+        'plan': row.plan or [],
+        'api_key': api_key,
+        'base_url': base_url,
+        'model_name': model_name,
+    }
+
+
+def run_proposal(db, row, target):
+    """One proposal pass over the current engagement state."""
+    inputs = gather_proposal_inputs(db, row, target)
+    candidates, refused, source, notes = next_steps_planner.propose(**inputs)
+    return {
+        'assessment_id': row.id, 'phase': inputs['phase'], 'source': source,
+        'state': {'findings': len(inputs['findings']),
+                  'executed_steps': len(inputs['executions']),
+                  'plan_steps': len(inputs['plan']),
+                  'headroom': MAX_PLAN_STEPS - len(inputs['plan'])},
+        'candidates': candidates,
+        'refused': refused,
+        'notes': notes,
+    }
+
+
+# The automatic recommendation loop's budget: one batch per executed step is
+# the natural rate, and this cap is the backstop that keeps a run of failing,
+# re-approved commands from manufacturing an endless suggestion stream.
+MAX_AUTO_RECOMMENDATIONS = 25
+
+
+def record_auto_recommendations(assessment_id, trigger_execution_id):
+    """Compute and persist the post-execution proposal batch (sync core).
+
+    Runs off the event loop (see schedule_auto_recommendations) in its own
+    session, reading only committed state. Every refusal this function can
+    meet - wrong phase, mid-flight command, exhausted budget, full plan - is
+    a reason to simply not propose, never an error that could disturb the
+    engagement the operator just ran.
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+        if row is None:
+            return None
+        current = row.current_phase or 'recon'
+        if current not in PROPOSAL_PHASES:
+            return None
+        if row.status == 'running':
+            # Another command is mid-flight; its output is not in the state a
+            # proposal should be drawn from.
+            return None
+        existing = db.query(Recommendation).filter(
+            Recommendation.assessment_id == assessment_id).count()
+        if existing >= MAX_AUTO_RECOMMENDATIONS:
+            return None
+        target = db.query(Target).filter(Target.id == row.target_id).first()
+        if target is None:
+            return None
+        if len(row.plan or []) >= MAX_PLAN_STEPS:
+            return None
+        payload = run_proposal(db, row, target)
+        record = Recommendation(assessment_id=assessment_id,
+                                trigger_execution_id=trigger_execution_id,
+                                phase=current, payload=payload, origin='auto')
+        db.add(record)
+        db.commit()
+        return record.id
+    except Exception:
+        # The advisor is advisory: a failure here must never surface as an
+        # error in the engagement that triggered it.
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def schedule_auto_recommendations(assessment_id, trigger_execution_id):
+    """Level 2 of the automatic loop: propose next steps after each execution.
+
+    The proposal may call the AI provider (up to its 60 s timeout), so it runs
+    in a worker thread rather than on the event loop - otherwise one slow
+    provider answer would freeze every other request, including the live
+    terminal the operator is watching.
+    """
+    return asyncio.create_task(asyncio.to_thread(
+        record_auto_recommendations, assessment_id, trigger_execution_id))
+
+
+@app.get('/assessments/{assessment_id}/recommendations', dependencies=PROTECTED)
+def get_recommendations(assessment_id: int, db: Session = Depends(get_db)):
+    """The automatic recommendation feed for an assessment.
+
+    Newest first, capped. Each batch records which execution triggered it, so
+    the UI can match a poll to the step it just ran, and the batches persist
+    as engagement evidence: what the system proposed at every juncture,
+    including the candidates the policy engine refused with their reasons.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    records = db.query(Recommendation).filter(
+        Recommendation.assessment_id == assessment_id
+    ).order_by(Recommendation.id.desc()).limit(20).all()
+    total = db.query(Recommendation).filter(
+        Recommendation.assessment_id == assessment_id).count()
+    return {
+        'assessment_id': assessment_id,
+        'total': total,
+        'recommendations': [{
+            'id': record.id,
+            'trigger_execution_id': record.trigger_execution_id,
+            'phase': record.phase,
+            'origin': record.origin or 'auto',
+            'created_at': record.created_at.isoformat() if record.created_at else None,
+            **(record.payload or {}),
+        } for record in records],
+    }
+
+
+@app.post('/assessments/{assessment_id}/next-steps', dependencies=PROTECTED)
+def propose_next_steps(assessment_id: int, db: Session = Depends(get_db)):
+    """Propose ranked, policy-checked next steps for the phase in progress.
+
+    Read-only by design: proposals are returned and never persisted. They become
+    plan steps only when the operator accepts them through PUT /plan, so
+    executed-step immutability, phase tagging, and plan validation keep living in
+    exactly one place. What changes is what the human is deciding on — reasoned
+    options drawn from what has actually been observed, instead of a list frozen
+    before the first command ran.
+
+    Every candidate is re-validated by the policy engine against the same scopes
+    and the same exploitation gate the execute endpoint applies, and candidates
+    are refused rather than silently dropped: `refused` is the guardrail's
+    receipt, and it is part of what the operator is shown.
+
+    With no AI provider configured the question is still answered, from the
+    framework's deterministic generators minus whatever has already been run.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    if not target:
+        raise HTTPException(404, 'Target not found')
+    current = row.current_phase or 'recon'
+    if current not in PROPOSAL_PHASES:
+        raise HTTPException(409, PHASE_PROPOSAL_REFUSALS.get(
+            current, 'This phase cannot receive proposals.'))
+    if row.status == 'running':
+        # A command is mid-flight and its output is not yet in the state the
+        # proposals would be drawn from; proposing now would reason about a
+        # half-written engagement.
+        raise HTTPException(409, 'A step is currently executing; wait for it to finish before proposing more')
+    plan = row.plan or []
+    if len(plan) >= MAX_PLAN_STEPS:
+        raise HTTPException(409, f'The plan is already at its {MAX_PLAN_STEPS}-step limit; no further steps can be added')
+
+    return run_proposal(db, row, target)
+
+
+@app.get('/assessments/{assessment_id}/phases', dependencies=PROTECTED)
+def get_phase_overview(assessment_id: int, db: Session = Depends(get_db)):
+    """Phase progress for the stepper: per-phase step counts and analysis state."""
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id, ToolExecution.return_code.is_not(None)).all()
+    executed = {execution.step_index for execution in executions}
+    phases = []
+    for phase in PLAN_PHASES:
+        indices = phase_steps_all(row, phase)
+        enabled = [i for i in indices if (row.plan or [])[i].get('enabled', True)]
+        complete = [i for i in enabled if i in executed]
+        phases.append({
+            'phase': phase, 'label': PHASE_LABELS[phase],
+            'steps': len(indices), 'executed': len(complete),
+            'analyzed': phase in (row.analyzed_phases or []),
+        })
+    overview = {'assessment_id': assessment_id, 'current_phase': row.current_phase or 'recon',
+                'phases': phases, 'all_phases': PHASES, 'labels': PHASE_LABELS,
+                'status': row.status}
+    return overview
+
+
+@app.post('/assessments/{assessment_id}/execute', dependencies=PROTECTED)
 async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
@@ -596,10 +1171,28 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
         # the global policy would allow it; refusing here keeps a manually
         # edited plan from bypassing the import-time filtering.
         raise HTTPException(403, f"{step['tool']} is restricted for this target by the client's engagement letter")
-    valid, reason, capability = policy_engine.validate_command(step['command'], authorized_scopes_for(target), expected_tool=step['tool'])
+    valid, reason, capability = policy_engine.validate_command(
+        step['command'], authorized_scopes_for(target),
+        expected_tool=step['tool'],
+        # Exploitation-grade commands additionally require the letter to
+        # authorize controlled exploitation for this target. The policy engine
+        # returns the refusal reason itself.
+        allow_exploitation=bool(target.exploitation_authorized),
+    )
     if not valid:
         raise HTTPException(403, reason)
     settings = get_settings_row(db)
+    # VM mode fails closed on incomplete configuration: silently running the
+    # command on the backend host instead would put scanner traffic on a
+    # machine the operator did not choose.
+    remote = remote_execution_settings(settings)
+    if remote and not (remote['host'] and remote['username'] and remote['password']):
+        raise HTTPException(409, 'Kali VM execution is selected but the SSH host, username, or password is missing; configure them in Settings')
+    if step['tool'] in VM_ONLY_TOOLS and not remote:
+        # msfconsole exists only on the attacker VM; the local container
+        # image deliberately ships without it so the demo machine cannot be
+        # mistaken for an exploitation engine. Fail closed with the reason.
+        raise HTTPException(409, f"{step['tool']} runs only on the Kali attacker VM; switch the execution mode to 'Kali VM over SSH' in Settings")
 
     existing = db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id, ToolExecution.step_index == payload.step_index).first()
     if existing and existing.return_code == 0:
@@ -620,8 +1213,10 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     else:
         execution = ToolExecution(assessment_id=row.id, step_index=payload.step_index, tool_name=step['tool'], command=step['command'], stdout='', stderr='', return_code=None, duration_ms=0, approved_by_user=True, attempt=1)
         db.add(execution)
-    # Re-running a step invalidates any analysis derived from the old output.
-    invalidate_analysis(db, assessment_id)
+    # Re-running a step invalidates any analysis derived from the old output
+    # — scoped to that step's phase, so recon findings survive an
+    # exploitation step being re-run.
+    invalidate_analysis(db, assessment_id, phase=step.get('phase', 'recon'))
     row.status = 'running'
     row.completed_at = None
     try:
@@ -636,7 +1231,7 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     # stream from the first chunk; removed whatever way the command ends.
     live_registry.start(execution_id, step['command'])
     try:
-        result = await executor.execute_command(step['tool'], step['command'], proxy_environment(settings), execution_id=execution_id)
+        result = await executor.execute_command(step['tool'], step['command'], proxy_environment(settings), execution_id=execution_id, remote=remote)
     except BaseException as exc:
         record_abandoned_execution(db, execution_id, f'Execution did not complete: {type(exc).__name__}: {exc}'.strip())
         raise
@@ -647,12 +1242,21 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     execution.stderr = result['stderr']
     execution.return_code = result['return_code']
     execution.duration_ms = result['duration_ms']
+    # The attestation of where this command physically ran, when VM mode is
+    # active - hostname, OS, kernel, and the SSH host-key fingerprint of the
+    # attacker VM that produced this output.
+    execution.execution_host = result.get('execution_host')
     status = refresh_assessment_status(db, row, extra_executed={payload.step_index})
     db.commit()
-    return {'message': 'Execution finished', 'policy': reason, 'capability': capability, 'status': status, 'result': result, 'execution_id': execution_id}
+    # Level 2 of the automatic recommendation loop: the step just finished,
+    # so ask what to do next given its output - off the event loop, in its
+    # own session, persisting a proposal batch that never becomes plan steps
+    # without the operator. A failure inside is swallowed by design.
+    schedule_auto_recommendations(row.id, execution_id)
+    return {'message': 'Execution finished', 'policy': reason, 'capability': capability, 'status': status, 'result': result, 'execution_id': execution_id, 'recommendation_pending': True}
 
 
-@app.get('/assessments/{assessment_id}/executions/{execution_id}/live')
+@app.get('/assessments/{assessment_id}/executions/{execution_id}/live', dependencies=PROTECTED)
 def get_live_execution(assessment_id: int, execution_id: int, db: Session = Depends(get_db)):
     """Partial output for a command that is still running.
 
@@ -679,20 +1283,28 @@ def get_live_execution(assessment_id: int, execution_id: int, db: Session = Depe
     }
 
 
-@app.post('/assessments/{assessment_id}/analyze')
+@app.post('/assessments/{assessment_id}/analyze', dependencies=PROTECTED)
 def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
         raise HTTPException(404, 'Assessment not found')
+    current = row.current_phase or 'recon'
+    phase_indices = set(phase_steps(row))
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id, ToolExecution.return_code.is_not(None)).all()
     if not executions:
         raise HTTPException(400, 'Execute at least one approved plan step first')
-    enabled_steps = {index for index, step in enumerate(row.plan or []) if step.get('enabled', True)}
+    enabled_steps = {index for index in phase_steps(row) if (row.plan or [])[index].get('enabled', True)}
     executed_steps = {execution.step_index for execution in executions}
+    if not enabled_steps:
+        raise HTTPException(409, 'The current phase has no enabled steps to analyze; draft the next phase plan first')
     if not enabled_steps.issubset(executed_steps):
-        raise HTTPException(409, 'Execute every enabled plan step before analysis')
+        raise HTTPException(409, 'Execute every enabled step of the current phase before analysis')
     target = db.query(Target).filter(Target.id == row.target_id).first()
-    raw = [{'tool': e.tool_name, 'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in executions]
+    # Only the current phase's executions feed this analysis run: recon
+    # output was already analyzed, and re-analyzing it alongside exploitation
+    # output would re-file recon findings against the verification state.
+    phase_executions = [execution for execution in executions if execution.step_index in phase_indices]
+    raw = [{'tool': e.tool_name, 'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in phase_executions]
     settings = get_settings_row(db)
     api_key, base_url, model_name = provider_credentials(settings)
     analyzed, analyzer_mode = analyzer_agent.analyze_results(
@@ -703,7 +1315,10 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
         include_metadata=True,
         asset_criticality=target.criticality if target else None,
     )
-    invalidate_analysis(db, assessment_id)
+    # Only the current phase's findings are recomputed; earlier phases'
+    # findings survive, because the later phases' plans were drafted from
+    # them and the report cites them.
+    invalidate_analysis(db, assessment_id, phase=current)
     for item in analyzed:
         db.add(Finding(
             assessment_id=assessment_id, fingerprint=item['fingerprint'],
@@ -716,16 +1331,78 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
             exploitability=item.get('exploitability', 3), impact=item.get('impact', 3),
             exposure=item.get('exposure', 3),
             source_tools=item.get('source_tools', []),
+            phase=current,
         ))
+    db.commit()
+    # The exploitation phase's results verify (or refute) the earlier phases'
+    # findings: link them by endpoint/parameter, then persist the verdict on
+    # the recon rows so the report can separate "a scanner matched a
+    # signature" from "exploitation proved it".
+    verified_count = 0
+    if current in ('exploitation', 'post_exploitation'):
+        all_rows = db.query(Finding).filter(Finding.assessment_id == assessment_id).all()
+        exploitation_rows = [f for f in all_rows if f.phase == current]
+        prior_rows = [f for f in all_rows if f.phase != current]
+        links = match_verification(
+            [{'endpoint': f.endpoint, 'parameter': f.parameter, 'title': f.title} for f in prior_rows],
+            [{'endpoint': f.endpoint, 'parameter': f.parameter, 'title': f.title,
+              'evidence': f.evidence, 'source_tools': f.source_tools} for f in exploitation_rows])
+        prior_index = {(f.title, f.endpoint, f.parameter): f for f in prior_rows}
+        for recon_data, exploit_data, evidence in links:
+            row_finding = prior_index.get((recon_data['title'], recon_data['endpoint'], recon_data['parameter']))
+            if row_finding is None:
+                continue
+            row_finding.verification = 'verified' if evidence else 'attempted'
+            row_finding.exploit_evidence = ((row_finding.exploit_evidence or '') + ('\n' + evidence if evidence else '')).strip()[:20000]
+            tools = list(row_finding.verified_by or [])
+            for tool in exploit_data.get('source_tools') or []:
+                if tool not in tools:
+                    tools.append(tool)
+            row_finding.verified_by = tools
+            verified_count += 1
+        db.commit()
+    # Phase bookkeeping: this phase is now analyzed, and the assessment
+    # advances to the phase its analysis unlocks (vuln_analysis after recon,
+    # post_exploitation after exploitation, reporting after the last).
+    analyzed_phases = row.analyzed_phases or []
+    if current not in analyzed_phases:
+        analyzed_phases = analyzed_phases + [current]
+    row.analyzed_phases = analyzed_phases
+    if current in ANALYSIS_ADVANCES_TO and (row.current_phase or 'recon') == current:
+        row.current_phase = ANALYSIS_ADVANCES_TO[current]
     row.status = 'analyzed'
     row.analysis_mode = analyzer_mode
     row.completed_at = utcnow()
     db.commit()
-    failed = [execution.step_index for execution in executions if execution.return_code != 0]
-    return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode, 'failed_steps': failed}
+    # Level 1 of the automatic recommendation loop: the analysis just
+    # unlocked the next phase, so draft it immediately instead of waiting
+    # for the operator to press the Draft button. Nothing new is authorized:
+    # drafting was already policy-gated and every drafted step still waits
+    # for its own approval - the operator just no longer has to ask. A
+    # refusal is a note, not an error: the operator did not request this
+    # draft, so "the letter does not authorize exploitation" is information
+    # about the engagement, worth showing, not worth failing the analysis.
+    auto_drafted = {'phase': None, 'steps': 0, 'note': ''}
+    next_phase = NEXT_DRAFTABLE_PHASE.get(row.current_phase or '')
+    if next_phase:
+        steps, notes, refusal = try_draft_phase(db, row, target, next_phase)
+        if steps:
+            row.plan = normalize_plan(list(row.plan or []) + steps)
+            row.current_phase = next_phase
+            row.status = 'awaiting_approval'
+            try:
+                report_path(assessment_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            db.commit()
+            auto_drafted = {'phase': next_phase, 'steps': len(steps), 'note': ''}
+        else:
+            auto_drafted = {'phase': next_phase, 'steps': 0, 'note': notes}
+    failed = [execution.step_index for execution in phase_executions if execution.return_code != 0]
+    return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode, 'failed_steps': failed, 'phase': current, 'verified_findings': verified_count, 'current_phase': row.current_phase, 'auto_drafted': auto_drafted}
 
 
-@app.post('/assessments/{assessment_id}/report')
+@app.post('/assessments/{assessment_id}/report', dependencies=PROTECTED)
 def generate_report(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
@@ -734,28 +1411,83 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
     if not target:
         raise HTTPException(404, 'Target not found')
     if row.status not in {'analyzed', 'reported'}:
-        raise HTTPException(409, 'Analyze the completed assessment before generating a report')
+        raise HTTPException(409, 'Analyze the completed phase before generating a report')
     findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).order_by(Finding.priority_score.desc()).all()
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).order_by(ToolExecution.step_index).all()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = report_path(assessment_id)
+    # Per-phase step counts for the report's progress summary, and the
+    # verification outcomes for the exploitation section.
+    phase_summary = [
+        {'phase': phase, 'label': PHASE_LABELS[phase],
+         'steps': len(phase_steps_all(row, phase)),
+         'analyzed': phase in (row.analyzed_phases or [])}
+        for phase in PLAN_PHASES
+    ]
+    # Attack paths: the findings as a graph, so the report shows which of
+    # them combine on one origin instead of only a flat prioritised list.
+    # The narrative is grounded - cited finding ids are verified to exist -
+    # and falls back to the deterministic explanation without a provider.
+    serialized_findings = [serialize_finding(finding) for finding in findings]
+    paths = derive_paths(serialized_findings, target_address=target.scope_domain_ip)
+    if paths:
+        api_key, base_url, model_name = provider_credentials(get_settings_row(db))
+        paths = narrate_paths(paths, api_key, base_url, model_name)
     reporter.generate_html_report(
         target.scope_domain_ip,
         row.objective,
-        [serialize_finding(finding) for finding in findings],
+        serialized_findings,
         [serialize_execution(execution) for execution in executions],
         str(path),
         engagement_brief=row.engagement_brief,
         analysis_mode=row.analysis_mode,
+        current_phase=row.current_phase or 'recon',
+        phase_summary=phase_summary,
+        attack_paths=paths,
     )
     row.status = 'reported'
+    if (row.current_phase or 'recon') not in ('reporting',):
+        row.current_phase = 'reporting'
     db.commit()
     return {'message': 'Report generated', 'download_url': f'/reports/{assessment_id}'}
 
 
-@app.get('/reports/{assessment_id}')
+@app.get('/reports/{assessment_id}', dependencies=PROTECTED)
 def download_report(assessment_id: int):
     path = report_path(assessment_id)
     if not path.exists():
         raise HTTPException(404, 'Report not generated')
     return FileResponse(str(path), media_type='text/html', filename=f'security-assessment-{assessment_id}.html')
+
+
+@app.post('/workspace/reset', dependencies=PROTECTED)
+def reset_workspace(db: Session = Depends(get_db)):
+    """Clear every target, assessment, execution, finding and report.
+
+    A persisted database means every reload shows the last engagement's
+    leftovers. This is the explicit way back to an empty board between two
+    client letters or two demonstrations. The settings row survives, so a
+    configured provider or attacker VM stays configured.
+    """
+    if running_executions(db):
+        raise HTTPException(409, 'A command is still executing; wait for it to finish or time out before clearing the workspace')
+    assessments = db.query(Assessment).all()
+    for row in assessments:
+        report_path(row.id).unlink(missing_ok=True)
+    deleted_findings = db.query(Finding).delete(synchronize_session=False)
+    deleted_executions = db.query(ToolExecution).delete(synchronize_session=False)
+    db.query(Recommendation).delete(synchronize_session=False)
+    deleted_assessments = len(assessments)
+    for row in assessments:
+        db.delete(row)
+    deleted_targets = db.query(Target).delete(synchronize_session=False)
+    db.commit()
+    return {
+        'message': 'Workspace cleared',
+        'deleted': {
+            'assessments': deleted_assessments,
+            'executions': deleted_executions,
+            'findings': deleted_findings,
+            'targets': deleted_targets,
+        },
+    }

@@ -97,7 +97,19 @@ class Executor:
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
-    async def execute_command(self, tool, command, proxy_env=None, execution_id=None):
+    async def execute_command(self, tool, command, proxy_env=None, execution_id=None, remote=None):
+        """Run one approved command and return its captured result.
+
+        `remote` carries the Kali VM SSH settings when execution_mode is
+        'kali_vm'; the command is then typed into the VM's tmux session by the
+        SSH executor instead of spawned locally. The import is lazy so a
+        deployment without paramiko (the Docker image, before it is rebuilt)
+        keeps working in local mode.
+        """
+        if remote:
+            from modules.ssh_executor import ssh_executor
+            return await ssh_executor.execute_command(
+                tool, command, proxy_env=proxy_env, execution_id=execution_id, settings=remote)
         started = time.perf_counter()
         elapsed = lambda: round((time.perf_counter() - started) * 1000)
         stdout_chunks, stderr_chunks = [], []

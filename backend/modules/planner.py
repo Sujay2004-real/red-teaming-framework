@@ -32,6 +32,15 @@ DEFAULT_PLAN = [
     {'tool': 'sslscan', 'command': 'sslscan --no-colour {target}',
      'reason': 'Audit TLS protocol versions and cipher suites where TLS is exposed.',
      'enabled': True},
+    # The OWASP ZAP baseline in PASSIVE mode: it spiders the application and
+    # audits what the responses themselves reveal (headers, cookies, forms,
+    # markup) without sending attack payloads - the web-audit capability the
+    # Phase-1 report's toolchain named, integrated under the same allowlist.
+    # -I keeps WARN-level findings from failing the step's exit code: an
+    # advisory result is a result, not an execution error.
+    {'tool': 'zap-baseline.py', 'command': 'zap-baseline.py -t http://{target} -I',
+     'reason': 'Passive ZAP baseline: crawl the application and audit the served responses for header, cookie and form issues.',
+     'enabled': True},
     # -stats is for the operator, not the parser: -silent alone prints nothing
     # until a template matches, so the longest step in the plan showed an empty
     # live terminal for minutes with no way to tell it apart from a hang. The

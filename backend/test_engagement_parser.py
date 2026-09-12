@@ -83,8 +83,10 @@ def test_per_target_restrictions_follow_allow_and_deny_sentences():
     brief = parse_engagement(SAMPLE_LETTER)
     addresses = {target['address']: target for target in brief['targets']}
     # The allow-list sentence names nmap, curl and whatweb; nuclei is also
-    # denied by name. Everything runnable except those three is restricted.
-    assert addresses['dvwa:80']['restricted_tools'] == ['dig', 'nslookup', 'nuclei', 'sslscan', 'traceroute']
+    # denied by name. Everything runnable except those three is restricted -
+    # which since the exploitation rework includes sqlmap, searchsploit and
+    # msfconsole: an allow-list sentence excludes every tool it does not name.
+    assert addresses['dvwa:80']['restricted_tools'] == ['dig', 'msfconsole', 'nslookup', 'nuclei', 'searchsploit', 'sqlmap', 'sslscan', 'traceroute']
     assert addresses['juice-shop:3000']['restricted_tools'] == []
 
 
@@ -105,27 +107,35 @@ def test_parses_the_real_client_pdf():
     text = '\n'.join(page.extract_text() or '' for page in PdfReader(str(REAL_PDF)).pages)
     brief = parse_engagement(text)
     addresses = {target['address']: target for target in brief['targets']}
-    # The storefront now runs as a full VM on the virtualization lab's
-    # application host, so every letter target points at the lab, not at a
-    # container started by the compose "lab" profile.
-    assert '192.168.56.10:3000' in addresses
-    assert '192.168.56.20:80' in addresses
-    assert addresses['192.168.56.10:3000']['criticality'] == 90
-    assert addresses['192.168.56.20:80']['criticality'] == 50
-    assert 'nuclei' in addresses['192.168.56.20:80']['restricted_tools']
-    # The escalated letter denies traceroute for the storefront while allowing
-    # everything else, so both restriction shapes are exercised end to end.
-    assert addresses['192.168.56.10:3000']['restricted_tools'] == ['traceroute']
-    assert brief['engagement_ref'] == 'JB/SEC/2026/023'
-    # The letter's third target authorizes the whole virtualization-lab
-    # segment (a real host-only network, not a container bridge).
-    assert '192.168.56.0/24' in addresses
-    assert addresses['192.168.56.0/24']['criticality'] == 65
-    assert addresses['192.168.56.0/24']['restricted_tools'] == ['curl', 'nuclei', 'sslscan', 'whatweb']
-    # All objectives survive PDF extraction and parsing.
-    assert len(brief['objectives']) == 8
+    # The letter (v7) assesses a real self-hosted application - the OmniRoute
+    # AI gateway on the assessment host - so it names the target by the host's
+    # current lab-network address and the gateway's port (20128)
+    # (192.168.198.86 at v7 regeneration time).
+    assert '192.168.198.86:20128' in addresses
+    assert addresses['192.168.198.86:20128']['criticality'] == 90
+    # The letter denies traceroute for the gateway while allowing everything
+    # else, so the restriction sentence shape is exercised end to end.
+    assert addresses['192.168.198.86:20128']['restricted_tools'] == ['traceroute']
+    assert brief['engagement_ref'] == 'JB/SEC/2026/026'
+    # The v7 letter authorizes controlled verification for the gateway only,
+    # and declares its verification endpoint so the exploit planner can draft
+    # the curl proof-of-concept deterministically. Against a real application
+    # the verification is expected to come back clean - that outcome is a
+    # finding, not a failure.
+    assert addresses['192.168.198.86:20128']['exploitation_authorized'] is True
+    assert addresses['192.168.198.86:20128']['verification_endpoints'] == ['/v1/chat/completions']
+    assert addresses['192.168.198.0/24']['exploitation_authorized'] is False
+    # The letter's second target authorizes the whole virtualization-lab
+    # segment (a real host LAN, not a container bridge).
+    assert '192.168.198.0/24' in addresses
+    assert addresses['192.168.198.0/24']['criticality'] == 65
+    assert addresses['192.168.198.0/24']['restricted_tools'] == ['curl', 'nuclei', 'sslscan', 'whatweb']
+    # All objectives survive PDF extraction and parsing (4.7 remains the
+    # controlled verification of critical findings).
+    assert len(brief['objectives']) == 9
     assert any('security-header audit' in objective for objective in brief['objectives'])
     assert any('segment' in objective.lower() for objective in brief['objectives'])
+    assert any('Controlled verification' in objective for objective in brief['objectives'])
 
 
 # A letter that authorizes a whole segment. The subnet row uses the same

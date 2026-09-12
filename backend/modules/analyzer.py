@@ -56,6 +56,49 @@ def fingerprint(finding):
     return hashlib.sha256(material.encode()).hexdigest()[:24]
 
 
+def match_verification(recon_findings, exploitation_findings):
+    """Link exploitation findings to the recon findings they verify.
+
+    Returns a list of (recon_finding, exploitation_finding, evidence) tuples.
+    A match is made when both findings name the same endpoint URL or the same
+    host:port (recon nmap endpoints carry 'host:port/tcp', curl and sqlmap
+    carry full URLs), or when the exploitation finding's parameter equals the
+    recon finding's parameter. The match is deliberately loose on the recon
+    side: the point is to upgrade a scanner's signature claim to
+    'exploitation-verified', and a false link only ever strengthens one
+    finding's evidence attribution, never a command.
+    """
+    def keys(finding):
+        found = set()
+        endpoint = (finding.get('endpoint') or '').strip()
+        if endpoint:
+            found.add(endpoint)
+            # 'host:port/tcp' and 'http://host:port' are the same target.
+            bare = re.sub(r'^[a-z]+://', '', endpoint)
+            bare = bare.split('/tcp')[0].split('/udp')[0].split('/')[0]
+            if bare:
+                found.add(bare.lower())
+        parameter = (finding.get('parameter') or '').strip().lower()
+        if parameter:
+            found.add('param:' + parameter)
+        return found
+
+    links = []
+    for recon in recon_findings:
+        recon_keys = keys(recon)
+        if not recon_keys:
+            continue
+        for exploit in exploitation_findings:
+            exploit_keys = keys(exploit)
+            if not exploit_keys:
+                continue
+            overlap = recon_keys & exploit_keys
+            if overlap:
+                evidence = (exploit.get('evidence') or '').strip()
+                links.append((recon, exploit, evidence))
+    return links
+
+
 # ---------------------------------------------------------------------------
 # Deterministic analysis. Each parser understands one tool's output format and
 # emits findings with real explanations, per-instance evidence, distinct
@@ -69,6 +112,37 @@ def fingerprint(finding):
 # but a hand-edited command or a different build can still colourise, so every
 # stream is stripped before parsing rather than trusting the flags.
 ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+# zap-baseline.py (the ZAP project's CI entrypoint, Apache-2.0) prints one
+# line per alerting passive rule:
+#   'WARN-NEW: Content Security Policy (CSP) Header Not Set [10038] x 5'
+#   'FAIL-NEW: SQL Injection [40018] x 2'
+# followed - when detailed output is on (the default; -s suppresses it) - by
+# up to five indented per-URL lines:
+#   '\thttp://target/search?q=1 (200)'
+# 'PASS: Rule Name [id]' lines are clean results, not findings, and the
+# tab-separated summary line ('FAIL-NEW: 0\tFAIL-INPROG: ...') carries no
+# brackets so it cannot match the alert pattern.
+ZAP_BASELINE_ALERT_RE = re.compile(
+    r'^(?P<level>FAIL|WARN|INFO)-(?:NEW|IN_PROGRESS|INPROG):\s+'
+    r'(?P<name>.+?)\s+\[(?P<rule>\d+)\](?:\s+x\s+(?P<count>\d+))?\s*$')
+ZAP_BASELINE_DETAIL_RE = re.compile(r'^\s+(?P<url>\S+)\s+\((?P<code>\d{3})\)\s*$')
+
+# The baseline's level reflects ZAP's scan policy (FAIL = build-breaking,
+# WARN = advisory, INFO = informational). Folded onto the framework's four
+# severities, with per-rule overrides where a classic high-impact class is
+# undersold by the coarse level.
+ZAP_LEVEL_SEVERITY = {'FAIL': 'High', 'WARN': 'Medium', 'INFO': 'Low'}
+ZAP_LEVEL_DRIVERS = {'FAIL': (3, 4, 4), 'WARN': (2, 3, 4), 'INFO': (1, 1, 3)}
+ZAP_RULE_OVERRIDES = {
+    # SQL injection is the one class a passive rule can name that the
+    # framework scores Critical, matching the sqlmap confirmation path.
+    '40018': ('Critical', (5, 5, 4)),
+    # Cross-site scripting variants (reflected / stored / DOM).
+    '40026': ('High', (4, 5, 4)), '40027': ('High', (4, 5, 4)),
+    '40028': ('High', (4, 5, 4)),
+}
 
 
 def strip_ansi(text):
@@ -468,6 +542,183 @@ class AnalyzerAgent:
                 })
         return findings
 
+    # -------------------------------------------------------- sqlmap output
+
+    # sqlmap's confirmation lines look like:
+    #   GET parameter 'email' is 'AND boolean-based blind - WHERE or HAVING
+    #   clause' injectable
+    #   [CRITICAL] GET parameter 'email' is vulnerable
+    # with the back-end banner on its own line:
+    #   back-end DBMS: SQLite
+    SQLMAP_PARAM_RE = re.compile(
+        r"[\'\"]?(?P<param>\w+)[\'\"]?\s+is\s+(?:[\'\"](?P<technique>[^\'\"]+)[\'\"]|vulnerable)", re.IGNORECASE)
+    SQLMAP_DBMS_RE = re.compile(r'back-end DBMS:\s*(?P<dbms>.+)$', re.IGNORECASE)
+
+    @staticmethod
+    def _finding_sqlmap(stdout, source_tool):
+        findings = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            match = AnalyzerAgent.SQLMAP_PARAM_RE.search(stripped)
+            if not match:
+                continue
+            param, technique = match.group('param'), match.group('technique')
+            confirmed = 'vulnerable' in stripped.lower()
+            dbms = next((m.group('dbms').strip() for l in stdout.splitlines()
+                         if (m := AnalyzerAgent.SQLMAP_DBMS_RE.search(l))), '')
+            title = (f"SQL injection confirmed in parameter '{param}'"
+                     if confirmed else f"Parameter '{param}' reported injectable by sqlmap")
+            findings.append({
+                'title': title,
+                'description': (f'sqlmap verified that the parameter {param} is injectable'
+                                f'{f" via {technique} techniques" if technique else ""}. '
+                                'This is a confirmed, exploitable injection point, not a '
+                                'signature match: the tool sent differential boolean-based '
+                                'requests and the target answered them differently.'
+                                f'{f" The back-end database is {dbms}." if dbms else ""}'),
+                'severity': 'Critical',
+                'evidence': stripped,
+                'remediation': ('Parameterise every database query (prepared statements / '
+                                'bound parameters) for this endpoint, validate input against '
+                                'an allowlist, and return generic errors so a failed query '
+                                'leaks no schema information.'),
+                'endpoint': '',
+                'parameter': param,
+                'confidence_score': 95 if confirmed else 75,
+                'source_tools': [source_tool],
+                'exploitability': 5, 'impact': 5, 'exposure': 4,
+            })
+        return findings
+
+    # ---------------------------------------------------- searchsploit output
+
+    # Rows: ' OpenSSH 7.2 - (Auth) Remote Code Execution | multiple/remote/openssh-72-auth-bypass.txt'
+    # The right column is a path (newer builds) or a type word (older ones).
+    SEARCHSPLOIT_ROW_RE = re.compile(r'^[^\w|]*?(?P<title>[^|]+?)\s*\|\s*[^|]+$')
+
+    @staticmethod
+    def _finding_searchsploit(stdout, source_tool):
+        findings = []
+        rows = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or set(stripped) <= {'-', '|', ' '}:
+                continue
+            match = AnalyzerAgent.SEARCHSPLOIT_ROW_RE.match(stripped)
+            if not match:
+                continue
+            title = match.group('title').strip()
+            # The table's own header and separator rows are not exploits.
+            if not title or 'exploit title' in title.lower() or title.startswith('-'):
+                continue
+            rows.append(title)
+        if not rows:
+            return findings
+        # One finding summarising the public exploit surface for the searched
+        # product, not one per row: searchsploit returns dozens of hits per
+        # version, and they all argue the same remediation - patch.
+        sample = '; '.join(rows[:3])
+        findings.append({
+            'title': f'Public exploits available for the identified version ({len(rows)} matches)',
+            'description': (f'The offline Exploit-DB mirror lists {len(rows)} documented '
+                            f'exploits for the version fingerprint the recon phase identified: '
+                            f'{sample}. An attacker can go straight from the fingerprint to '
+                            'a working public exploit with no research of their own.'),
+            'severity': 'High',
+            'evidence': '\n'.join(line.strip() for line in stdout.splitlines()[:12]),
+            'remediation': ('Patch the identified component to the vendor current release '
+                            '(Exploit-DB entries cite the fixed versions), or remove the '
+                            'exposed service if it is not required.'),
+            'endpoint': 'Version fingerprint',
+            'confidence_score': 85,
+            'source_tools': [source_tool],
+            'exploitability': 4, 'impact': 4, 'exposure': 4,
+        })
+        return findings
+
+    # ---------------------------------------------------- msfconsole output
+
+    # Scanner banners: '[+] 192.168.56.10:22 - SSH server version: SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1'
+    MSF_RESULT_RE = re.compile(r'^\[\+\]\s+(?P<target>\S+)\s+-\s+(?P<detail>.+)$')
+
+    @staticmethod
+    def _finding_msfconsole(stdout, source_tool):
+        findings = []
+        for line in stdout.splitlines():
+            match = AnalyzerAgent.MSF_RESULT_RE.match(line.strip())
+            if not match:
+                continue
+            target, detail = match.group('target'), match.group('detail').strip()
+            findings.append({
+                'title': f'Version scanner confirmed: {detail.split(":", 1)[-1].strip()[:80]}',
+                'description': (f'The Metasploit scanner module confirmed at {target} that '
+                                f'{detail}. This is authoritative banner evidence from the '
+                                'attacker VM, matching the version fingerprint the recon '
+                                'phase derived — the two independent sources agree, which '
+                                'raises confidence in every version-mapped finding.'),
+                'severity': 'Low',
+                'evidence': line.strip(),
+                'remediation': ('Treat the confirmed version as public knowledge and patch '
+                                'the component to the vendor current release.'),
+                'endpoint': target,
+                'confidence_score': 90,
+                'source_tools': [source_tool],
+                'exploitability': 2, 'impact': 3, 'exposure': 4,
+            })
+        return findings
+
+    # ------------------------------------------------- zap-baseline output
+
+    @staticmethod
+    def _finding_zap_baseline(stdout, source_tool):
+        """Parse the passive ZAP baseline's alert lines.
+
+        The baseline spider crawls the application and audits what the
+        responses themselves reveal - headers, cookies, forms, markup - so a
+        finding here is a property of what the target actually serves, not of
+        an attack payload (that is the active scanner, which this framework
+        deliberately does not run).
+        """
+        findings = []
+        for line in stdout.splitlines():
+            match = ZAP_BASELINE_ALERT_RE.match(line)
+            if not match:
+                continue
+            level, name, rule = match.group('level'), match.group('name').strip(), match.group('rule')
+            count = int(match.group('count') or 1)
+            # Gather the indented per-URL detail lines that follow this alert
+            # (up to five per rule, per ZAP's print_rule) until the next
+            # non-detail line, so the finding names where it was observed.
+            urls = []
+            for detail in stdout.splitlines()[stdout.splitlines().index(line) + 1:]:
+                url_match = ZAP_BASELINE_DETAIL_RE.match(detail)
+                if not url_match:
+                    break
+                urls.append(url_match.group('url'))
+            severity, drivers = ZAP_RULE_OVERRIDES.get(
+                rule, (ZAP_LEVEL_SEVERITY[level], ZAP_LEVEL_DRIVERS[level]))
+            occurrences = f', observed at {len(urls)} URL(s)' if urls else ''
+            findings.append({
+                'title': f'ZAP passive audit: {name}',
+                'description': (f'The passive ZAP baseline (scan-rule {rule}) reported "{name}" '
+                                f'{count} time(s){occurrences} while crawling the application. '
+                                'Passive findings are properties of the responses the application '
+                                'itself serves - no attack payloads were sent. Treat this as '
+                                'high-likelihood evidence to verify during remediation rather '
+                                'than a confirmed exploit.'),
+                'severity': severity,
+                'evidence': '\n'.join([line.strip()] + [f'  {u}' for u in urls]),
+                'remediation': (f'Look up scan-rule {rule} ("{name}") in the ZAP alert library '
+                                'for the affected component, verify it against the observed URLs, '
+                                'then apply the referenced fix (typically a response header, '
+                                'cookie attribute, or input-handling change).'),
+                'endpoint': urls[0] if urls else 'ZAP passive crawl',
+                'confidence_score': 85,
+                'source_tools': [source_tool],
+                'exploitability': drivers[0], 'impact': drivers[1], 'exposure': drivers[2],
+            })
+        return findings
+
     # ---------------------------------------------------------- dispatcher
 
     def _fallback(self, raw_outputs):
@@ -484,6 +735,10 @@ class AnalyzerAgent:
             'curl': self._finding_curl,
             'whatweb': self._finding_whatweb,
             'sslscan': self._finding_sslscan,
+            'sqlmap': self._finding_sqlmap,
+            'searchsploit': self._finding_searchsploit,
+            'msfconsole': self._finding_msfconsole,
+            'zap-baseline.py': self._finding_zap_baseline,
         }
         findings = []
         for output in raw_outputs:

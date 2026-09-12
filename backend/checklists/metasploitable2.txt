@@ -1,0 +1,26 @@
+# Metasploitable2 ground-truth checklist for eval_harness.py --checklist
+# One expected finding/service per line. Recall = share of lines matched by
+# any finding title or endpoint (case-insensitive substring). Sources: the
+# official Rapid7 Metasploitable2 documentation and its standard walkthroughs.
+# Services (matched via the analyzer's exposed-service findings)
+vsftpd 2.3.4
+OpenSSH
+telnet
+Postfix
+Apache httpd
+vsftpd
+UnrealIRCd
+Samba
+distccd
+TFTP
+ProFTPD
+Asterisk
+# Web surfaces
+DVWA
+Mutillidae
+TWiki
+phpMyAdmin
+# Weaknesses the recon/analysis phases are expected to surface
+weak SSL
+SSLv2
+anonymous FTP

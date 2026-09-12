@@ -28,6 +28,13 @@ dist/
 *.sqlite3
 *.log
 
+# Runtime data directories (database, generated reports, secret key)
+data/
+backend/data/
+
+# Evaluation harness output
+eval_results*.json
+
 # Test & coverage artifacts
 .coverage
 .coverage.*
