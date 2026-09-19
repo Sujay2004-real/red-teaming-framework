@@ -72,3 +72,8 @@ red-teaming-framework/
 .tmp_pptx/
 output/
 .runlogs/
+
+.npm-cache/
+.pytest_tmp*/
+.pytest_results.txt
+audit-results.json

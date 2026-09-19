@@ -9,6 +9,9 @@ import time
 import uuid
 
 import paramiko
+import hmac
+import io
+import socket
 
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, live_registry
 
@@ -89,7 +92,7 @@ def _exec(client, command):
     the tmux server may apply out of order) and avoids leaking sessions
     against sshd's per-connection MaxSessions limit.
     """
-    _, stdout, _ = client.exec_command(command)
+    _, stdout, _ = client.exec_command(command, timeout=CONNECT_TIMEOUT_SECONDS)
     text = stdout.read().decode('utf-8', errors='ignore')
     stdout.channel.close()
     return text
@@ -191,7 +194,11 @@ def _run_blocking(client, command, token, stop, execution_id=None):
         # instant the command finishes, within the same input line, so the
         # marker can never land on an idle prompt (whose stale $? produced a
         # bogus exit code in live use) nor be lost as a separate queued line.
-        _send_line(client, f'{command}; echo "{_marker_for(token)}:$?"')
+        # Match local create_subprocess_exec semantics. The approved command
+        # describes argv, not a shell program; preserve $, &, substitutions,
+        # and other metacharacters as literal argument content in VM mode.
+        safe_command = shlex.join(shlex.split(command, posix=True))
+        _send_line(client, f'{safe_command}; echo "{_marker_for(token)}:$?"')
 
         captured = _pane_text(client)
         chunks = []
@@ -244,22 +251,49 @@ class SshExecutor:
         self._lock = asyncio.Lock()
 
     def _connect(self, settings):
+        expected = settings.get('fingerprint', '')
+        if not expected:
+            raise ValueError('Inspect and trust the SSH host fingerprint before connecting')
+        class PinnedKey(paramiko.MissingHostKeyPolicy):
+            def missing_host_key(self, client, hostname, key):
+                if not hmac.compare_digest(expected, _fingerprint(key)):
+                    raise paramiko.SSHException('SSH host key changed; inspect and explicitly trust the new fingerprint')
         client = paramiko.SSHClient()
-        # A lab VM's host key changes whenever the VM is rebuilt, and the
-        # fingerprint is captured per execution as the attestation instead -
-        # the operator verifies the machine through the UI, not known_hosts.
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            settings['host'], port=settings['port'], username=settings['username'],
-            password=settings['password'], look_for_keys=False, allow_agent=False,
-            timeout=CONNECT_TIMEOUT_SECONDS, banner_timeout=CONNECT_TIMEOUT_SECONDS,
-            auth_timeout=CONNECT_TIMEOUT_SECONDS,
-        )
-        return client
+        client.set_missing_host_key_policy(PinnedKey())
+        private_key = None
+        if settings.get('private_key'):
+            for kind in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
+                try:
+                    private_key = kind.from_private_key(io.StringIO(settings['private_key']), password=settings.get('key_passphrase') or None)
+                    break
+                except (paramiko.SSHException, ValueError):
+                    continue
+            if private_key is None:
+                raise ValueError('The SSH private key or passphrase is invalid')
+        try:
+            client.connect(settings['host'], port=settings['port'], username=settings['username'],
+                password=settings.get('password') or None, pkey=private_key, look_for_keys=False, allow_agent=False,
+                timeout=CONNECT_TIMEOUT_SECONDS, banner_timeout=CONNECT_TIMEOUT_SECONDS,
+                auth_timeout=CONNECT_TIMEOUT_SECONDS, channel_timeout=CONNECT_TIMEOUT_SECONDS)
+            return client
+        except BaseException:
+            client.close()
+            raise
+
+    def inspect_fingerprint(self, settings):
+        # Host-key discovery performs only the SSH handshake, never authentication.
+        with socket.create_connection((settings['host'], settings['port']), timeout=CONNECT_TIMEOUT_SECONDS) as sock:
+            transport = paramiko.Transport(sock)
+            try:
+                transport.start_client(timeout=CONNECT_TIMEOUT_SECONDS)
+                return {'host': settings['host'], 'port': settings['port'],
+                        'fingerprint': _fingerprint(transport.get_remote_server_key())}
+            finally:
+                transport.close()
 
     def _attest(self, client, settings):
         _, stdout, _ = client.exec_command(
-            'uname -sr; grep -h PRETTY_NAME /etc/os-release; hostname; id -un')
+            'uname -sr; grep -h PRETTY_NAME /etc/os-release; hostname; id -un', timeout=CONNECT_TIMEOUT_SECONDS)
         kernel, os_name, hostname, user = (stdout.read().decode('utf-8', errors='ignore').splitlines() + [''] * 4)[:4]
         stdout.channel.close()
         return {
@@ -271,32 +305,42 @@ class SshExecutor:
     async def execute_command(self, tool, command, proxy_env=None, execution_id=None, settings=None):
         """Run one approved command in the VM. Same contract as the local executor.
 
-        proxy_env (operator-configured proxy variables) is applied by typing
-        export lines before the command - the values come from the operator's
-        own settings, never from client input, and shlex.quote keeps each one
-        a single shell word.
+        Proxy values are loaded from a private temporary file for this command
+        only, and removed after completion. They never enter the pane input.
         """
         started = time.perf_counter()
         elapsed = lambda: round((time.perf_counter() - started) * 1000)
         attestation = None
         client = None
+        environment_file = None
         stop = threading.Event()
         try:
-            if not settings or not settings.get('host') or not settings.get('username') or not settings.get('password'):
+            if not settings or not settings.get('host') or not settings.get('username') or not (settings.get('password') or settings.get('private_key')):
                 raise ValueError('Kali VM execution is selected but the SSH host, username, or password is not configured')
             async with self._lock:
                 client = await asyncio.to_thread(self._connect, settings)
                 attestation = await asyncio.to_thread(self._attest, client, settings)
                 if not await asyncio.to_thread(_ensure_session, client):
                     raise RuntimeError('tmux is not installed in the VM; run: sudo apt install -y tmux')
+                # Clear inherited proxy variables for every run. Credentials live
+                # in a short-lived mode-600 file, never in the visible tmux input.
+                names = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')
+                command_to_run = 'env ' + ' '.join('-u ' + name for name in names) + ' ' + shlex.join(shlex.split(command))
                 if proxy_env:
-                    for key, value in sorted(proxy_env.items()):
-                        await asyncio.to_thread(_send_line, client, f'export {key}={shlex.quote(str(value))}')
+                    environment_file = '/tmp/rtcc-env-' + uuid.uuid4().hex
+                    def write_environment():
+                        with client.open_sftp() as sftp:
+                            with sftp.open(environment_file, 'wx') as stream:
+                                sftp.chmod(environment_file, 0o600)
+                                stream.write(''.join('export ' + key + '=' + shlex.quote(str(value)) + '\n' for key, value in proxy_env.items() if key in names))
+                    await asyncio.to_thread(write_environment)
+                    script = '. ' + shlex.quote(environment_file) + '; exec "$@"'
+                    command_to_run = 'env ' + ' '.join('-u ' + name for name in names) + ' sh -c ' + shlex.quote(script) + ' sh ' + shlex.join(shlex.split(command))
                 token = uuid.uuid4().hex[:12]
                 monitor = asyncio.create_task(
-                    asyncio.to_thread(_run_blocking, client, command, token, stop, execution_id))
+                    asyncio.to_thread(_run_blocking, client, command_to_run, token, stop, execution_id))
                 try:
-                    transcript, return_code, timed_out = await monitor
+                    transcript, return_code, timed_out = await asyncio.shield(monitor)
                 except asyncio.CancelledError:
                     # A client disconnect cancels this coroutine but cannot
                     # cancel the worker thread. Signal it to interrupt the
@@ -306,12 +350,14 @@ class SshExecutor:
                     stop.set()
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(self._interrupt_via_new_connection, settings)
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(asyncio.shield(monitor), CONNECT_TIMEOUT_SECONDS + CANCEL_GRACE_SECONDS + 2)
                     raise
             stderr = ''
             if timed_out:
                 stderr = (f'Execution timed out after {EXECUTION_TIMEOUT_SECONDS} seconds; '
                           'output below is partial. The command was interrupted with Ctrl-C in the VM.')
-            stdout = strip_ansi(_trim_transcript(transcript, token, command))
+            stdout = strip_ansi(_trim_transcript(transcript, token, command_to_run))
             return {
                 'tool': tool, 'command': command, 'stdout': stdout, 'stderr': stderr,
                 'return_code': return_code, 'duration_ms': elapsed(), 'execution_host': attestation,
@@ -326,10 +372,14 @@ class SshExecutor:
             # the client from here is safe because a cancelled run's thread is
             # on its way out and a finished run's thread is already done.
             stop.set()
+            if client is not None and environment_file:
+                def remove_environment():
+                    with client.open_sftp() as sftp:
+                        sftp.remove(environment_file)
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(remove_environment)
             if client is not None:
                 await asyncio.to_thread(_close_quietly, client)
-            if execution_id is not None:
-                live_registry.finish(execution_id)
 
     def _interrupt_via_new_connection(self, settings):
         with contextlib.suppress(Exception):
@@ -351,7 +401,7 @@ class SshExecutor:
             attestation = self._attest(client, settings)
             tmux_ok = _ensure_session(client)
             _, stdout, _ = client.exec_command(
-                'for t in ' + ' '.join(EXPECTED_TOOLS) + '; do printf \'%s=\' "$t"; command -v "$t" || echo MISSING; done')
+                'for t in ' + ' '.join(EXPECTED_TOOLS) + '; do printf \'%s=\' "$t"; command -v "$t" || echo MISSING; done', timeout=CONNECT_TIMEOUT_SECONDS)
             inventory = stdout.read().decode('utf-8', errors='ignore')
             stdout.channel.close()
         finally:

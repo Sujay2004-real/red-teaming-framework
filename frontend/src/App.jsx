@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import { useAssessment } from './lib/useAssessment'
+import { useExecution } from './lib/useExecution'
+import { useRecommendations } from './lib/useRecommendations'
+import ReportVersions from './components/ReportVersions'
+import ScopePolicy from './components/ScopePolicy'
 import {
-  API, EXECUTE_TIMEOUT_MS, HEALTH_POLL_MS, LIVE_POLL_MS,
+  API, HEALTH_POLL_MS,
   createRequest, fetchProtectedObjectUrl, getOperatorKey, loadStoredKey, setOperatorKey,
 } from './lib/api'
 import {
@@ -27,10 +32,14 @@ import AuditTrailPanel from './components/AuditTrailPanel'
 // server-confirmed state.
 function App() {
   const [targets, setTargets] = useState([]), [assessments, setAssessments] = useState([])
-  const [selected, setSelected] = useState(null), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
+  const [page, setPage] = useState('Assessments'), [tab, setTab] = useState('Overview')
+  const [rememberKey, setRememberKey] = useState(false)
+  const [catalogPage, setCatalogPage] = useState(0), [catalogTotal, setCatalogTotal] = useState(0)
+  const [reviewedPolicy, setReviewedPolicy] = useState({ max_executions: 100, max_rate: 30 })
   // Server plan lives on `selected`; `draftPlan` holds unsaved edits so the
   // progress gauges below can never describe a plan the backend has not seen.
-  const [draftPlan, setDraftPlan] = useState([])
+
   // The adaptive next-step proposals for the assessment in view: the last
   // /next-steps response (manual or automatic), and which of its candidates
   // the operator has ticked. Proposals are never a plan on their own — they
@@ -75,16 +84,16 @@ function App() {
   const backendUpRef = useRef(true)
   // The step whose approval request is mid-flight, so its own button says
   // "Running…" during a long command instead of looking disabled for no reason.
-  const [runningStep, setRunningStep] = useState(null)
+
   // Set when a popup blocker swallowed the report tab; a plain link needs no
   // user gesture, so the report stays one click away.
   const [reportUrl, setReportUrl] = useState('')
   // Live terminal: which execution is being streamed, and the output fetched
   // so far. The command's real output scrolls in as the scanner produces it.
-  const [liveExec, setLiveExec] = useState(null)
+
   // Elapsed seconds for the running command's status line, ticking locally
   // between polls so the terminal never looks frozen.
-  const [liveElapsed, setLiveElapsed] = useState(0)
+
 
   // The operator API key, entered once and remembered per browser. A 401 from
   // the backend raises the key prompt; until a valid key is saved, protected
@@ -99,16 +108,16 @@ function App() {
     [])
 
   const refresh = async () => {
-    const [t, a, s, c] = await Promise.all([request('/targets/'), request('/assessments/'), request('/settings'), request('/capabilities').catch(() => null)])
-    setTargets(t); setAssessments(a); setSettings(v => ({ ...v, ...s }))
+    const [t, a, s, c] = await Promise.all([request('/targets/'), request(`/catalog/assessments?offset=${catalogPage * 30}&limit=30`), request('/settings'), request('/capabilities').catch(() => null)])
+    setTargets(t); setAssessments(a.items); setCatalogTotal(a.total); setSettings(v => ({ ...v, ...s }))
     if (Array.isArray(c) && c.length) setCapabilities(c)
   }
-  const openAssessment = async id => {
-    try { const data = await request(`/assessments/${id}`); setSelected(data); setDraftPlan(data.plan || []) }
-    catch (e) { setNotice(e.message) }
-  }
+  const { selected, draftPlan, setDraftPlan, openAssessment, reloadAssessment, clearAssessment } = useAssessment(request, setNotice)
+  const { runningStep, liveExec, liveElapsed } = useExecution(selected, request,
+    async id => { await reloadAssessment(id); await refresh(); pushFeed('Execution finished; evidence and attempt history are available in Activity.') }, setNotice)
+  useRecommendations(selected?.id, request, batch => { setNextProposals(batch); setPickedCandidates(new Set()) })
   /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [apiKey])
+  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [apiKey, catalogPage])
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
   // Saving the key retries the whole refresh immediately, so the operator
@@ -117,35 +126,12 @@ function App() {
     e.preventDefault()
     const value = keyInput.trim()
     if (!value) return
-    setOperatorKey(value)
+    setOperatorKey(value, rememberKey)
     setApiKey(value)
     setKeyInput('')
     setKeyPrompt(false)
   }
   /* eslint-disable react-hooks/exhaustive-deps */
-  // Live terminal polling: while a step shows as still running in the audit
-  // trail, fetch its partial output every second and stop when the command
-  // finishes. Attaching by the audit row's execution id (rather than the
-  // execute response) means the terminal also works when a command was
-  // started before a page refresh.
-  useEffect(() => {
-    const running = selected?.executions?.find(e => !e.complete && e.step_index === runningStep)
-    if (runningStep === null || runningStep === undefined || !selected || !running) { return }
-    let cancelled = false
-    const tick = async () => {
-      try {
-        const snap = await request(`/assessments/${selected.id}/executions/${running.id}/live`)
-        if (cancelled || !snap.running) return
-        setLiveExec({ id: running.id, command: snap.command, output: snap.output, running: true })
-        setLiveElapsed(prev => prev + 1)
-      } catch { /* poll failures are silent; the execute request reports errors */ }
-    }
-    tick()
-    const interval = setInterval(tick, LIVE_POLL_MS)
-    return () => { cancelled = true; clearInterval(interval) }
-
-  }, [runningStep, selected?.id, selected?.executions?.length])
-
   // A dead backend turns every button into a silent no-op, so reachability is
   // polled on its own schedule and announced in a banner. Coming back online
   // triggers a refresh, because the UI's data is stale by the length of the
@@ -183,6 +169,7 @@ function App() {
     proxy_username: settings.proxy_username || '', proxy_password: settings.proxy_password || '',
     execution_mode: settings.execution_mode || 'local', ssh_host: settings.ssh_host || '',
     ssh_port: Math.min(65535, Math.max(1, Number(settings.ssh_port) || 22)),
+    ssh_fingerprint: settings.ssh_fingerprint || '', ssh_private_key: settings.ssh_private_key || '', ssh_key_passphrase: settings.ssh_key_passphrase || '',
     ssh_username: settings.ssh_username || '', ssh_password: settings.ssh_password || '',
   })
   const saveSettings = e => run('', async () => {
@@ -193,7 +180,7 @@ function App() {
     const clearedProxy = settings.proxy_configured && !settings.proxy_url
     const clearedVm = settings.ssh_password_configured && !settings.ssh_host
     await request('/settings', { method: 'PUT', body: settingsPayload() })
-    setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '', ssh_password: '' }))
+    setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '', ssh_password: '', ssh_private_key: '', ssh_key_passphrase: '' }))
     await refresh()
     setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : clearedVm ? 'Settings saved. Clearing the VM host also cleared its stored password.' : 'Settings saved. Secrets are masked after storage.')
   })
@@ -215,7 +202,7 @@ function App() {
       throw e
     }
   })
-  const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean), exploitation_authorized: !!target.exploitation_authorized }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70, exploitation_authorized: false }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
+  const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean), exploitation_authorized: !!target.exploitation_authorized, aggressive_lab: !!(target.exploitation_authorized && target.aggressive_lab) }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70, exploitation_authorized: false, aggressive_lab: false }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
   const createAssessment = e => run('planner', async () => { e.preventDefault(); let requirements = assessment.requirements; if (requirementFile) { const form = new FormData(); form.append('file', requirementFile); const data = await request('/requirements/extract', { method: 'POST', body: form }); requirements = data.text } const selectedTarget = targets.find(t => t.id === Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t => t.address === selectedTarget.scope_domain_ip); const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ ...assessment, target_id: Number(assessment.target_id), requirements, ...(briefApplies ? { engagement_brief: brief } : {}) }) }); setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null); await refresh(); await openAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source === 'ai-filtered' ? 'ok' : 'info'); const dropped = a.restricted_steps_dropped || 0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped > 1 ? 's' : ''} using tools the client's letter restricts for this target.` : '')) })
   // The second way in: the operator picks one or more registered targets
   // and writes the engagement as their own prompt. The prompt becomes the
@@ -242,33 +229,26 @@ function App() {
     setNotice(`Drafted ${picked.length} plan${picked.length !== 1 ? 's' : ''} from your prompt${totalDropped ? ` — ${totalDropped} step${totalDropped > 1 ? 's' : ''} using tools the client's letter restricts were removed` : ''}. Review the commands, then approve each one when you're ready.`)
   })
   const togglePromptTarget = id => setPromptTargetIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
-  const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan }) }); await openAssessment(id); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
+  const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan, plan_version: selected.plan_version }) }); await reloadAssessment(id); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
   // The assessment id is captured up front so switching assessments
-  // mid-request cannot write one assessment's results into another, and the
-  // timeout exceeds the executor's own 360 s cap so the server always decides
-  // how a command ends. runningStep lights the exact button that is
-  // mid-flight, so a long command reads as progress rather than a dead UI.
-  const execute = index => { setRunningStep(index); setLiveExec(null); setLiveElapsed(0); run('executor', async () => { const id = selected.id; const d = await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true }) }, EXECUTE_TIMEOUT_MS); const r = d.result || {}; pushFeed(r.return_code === 0 ? `Step ${index + 1} finished cleanly in ${r.duration_ms} ms.` : `Step ${index + 1} exited with code ${r.return_code} — you can re-approve it.`, r.return_code === 0 ? 'ok' : 'warn'); await openAssessment(id); await refresh(); pollRecommendations(id, d.execution_id) }).finally(() => setRunningStep(null)) }
-  // Level 2 of the recommendation loop: the backend proposes next steps
-  // after each finished command; this polls until that batch appears and
-  // shows it in the proposals panel. The batch is advice only — accepting
-  // anything still goes through Save plan and per-step approval.
-  const pollRecommendations = async (assessmentId, executionId) => {
-    for (let attempt = 0; attempt < 15; attempt++) {
-      let batch = null
-      try {
-        const feed = await request(`/assessments/${assessmentId}/recommendations`)
-        batch = (feed.recommendations || []).find(r => r.trigger_execution_id === executionId) || null
-      } catch { /* transient poll failure; the next attempt retries */ }
-      if (batch) {
-        setNextProposals(batch); setPickedCandidates(new Set())
-        pushFeed(`Proposed ${batch.candidates.length} next step${batch.candidates.length !== 1 ? 's' : ''} automatically after this command${batch.refused?.length ? ` — ${batch.refused.length} refused by the policy engine` : ''}. Nothing runs until you approve it.`, batch.candidates.length ? 'ok' : '')
-        return
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000))
-    }
-  }
-  const analyze = () => run('analyst', async () => { const id = selected.id; const d = await request(`/assessments/${id}/analyze`, { method: 'POST' }); await openAssessment(id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count || 0} finding${(d.findings_count || 0) !== 1 ? 's' : ''} (${d.analyzer} mode).`, 'ok'); const failed = d.failed_steps || []; const auto = d.auto_drafted; if (auto && auto.steps > 0) pushFeed(`Auto-drafted ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} from the findings — review and approve each one.`, 'ok'); if (auto && auto.note) pushFeed(`Next phase not drafted: ${auto.note}`, 'warn'); setNotice(failed.length ? `Analysis complete, but ${failed.length > 1 ? 'steps' : 'step'} ${failed.map(i => i + 1).join(', ')} failed to run — findings may be incomplete.` : (auto && auto.steps > 0 ? `Analysis complete (${d.analyzer}). ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} drafted from the findings — review them below.` : `Analysis complete (${d.analyzer}).`)) })
+  // mid-request cannot write one assessment's results into another. The command
+  // is queued in the background (the request returns as soon as the job is
+  // accepted), and the live terminal reconnects to its output after the reload.
+  // runningStep lights the exact button that is mid-flight, so a long command
+  // reads as progress rather than a dead UI.
+  const execute = index => run('executor', async () => {
+    const id = selected.id
+    await request(`/assessments/${id}/execute`, { method: 'POST', body: JSON.stringify({ step_index: index, approved: true, background: true, plan_version: selected.plan_version }) })
+    await reloadAssessment(id)
+    pushFeed(`Step ${index + 1} queued. You can reconnect to its output after a reload.`)
+  })
+  const cancelExecution = () => run('executor', async () => {
+    const active = selected.executions.find(e => !e.complete)
+    if (!active) return
+    await request(`/assessments/${selected.id}/executions/${active.id}/cancel`, { method: 'POST' })
+    setNotice('Cancellation requested. Waiting for the worker to stop the command.')
+  })
+  const analyze = () => run('analyst', async () => { const id = selected.id; const d = await request(`/assessments/${id}/analyze`, { method: 'POST' }); await reloadAssessment(id); await refresh(); pushFeed(`Correlated the outputs into ${d.findings_count || 0} finding${(d.findings_count || 0) !== 1 ? 's' : ''} (${d.analyzer} mode).`, 'ok'); const failed = d.failed_steps || []; const auto = d.auto_drafted; if (auto && auto.steps > 0) pushFeed(`Auto-drafted ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} from the findings — review and approve each one.`, 'ok'); if (auto && auto.note) pushFeed(`Next phase not drafted: ${auto.note}`, 'warn'); setNotice(failed.length ? `Analysis complete, but ${failed.length > 1 ? 'steps' : 'step'} ${failed.map(i => i + 1).join(', ')} failed to run — findings may be incomplete.` : (auto && auto.steps > 0 ? `Analysis complete (${d.analyzer}). ${auto.steps} ${PHASE_LABEL(auto.phase).toLowerCase()} step${auto.steps !== 1 ? 's' : ''} drafted from the findings — review them below.` : `Analysis complete (${d.analyzer}).`)) })
   // The report is downloaded through a key-authenticated blob fetch: the
   // plain /reports/{id} URL now requires the X-API-Key header, which a
   // browser tab link cannot send.
@@ -281,7 +261,7 @@ function App() {
     // blockers swallow it silently; a plain link needs no gesture, so the
     // report stays one click away instead of looking like a dead button.
     setReportUrl(opened ? '' : url)
-    await openAssessment(id); await refresh()
+    await reloadAssessment(id); await refresh()
     pushFeed(opened ? 'Report written and opened in a new tab — it cites the engagement brief and every command.' : 'Report written — your browser blocked the automatic tab; open it from the link below.', 'ok')
   })
   const downloadReport = () => run('reporter', async () => {
@@ -308,6 +288,7 @@ function App() {
         criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
         restricted_tools: t.restricted_tools || [],
         exploitation_authorized: !!t.exploitation_authorized,
+        engagement_policy: reviewedPolicy,
       })
     })
     await refresh()
@@ -346,6 +327,7 @@ function App() {
           criticality: Number.isFinite(t.criticality) ? t.criticality : 70,
           restricted_tools: t.restricted_tools || [],
           exploitation_authorized: !!t.exploitation_authorized,
+        engagement_policy: reviewedPolicy,
         })
       })
       if (!existing) registered++
@@ -387,9 +369,7 @@ function App() {
   // plan-update endpoint enforces, and the reason a proposal can be accepted
   // in a phase that is already under way. Any change to the frozen prefix is
   // refused here and refused again by the backend.
-  const executedPrefixIntact = !!selected && draftPlan.length >= (selected.plan?.length || 0)
-    && samePlan(draftPlan.slice(0, selected.plan?.length || 0), selected.plan)
-  const planEditable = !planLocked || executedPrefixIntact
+  const planEditable = !selected?.executions?.some(e => { const old = selected.plan?.[e.step_index], next = draftPlan[e.step_index]; return !next || ['tool', 'command', 'phase', 'enabled'].some(k => old?.[k] !== next?.[k]) })
   const planDirty = !!selected && !samePlan(draftPlan, selected.plan)
   const selectedTarget = useMemo(() => targets.find(t => t.id === selected?.target_id), [targets, selected])
   const canAnalyze = !!selected && !planDirty && phaseSteps.length > 0 && phaseCompleted.length === phaseSteps.length
@@ -419,7 +399,7 @@ function App() {
         captionText = selected ? (analyzed.has('recon') ? 'Recon executed and analyzed' : `${phaseDone('recon') ? 'All' : 'Some'} recon steps executed${analyzed.has('recon') ? '' : ' — analysis pending'}`) : caption
       } else if (key === 'vuln_analysis') {
         done = analyzed.has('recon') && (current !== 'vuln_analysis' || !!selected)
-        captionText = analyzed.has('recon') ? `${selected?.findings?.length || 0} correlated findings` : 'Analyze the recon output to complete this phase'
+        captionText = analyzed.has('recon') ? `${selected?.finding_count || 0} correlated findings` : 'Analyze the recon output to complete this phase'
       } else if (key === 'exploitation') {
         done = analyzed.has('exploitation')
         captionText = done ? 'Findings verified with controlled exploits' : phaseCount('exploitation') ? `${phaseCount('exploitation')} verification steps planned` : selectedTarget?.exploitation_authorized ? 'Ready to draft verification steps from the findings' : 'Letter does not authorize exploitation for this target'
@@ -448,7 +428,7 @@ function App() {
   const draftPhase = phase => run('planner', async () => {
     const id = selected.id
     const d = await request(`/assessments/${id}/phases/${phase}/plan`, { method: 'POST' })
-    await openAssessment(id)
+    await reloadAssessment(id)
     await refresh()
     pushFeed(`Drafted ${d.drafted_steps} ${PHASE_LABEL(phase)} steps for assessment #${id}. Nothing runs until you approve it.`, 'ok')
     setNotice(`Drafted ${d.drafted_steps} ${PHASE_LABEL(phase)} step${d.drafted_steps !== 1 ? 's' : ''} from the analysis — review each one, then approve it when you're ready.`)
@@ -480,7 +460,7 @@ function App() {
   // Everything below is view state for the run being inspected: clearing the
   // workspace or one assessment must drop it all, or the panels would keep
   // describing an assessment the backend no longer has.
-  const forgetAssessment = () => { setSelected(null); setDraftPlan([]); setReportUrl(''); setLiveExec(null); setRunningStep(null); setNextProposals(null); setPickedCandidates(new Set()) }
+  const forgetAssessment = () => { clearAssessment(); setReportUrl(''); setNextProposals(null); setPickedCandidates(new Set()) }
   const deleteAssessment = id => {
     if (!window.confirm(`Delete assessment #${id} with its executions, findings and report? This cannot be undone.`)) return
     run('', async () => {
@@ -514,7 +494,7 @@ function App() {
   // lifecycle (`activeAgent`); `done` reads saved state only, so a card never
   // claims an agent finished work the backend has not recorded.
   const crew = useMemo(() => {
-    const findings = selected?.findings?.length || 0
+    const findings = selected?.finding_count || 0
     const planned = !!selected && (selected.plan || []).length > 0
     const current = selected?.current_phase || 'recon'
     const analyzed = new Set(selected?.analyzed_phases || [])
@@ -529,78 +509,56 @@ function App() {
     ]
   }, [brief, briefFilename, targets, selected, completedSteps, enabledSteps])
 
+  useEffect(() => {
+    if (!planDirty) return
+    const warn = event => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [planDirty])
+  const lock = () => { setOperatorKey(''); setApiKey(''); setKeyInput(''); setKeyPrompt(true); forgetAssessment(); setTargets([]); setAssessments([]); setSettings({}); setFeed([]) }
+  const navigateAssessment = id => {
+    if (planDirty && !window.confirm('Discard unsaved plan edits?')) return
+    setNextProposals(null); setPickedCandidates(new Set()); setReportUrl(''); setTab('Overview'); openAssessment(id)
+  }
   const app = { request, run, pushFeed, busy, activeAgent, agentBusy, notice, setNotice }
 
+  if (keyPrompt) return <ApiKeyGate keyInput={keyInput} setKeyInput={setKeyInput} onSave={saveApiKey} remember={rememberKey} setRemember={setRememberKey} />
   if (loading) return <main className="loading-screen"><div className="loading-mark" /><p>Loading control center...</p></main>
 
   return <AppContext.Provider value={app}>
     <main>
       {busy && <div className="busy-bar" aria-hidden="true" />}
       {!backendUp && <div className="offline-banner">⚠ Cannot reach the backend at <code>{API}</code> — buttons will not respond until the stack is running again.</div>}
-      {keyPrompt && <ApiKeyGate keyInput={keyInput} setKeyInput={setKeyInput} onSave={saveApiKey} />}
-      <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="health"><i /> Lab environment</div></header>
-      {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>×</button></div>}
+      <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="header-actions"><span className="health"><i /> Authorized workspace</span><button className="secondary compact" onClick={lock}>Lock workspace</button></div></header>
+      {notice && <div className="notice" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}
       <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a => a.status === 'reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>Configured analyzer</span></div></section>
 
-      <div className="workspace">
+      <nav className="workspace-nav" aria-label="Workspace">{['Assessments', 'Targets', 'Settings'].map(name => <button key={name} aria-current={page === name ? 'page' : undefined} className={page === name ? 'active' : 'secondary'} onClick={() => setPage(name)}>{name}</button>)}</nav>
+      {page === 'Settings' && <div className="settings-layout"><ConfigurationPanel settings={settings} setSettings={setSettings} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} /></div>}
+      {page === 'Targets' && <div className="settings-layout"><TargetPanel target={target} setTarget={setTarget} onAdd={addTarget} />{targets.map(t => <section className="panel" key={t.id}><h2>{t.name}</h2><code>{t.scope_domain_ip}</code><p>Authorized scopes: {t.authorized_scopes.join(', ')}</p><ScopePolicy value={t.engagement_policy || {}} readOnly /></section>)}</div>}
+      {page === 'Assessments' && <div className="workspace">
         <aside>
-          <ConfigurationPanel settings={settings} setSettings={setSettings} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} />
-          <TargetPanel target={target} setTarget={setTarget} onAdd={addTarget} />
-          <NewAssessmentPanel
-            targets={targets} brief={brief} briefFilename={briefFilename}
-            mode={assessmentMode} setMode={setAssessmentMode}
-            assessment={assessment} setAssessment={setAssessment}
-            setRequirementFile={setRequirementFile}
-            promptTargetIds={promptTargetIds} togglePromptTarget={togglePromptTarget}
-            promptText={promptText} setPromptText={setPromptText}
-            onCreateFromLetter={createAssessment} onCreateFromPrompt={createFromPrompt}
-          />
+          <NewAssessmentPanel targets={targets} brief={brief} briefFilename={briefFilename} mode={assessmentMode} setMode={setAssessmentMode} assessment={assessment} setAssessment={setAssessment} setRequirementFile={setRequirementFile} promptTargetIds={promptTargetIds} togglePromptTarget={togglePromptTarget} promptText={promptText} setPromptText={setPromptText} onCreateFromLetter={createAssessment} onCreateFromPrompt={createFromPrompt} />
+          <AssessmentsPanel assessments={assessments} targets={targets} selected={selected} onOpen={navigateAssessment} onDelete={deleteAssessment} onReset={resetWorkspace} />
+          <div className="pagination"><button className="secondary" disabled={!catalogPage} onClick={() => setCatalogPage(p => p - 1)}>Previous</button><span>{catalogPage + 1} / {Math.max(1, Math.ceil(catalogTotal / 30))}</span><button className="secondary" disabled={(catalogPage + 1) * 30 >= catalogTotal} onClick={() => setCatalogPage(p => p + 1)}>Next</button></div>
         </aside>
-
         <section className="main-column">
-          <LetterPanel
-            brief={brief} briefFilename={briefFilename} targets={targets}
-            onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }}
-            onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={setupFromBrief}
-          />
-          <CrewPanel crew={crew} activeAgent={activeAgent} feed={feed} onClearFeed={() => setFeed([])} />
-          <PhasePipeline
-            selected={selected} selectedTarget={selectedTarget} phases={phases}
-            nextDraftable={nextDraftable} currentPhase={currentPhase}
-            nextProposals={nextProposals} pickedCandidates={pickedCandidates}
-            setPickedCandidates={setPickedCandidates} planEditable={planEditable}
-            onDraftPhase={draftPhase} onPropose={proposeNextSteps}
-            onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }}
-            onAddPicked={addPickedCandidates}
-          />
-          <AssessmentsPanel
-            assessments={assessments} targets={targets} selected={selected}
-            onOpen={id => { setReportUrl(''); openAssessment(id) }}
-            onDelete={deleteAssessment} onReset={resetWorkspace}
-          />
-
+          {!selected && <section className="panel onboarding"><span className="eyebrow">START AN ASSESSMENT</span><h2>Define the scope. Review the plan. Run with approval.</h2><p>Import a client letter below, review its rules, and create an assessment. You can also register a target in Targets and write an objective.</p></section>}
+          {(!selected || tab === 'Overview') && <><LetterPanel brief={brief} briefFilename={briefFilename} targets={targets} onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }} onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={setupFromBrief} />{brief && <section className="panel"><h2>Review enforceable engagement rules</h2><p>Translate the letter?s exclusions and dates into these fields before registering targets. Prose restrictions still require your review.</p><ScopePolicy value={reviewedPolicy} onChange={setReviewedPolicy} /></section>}</>}
           {selected && <>
-            <PlanEditor
-              selected={selected} selectedTarget={selectedTarget}
-              draftPlan={draftPlan} setDraftPlan={setDraftPlan}
-              executionByStep={executionByStep} runningStep={runningStep}
-              liveExec={liveExec} liveElapsed={liveElapsed}
-              planLocked={planLocked} planEditable={planEditable} planDirty={planDirty}
-              capabilities={capabilities} toolNames={toolNames}
-              onSave={savePlan} onExecute={execute}
-            />
-            <AnalysisPanel
-              selected={selected} currentPhase={currentPhase}
-              phaseSteps={phaseSteps} phaseCompleted={phaseCompleted}
-              planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport}
-              reportUrl={reportUrl} onAnalyze={analyze} onReport={report}
-              onDownloadReport={downloadReport}
-            />
-            <FindingsPanel findings={selected.findings} />
-            <AuditTrailPanel executions={selected.executions} />
+            <div className="assessment-heading"><div><span className="eyebrow">ASSESSMENT #{selected.id} ? PLAN v{selected.plan_version}</span><h2>{selectedTarget?.name}</h2><p>{selected.objective}</p></div><span className="tag">{selected.status.replaceAll('_', ' ')}</span></div>
+            <nav className="assessment-tabs" aria-label="Assessment sections">{['Overview', 'Plan', 'Findings', 'Activity', 'Report'].map(name => <button key={name} aria-current={tab === name ? 'page' : undefined} className={tab === name ? 'active' : 'secondary'} onClick={() => setTab(name)}>{name}{name === 'Findings' ? ` (${selected.finding_count || 0})` : ''}</button>)}</nav>
+            {planDirty && <div className="notice" role="status">Unsaved plan changes <button className="secondary compact" onClick={savePlan} disabled={busy || !planEditable}>Save plan</button></div>}
+            {runningStep !== null && <div className="run-banner" role="status">Step {runningStep + 1} {liveExec?.state || 'queued'} ? {liveElapsed}s <button className="secondary compact" onClick={() => setTab('Plan')}>View output</button><button className="danger compact" onClick={cancelExecution}>Cancel execution</button></div>}
+            {tab === 'Overview' && <PhasePipeline selected={selected} selectedTarget={selectedTarget} phases={phases} nextDraftable={nextDraftable} currentPhase={currentPhase} nextProposals={nextProposals} pickedCandidates={pickedCandidates} setPickedCandidates={setPickedCandidates} planEditable={planEditable} onDraftPhase={draftPhase} onPropose={proposeNextSteps} onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }} onAddPicked={addPickedCandidates} />}
+            {tab === 'Plan' && <PlanEditor selected={selected} selectedTarget={selectedTarget} draftPlan={draftPlan} setDraftPlan={setDraftPlan} executionByStep={executionByStep} runningStep={runningStep} liveExec={liveExec} liveElapsed={liveElapsed} planLocked={planLocked} planEditable={planEditable} planDirty={planDirty} capabilities={capabilities} toolNames={toolNames} onSave={savePlan} onExecute={execute} />}
+            {(tab === 'Overview' || tab === 'Report') && <AnalysisPanel selected={selected} currentPhase={currentPhase} phaseSteps={phaseSteps} phaseCompleted={phaseCompleted} planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport} reportUrl={reportUrl} onAnalyze={analyze} onReport={report} onDownloadReport={downloadReport} />}
+            {tab === 'Findings' && <FindingsPanel key={selected.id} assessment={selected} assessments={assessments} />}
+            {tab === 'Activity' && <><CrewPanel crew={crew} activeAgent={activeAgent} feed={feed} onClearFeed={() => setFeed([])} /><AuditTrailPanel assessmentId={selected.id} executions={selected.executions} /></>}
+            {tab === 'Report' && <ReportVersions assessmentId={selected.id} status={selected.status} />}
           </>}
         </section>
-      </div>
+      </div>}
       <footer>For authorized laboratory environments only · Human approval required before every command</footer>
     </main>
   </AppContext.Provider>

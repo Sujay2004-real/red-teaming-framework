@@ -105,7 +105,7 @@ def test_unrestricted_target_still_accepts_nuclei(client):
         'target_id': target['id'],
         'objective': 'Full pre-release assessment',
         'plan': [
-            {'tool': 'nuclei', 'command': 'nuclei -u http://juice-shop:3000'},
+            {'tool': 'nuclei', 'command': 'nuclei -u http://juice-shop:3000 -dr'},
         ],
     }).json()
     result = {'stdout': '', 'stderr': '', 'return_code': 0, 'duration_ms': 5}

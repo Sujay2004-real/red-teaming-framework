@@ -72,7 +72,7 @@ class FakeVm:
         self.captures_at_command = 0
         self.interrupts = 0
 
-    def exec_command(self, command):
+    def exec_command(self, command, **kwargs):
         if 'capture-pane' in command:
             self.captures += 1
             return None, FakeStdout(self.pane_text()), None
@@ -225,7 +225,7 @@ def test_execute_command_success_types_streams_and_attests(monkeypatch, fast_pol
     # One combined line typed into the pane: the command and, in the same
     # line, the exit marker that captures $? the instant the tool finishes.
     assert len(vm.typed) == 1
-    assert vm.typed[0].startswith('curl -sSI http://192.168.56.10; echo "__RT_EXIT_')
+    assert 'curl -sSI http://192.168.56.10; echo "__RT_EXIT_' in vm.typed[0]
     assert vm.typed[0].endswith('__:$?"')
     assert result['return_code'] == 0
     assert result['stdout'] == 'HTTP/1.1 200 OK\nServer: nginx'
@@ -258,6 +258,18 @@ def test_execution_streams_to_live_registry(monkeypatch, fast_polling):
     assert 'HTTP/1.1 200 OK' in streamed_text and 'Server: nginx' in streamed_text
 
 
+def test_vm_command_keeps_shell_metacharacters_literal(monkeypatch, fast_polling):
+    vm = FakeVm(['HTTP/1.1 200 OK'], exit_code=0)
+    executor = make_executor(monkeypatch, vm)
+    command = 'curl --data $(id) http://allowed.example/search?a=1&b=2'
+    result = run(executor.execute_command('curl', command, settings=SETTINGS))
+    typed_command = vm.typed[0].split('; echo ', 1)[0]
+    assert "'$(id)'" in typed_command
+    assert "'http://allowed.example/search?a=1&b=2'" in typed_command
+    assert shlex.split(typed_command)[17:] == shlex.split(command)
+    assert result['return_code'] == 0
+
+
 def test_combined_marker_line_captures_real_exit_code(monkeypatch, fast_polling):
     """Regression: the marker must ride the same input line as the command.
 
@@ -272,7 +284,7 @@ def test_combined_marker_line_captures_real_exit_code(monkeypatch, fast_polling)
         'curl', 'curl -sSI http://192.168.56.10', settings=SETTINGS))
     assert result['return_code'] == 0
     assert len(vm.typed) == 1
-    assert vm.typed[0].startswith('curl -sSI http://192.168.56.10; echo "__RT_EXIT_')
+    assert 'curl -sSI http://192.168.56.10; echo "__RT_EXIT_' in vm.typed[0]
 
 
 def test_execute_command_propagates_nonzero_exit(monkeypatch, fast_polling):
@@ -313,17 +325,28 @@ def test_execute_command_without_tmux_reports_install_hint(monkeypatch, fast_pol
     assert 'apt install -y tmux' in result['stderr']
 
 
-def test_proxy_environment_is_typed_before_command(monkeypatch, fast_polling):
+def test_proxy_environment_is_private_and_removed(monkeypatch, fast_polling):
+    from contextlib import contextmanager
     vm = FakeVm(['HTTP/1.1 200 OK'], exit_code=0)
+    events = []
+    class Files:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def open(self, path, mode):
+            events.append(('open', path, mode))
+            return self
+        def chmod(self, path, mode): events.append(('chmod', path, mode))
+        def write(self, text): events.append(('write', text))
+        def remove(self, path): events.append(('remove', path))
+    vm.open_sftp = Files
     executor = make_executor(monkeypatch, vm)
-    run(executor.execute_command(
-        'curl', 'curl -sSI http://192.168.56.10',
-        proxy_env={'HTTP_PROXY': 'http://proxy:8080'}, settings=SETTINGS))
-    assert vm.typed[0] == 'export HTTP_PROXY=http://proxy:8080'
-    # The export line lands before the combined command+marker line, so
-    # trimming must still start after the command itself, not after the
-    # export.
-    assert vm.typed[1].startswith('curl -sSI http://192.168.56.10; echo "__RT_EXIT_')
+    result = run(executor.execute_command('curl', 'curl -I http://192.168.56.10',
+        proxy_env={'HTTP_PROXY': 'http://user:secret@proxy:8080'}, settings=SETTINGS))
+    assert result['return_code'] == 0
+    assert len(vm.typed) == 1 and 'secret' not in vm.typed[0]
+    assert vm.typed[0].startswith('env -u HTTP_PROXY')
+    assert events[1][0] == 'chmod' and events[1][2] == 0o600
+    assert 'secret' in events[2][1] and events[-1][0] == 'remove'
 
 
 def test_pane_usage_is_serialized(monkeypatch, fast_polling):
@@ -346,7 +369,7 @@ def test_pane_usage_is_serialized(monkeypatch, fast_polling):
     assert first['return_code'] == 0 and second['return_code'] == 0
     typed = [line for line in vm.typed if not line.startswith('echo ')
              and not line.split('; echo ')[0].startswith('echo ')]
-    assert [line.split('; echo ')[0] for line in typed] == [
+    assert [shlex.join(shlex.split(line.split('; echo ')[0])[17:]) for line in typed] == [
         'curl -sSI http://192.168.56.10', 'dig +short 192.168.56.10']
 
 

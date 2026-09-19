@@ -23,7 +23,7 @@ PROVIDER = {'api_key': 'test-key', 'base_url': 'https://provider.example/v1', 'm
 
 def test_partial_provider_configuration_never_calls_out():
     """A key with no endpoint or model must not reach any provider."""
-    with patch('requests.post') as post:
+    with patch('modules.analyzer.requests.post') as post:
         findings, mode = AnalyzerAgent().analyze_results(
             RAW_OUTPUTS,
             api_key='test-key',
@@ -55,7 +55,7 @@ def test_openai_compatible_analysis_uses_configured_provider():
         }]) + '\n```'}}],
     }
 
-    with patch('requests.post', return_value=response) as post:
+    with patch('modules.analyzer.requests.post', return_value=response) as post:
         findings, mode = AnalyzerAgent().analyze_results(
             RAW_OUTPUTS,
             api_key='test-key',
@@ -66,14 +66,15 @@ def test_openai_compatible_analysis_uses_configured_provider():
 
     assert mode == 'ai-provider'
     assert findings[0]['title'] == 'Exposed http service on port 80'
-    assert findings[0]['confidence_score'] == 90
+    assert any(f['confidence_score'] == 90 for f in findings)
+    assert all(any(f['fingerprint'] == expected['fingerprint'] for f in findings) for expected in AnalyzerAgent().analyze_results(RAW_OUTPUTS))
     post.assert_called_once()
     assert post.call_args.args[0] == 'https://provider.example/v1/chat/completions'
     assert post.call_args.kwargs['json']['model'] == 'test-model'
 
 
 def test_provider_failure_uses_deterministic_fallback():
-    with patch('requests.post', side_effect=requests.RequestException('provider unavailable')):
+    with patch('modules.analyzer.requests.post', side_effect=requests.RequestException('provider unavailable')):
         findings, mode = AnalyzerAgent().analyze_results(
             RAW_OUTPUTS,
             **PROVIDER,
@@ -91,7 +92,7 @@ def test_invalid_provider_payload_uses_deterministic_fallback():
         'choices': [{'message': {'content': '{"not": "a list"}'}}],
     }
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.analyzer.requests.post', return_value=response):
         findings, mode = AnalyzerAgent().analyze_results(
             RAW_OUTPUTS,
             **PROVIDER,
@@ -134,14 +135,14 @@ def test_invalid_model_scores_are_normalized_safely():
 ])
 def test_asset_criticality_falls_back_to_the_target(reported, expected):
     agent = AnalyzerAgent()
-    item = {'title': 'Model finding', 'severity': 'Medium'}
+    item = {'title': 'Model finding', 'severity': 'Medium', 'evidence': '80/tcp open http', 'source_tools': ['nmap']}
     if reported is not None:
         item['asset_criticality'] = reported
 
     with patch.object(agent, '_ai_findings', return_value=[item]):
         findings = agent.analyze_results(RAW_OUTPUTS, **PROVIDER, asset_criticality=100)
 
-    assert findings[0]['asset_criticality'] == expected
+    assert next(f for f in findings if f['title'] == 'Model finding')['asset_criticality'] == expected
 
 
 def test_asset_criticality_falls_back_to_the_global_default_without_a_target():
@@ -157,11 +158,11 @@ def test_a_runaway_provider_response_is_bounded():
     response = Mock()
     response.raise_for_status.return_value = None
     response.json.return_value = {'choices': [{'message': {'content': json.dumps([
-        {'title': f'Finding {index}', 'description': 'x' * (MAX_FINDING_TEXT_CHARS + 5_000)}
+        {'title': f'Finding {index}', 'severity': 'Low', 'evidence': '80/tcp open http', 'source_tools': ['nmap'], 'description': 'x' * (MAX_FINDING_TEXT_CHARS + 5_000)}
         for index in range(MAX_FINDINGS + 50)
     ])}}]}
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.analyzer.requests.post', return_value=response):
         findings, mode = AnalyzerAgent().analyze_results(
             RAW_OUTPUTS,
             **PROVIDER,
@@ -170,7 +171,7 @@ def test_a_runaway_provider_response_is_bounded():
 
     assert mode == 'ai-provider'
     assert len(findings) == MAX_FINDINGS
-    assert all(len(finding['description']) == MAX_FINDING_TEXT_CHARS for finding in findings)
+    assert all(len(finding['description']) == MAX_FINDING_TEXT_CHARS for finding in findings if finding['title'].startswith('Finding '))
 
 
 def test_one_chatty_scanner_cannot_crowd_out_the_prompt_budget():
@@ -179,7 +180,7 @@ def test_one_chatty_scanner_cannot_crowd_out_the_prompt_budget():
     response.json.return_value = {'choices': [{'message': {'content': '[]'}}]}
     outputs = [{'tool': f'tool{index}', 'stdout': 'x' * 200_000, 'stderr': ''} for index in range(10)]
 
-    with patch('requests.post', return_value=response) as post:
+    with patch('modules.analyzer.requests.post', return_value=response) as post:
         AnalyzerAgent().analyze_results(outputs, **PROVIDER)
 
     prompt = post.call_args.kwargs['json']['messages'][0]['content']

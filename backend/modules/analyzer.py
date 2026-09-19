@@ -1,7 +1,8 @@
 import hashlib
 import json
 import re
-import requests
+from modules.provider import transport as requests
+from modules.verification import command_endpoint, confirmation_match, match_verification
 
 SEVERITY = {'Low': 25, 'Medium': 50, 'High': 75, 'Critical': 100}
 SEVERITY_RANK = {'Low': 1, 'Medium': 2, 'High': 3, 'Critical': 4}
@@ -54,49 +55,6 @@ def score_finding(finding):
 def fingerprint(finding):
     material = '|'.join(str(finding.get(k, '')).lower().strip() for k in ('title', 'endpoint', 'parameter'))
     return hashlib.sha256(material.encode()).hexdigest()[:24]
-
-
-def match_verification(recon_findings, exploitation_findings):
-    """Link exploitation findings to the recon findings they verify.
-
-    Returns a list of (recon_finding, exploitation_finding, evidence) tuples.
-    A match is made when both findings name the same endpoint URL or the same
-    host:port (recon nmap endpoints carry 'host:port/tcp', curl and sqlmap
-    carry full URLs), or when the exploitation finding's parameter equals the
-    recon finding's parameter. The match is deliberately loose on the recon
-    side: the point is to upgrade a scanner's signature claim to
-    'exploitation-verified', and a false link only ever strengthens one
-    finding's evidence attribution, never a command.
-    """
-    def keys(finding):
-        found = set()
-        endpoint = (finding.get('endpoint') or '').strip()
-        if endpoint:
-            found.add(endpoint)
-            # 'host:port/tcp' and 'http://host:port' are the same target.
-            bare = re.sub(r'^[a-z]+://', '', endpoint)
-            bare = bare.split('/tcp')[0].split('/udp')[0].split('/')[0]
-            if bare:
-                found.add(bare.lower())
-        parameter = (finding.get('parameter') or '').strip().lower()
-        if parameter:
-            found.add('param:' + parameter)
-        return found
-
-    links = []
-    for recon in recon_findings:
-        recon_keys = keys(recon)
-        if not recon_keys:
-            continue
-        for exploit in exploitation_findings:
-            exploit_keys = keys(exploit)
-            if not exploit_keys:
-                continue
-            overlap = recon_keys & exploit_keys
-            if overlap:
-                evidence = (exploit.get('evidence') or '').strip()
-                links.append((recon, exploit, evidence))
-    return links
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +508,6 @@ class AnalyzerAgent:
     #   [CRITICAL] GET parameter 'email' is vulnerable
     # with the back-end banner on its own line:
     #   back-end DBMS: SQLite
-    SQLMAP_PARAM_RE = re.compile(
-        r"[\'\"]?(?P<param>\w+)[\'\"]?\s+is\s+(?:[\'\"](?P<technique>[^\'\"]+)[\'\"]|vulnerable)", re.IGNORECASE)
     SQLMAP_DBMS_RE = re.compile(r'back-end DBMS:\s*(?P<dbms>.+)$', re.IGNORECASE)
 
     @staticmethod
@@ -559,15 +515,13 @@ class AnalyzerAgent:
         findings = []
         for line in stdout.splitlines():
             stripped = line.strip()
-            match = AnalyzerAgent.SQLMAP_PARAM_RE.search(stripped)
+            match = confirmation_match(stripped)
             if not match:
                 continue
             param, technique = match.group('param'), match.group('technique')
-            confirmed = 'vulnerable' in stripped.lower()
             dbms = next((m.group('dbms').strip() for l in stdout.splitlines()
                          if (m := AnalyzerAgent.SQLMAP_DBMS_RE.search(l))), '')
-            title = (f"SQL injection confirmed in parameter '{param}'"
-                     if confirmed else f"Parameter '{param}' reported injectable by sqlmap")
+            title = f"SQL injection confirmed in parameter '{param}'"
             findings.append({
                 'title': title,
                 'description': (f'sqlmap verified that the parameter {param} is injectable'
@@ -584,7 +538,8 @@ class AnalyzerAgent:
                                 'leaks no schema information.'),
                 'endpoint': '',
                 'parameter': param,
-                'confidence_score': 95 if confirmed else 75,
+                'verification_outcome': 'confirmed',
+                'confidence_score': 95,
                 'source_tools': [source_tool],
                 'exploitability': 5, 'impact': 5, 'exposure': 4,
             })
@@ -747,8 +702,26 @@ class AnalyzerAgent:
             if not parser:
                 continue
             combined = strip_ansi(f"{output.get('stdout','')}\n{output.get('stderr','')}")
-            findings.extend(parser(combined, output.get('tool')))
+            parsed = parser(combined, output.get('tool'))
+            if tool == 'sqlmap':
+                endpoint = command_endpoint(tool, output.get('command'))
+                for finding in parsed:
+                    finding['endpoint'] = endpoint
+                    if 'return_code' in output and output['return_code'] != 0:
+                        finding.pop('verification_outcome', None)
+                        finding['title'] = f"SQL injection reported in parameter '{finding['parameter']}' (incomplete execution)"
+                        finding['description'] = 'The scanner printed an injection result but did not finish successfully. Review the partial evidence and rerun before treating it as verified.'
+                        finding['confidence_score'] = 60
+            findings.extend(parsed)
         return findings[:MAX_FINDINGS]
+
+    def confirmed_verifications(self, raw_outputs):
+        # Never trust an AI-provided verification flag or a nonempty evidence
+        # string. Derive confirmations independently from successful runs.
+        successful = [output for output in raw_outputs
+                      if output.get('tool') == 'sqlmap' and output.get('return_code') == 0]
+        return [finding for finding in self._fallback(successful)
+                if finding.get('verification_outcome') == 'confirmed' and finding.get('endpoint')]
 
     def _ai_findings(self, raw_outputs, api_key, base_url, model_name):
         bounded_outputs = []
@@ -844,19 +817,38 @@ class AnalyzerAgent:
 
     def analyze_results(self, raw_outputs, api_key='', base_url='', model_name='', include_metadata=False, asset_criticality=None):
         mode = 'deterministic-fallback'
+        deterministic = self._fallback(raw_outputs)
         # All three are required: there is no default endpoint or model, so a
         # partial configuration analyses locally instead of guessing a provider.
         if api_key and base_url and model_name and raw_outputs:
             try:
-                findings = self._ai_findings(raw_outputs, api_key, base_url, model_name)
+                proposed = self._ai_findings(raw_outputs, api_key, base_url, model_name)
+                # AI may add only findings with literal evidence and a real source.
+                findings = []
+                for item in proposed:
+                    evidence = item.get('evidence')
+                    sources = item.get('source_tools')
+                    if (not isinstance(evidence, str) or not evidence.strip() or not isinstance(sources, list)
+                        or not all(isinstance(t, str) for t in sources)
+                        or item.get('severity') not in {'Low', 'Medium', 'High', 'Critical'}
+                        or not isinstance(item.get('title'), str)):
+                        continue
+                    matching = [o for o in raw_outputs if o.get('tool') in sources]
+                    if not matching or not any(evidence in (o.get('stdout', '') + '\n' + o.get('stderr', '')) for o in matching):
+                        continue
+                    safe = {k: v[:20000] if isinstance(v, str) else v for k, v in item.items()
+                            if k not in {'verification', 'verification_outcome', 'verified_by', 'exploit_evidence'}}
+                    if any(not isinstance(safe.get(k, ''), str) for k in ('description', 'remediation', 'endpoint', 'parameter')):
+                        continue
+                    findings.append(safe)
                 mode = 'ai-provider'
             except (AttributeError, IndexError, KeyError, TypeError, ValueError, requests.RequestException):
-                findings = self._fallback(raw_outputs)
+                findings = []
         else:
-            findings = self._fallback(raw_outputs)
+            findings = []
 
         merged = {}
-        for item in findings:
+        for item in (deterministic + findings)[:MAX_FINDINGS]:
             normalized = self._normalize(item, asset_criticality)
             key = normalized['fingerprint']
             merged[key] = self._combine(merged[key], normalized) if key in merged else normalized

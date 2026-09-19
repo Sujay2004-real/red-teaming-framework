@@ -28,6 +28,7 @@ PDF = 'JuiceBox_Security_Assessment_Request.pdf'
 # the backend's environment) is the scripted path; a backend started without
 # it printed a generated key to its console on first start.
 API_KEY = os.getenv('REDTEAM_API_KEY', '')
+STRICT = os.getenv('SMOKE_STRICT', '1') == '1'
 
 
 def call(path, method='GET', body=None, headers=None, raw=None):
@@ -95,6 +96,8 @@ for index, step in enumerate(assessment['plan']):
     result = call(f"/assessments/{assessment['id']}/execute", 'POST',
                   {'step_index': index, 'approved': True})
     r = result['result']
+    if STRICT:
+        assert r.get('outcome', 'completed' if r['return_code'] == 0 else 'failed') in {'completed', 'completed_with_findings'}, f"Scanner failed: {r.get('stderr')}"
     print(f"executed [{step['tool']}]: exit={r['return_code']} in {r['duration_ms']}ms")
     if step['tool'] == 'nmap':
         for line in r['stdout'].splitlines():
@@ -140,6 +143,8 @@ for index, step in enumerate(drafted['plan']):
     result = call(f"/assessments/{assessment['id']}/execute", 'POST',
                   {'step_index': index, 'approved': True})
     r = result['result']
+    if STRICT:
+        assert r.get('outcome', 'completed' if r['return_code'] == 0 else 'failed') in {'completed', 'completed_with_findings'}, f"Scanner failed: {r.get('stderr')}"
     note = ''
     if step['tool'] == 'msfconsole':
         note = ' (VM-only; refused in local mode as designed)' if r['return_code'] != 0 else ''
@@ -172,6 +177,8 @@ for index, step in enumerate(post_draft['plan']):
     result = call(f"/assessments/{assessment['id']}/execute", 'POST',
                   {'step_index': index, 'approved': True})
     r = result['result']
+    if STRICT:
+        assert r.get('outcome', 'completed' if r['return_code'] == 0 else 'failed') in {'completed', 'completed_with_findings'}, f"Scanner failed: {r.get('stderr')}"
     print(f"executed [{step['tool']}]: exit={r['return_code']} in {r['duration_ms']}ms")
 post_analysis = call(f"/assessments/{assessment['id']}/analyze", 'POST')
 print(f"post-exploitation analysis: phase -> {post_analysis['current_phase']}")
@@ -207,6 +214,8 @@ for index, step in enumerate(subnet['plan']):
     result = call(f"/assessments/{subnet['id']}/execute", 'POST',
                   {'step_index': index, 'approved': True})
     r = result['result']
+    if STRICT:
+        assert r.get('outcome', 'completed' if r['return_code'] == 0 else 'failed') in {'completed', 'completed_with_findings'}, f"Scanner failed: {r.get('stderr')}"
     print(f"executed [{step['tool']}]: exit={r['return_code']} in {r['duration_ms']}ms")
     hosts = [line.split()[-1] for line in r['stdout'].splitlines()
              if line.startswith('Nmap scan report for')]
@@ -227,8 +236,13 @@ if live_hosts:
     assert any(':' in f['endpoint'] and '/tcp' in f['endpoint'] for f in subnet_detail['findings']), \
         'sweep findings must be attributed to individual hosts'
 else:
+    if STRICT:
+        raise AssertionError('Strict smoke test requires at least one live host on the authorized lab segment')
     print('  note: no live hosts on the segment - expected in a backend-only demo '
           'without the virtualization lab VMs; host-attribution skipped')
 subnet_report = call(f"/assessments/{subnet['id']}/report", 'POST')
 print(f"subnet report: {subnet_report['download_url']}")
-print('SMOKE TEST PASSED')
+assert detail['executions'], 'No execution evidence recorded'
+if STRICT:
+    assert detail['findings'], 'Strict smoke test requires observed findings'
+print('STRICT SMOKE TEST PASSED' if STRICT else 'WORKFLOW-ONLY SMOKE PASSED (coverage not verified)')

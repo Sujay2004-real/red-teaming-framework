@@ -10,7 +10,6 @@ export const KEY_STORAGE = 'rtcc-operator-key'
 // calls at 60 s, so the browser gives up only after the server itself
 // certainly has, and `busy` can never wedge on a request that never answers.
 export const REQUEST_TIMEOUT_MS = 75_000
-export const EXECUTE_TIMEOUT_MS = 400_000
 export const HEALTH_POLL_MS = 10_000
 // How often the in-flight execution terminal polls the backend for new
 // output while a command runs.
@@ -24,9 +23,9 @@ export const loadStoredKey = () => {
 // read it at call time without re-creating itself on every key change.
 let operatorKey = loadStoredKey()
 export const getOperatorKey = () => operatorKey
-export const setOperatorKey = value => {
+export const setOperatorKey = (value, persist = false) => {
   operatorKey = value
-  try { if (value) localStorage.setItem(KEY_STORAGE, value) } catch { /* private window; works until reload */ }
+  try { if (value && persist) localStorage.setItem(KEY_STORAGE, value); else localStorage.removeItem(KEY_STORAGE) } catch { /* private window; works until reload */ }
 }
 
 /**
@@ -61,7 +60,10 @@ export const createRequest = (getKey, onUnauthorized) => async (path, options = 
     : { 'Content-Type': 'application/json' }
   if (apiKey) headers['X-API-Key'] = apiKey
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const abort = () => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  options.signal?.addEventListener('abort', abort, { once: true })
+  const timer = setTimeout(abort, timeoutMs)
   try {
     const res = await fetch(API + path, { headers, ...options, signal: controller.signal })
     if (res.status === 401) {
@@ -74,10 +76,12 @@ export const createRequest = (getKey, onUnauthorized) => async (path, options = 
   } catch (e) {
     // "TypeError: Failed to fetch" points at the code; the stopped
     // container is the actual cause. An abort is the timeout firing.
+    if (options.signal?.aborted) throw e
     if (e.name === 'AbortError') throw new Error(`The backend did not answer within ${Math.round(timeoutMs / 1000)} seconds — it may be overloaded or restarting.`)
     if (e instanceof TypeError) throw new Error(`Cannot reach the backend at ${API} — is the stack running?`)
     throw e
   } finally {
     clearTimeout(timer)
+    options.signal?.removeEventListener('abort', abort)
   }
 }

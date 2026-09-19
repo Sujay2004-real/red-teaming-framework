@@ -66,8 +66,8 @@ def test_attached_output_flag_is_blocked():
     # --tls-max is the one member of the family that does take a value, so this
     # guards the opposite mistake: filed as a boolean, '1.3' becomes a target.
     'curl -I --tls-max 1.3 http://juice-shop:3000',
-    'whatweb --open-timeout 5 http://juice-shop:3000',
-    'whatweb --open-timeout=5 http://juice-shop:3000',
+    'whatweb --follow-redirect never --open-timeout 5 http://juice-shop:3000',
+    'whatweb --follow-redirect never --open-timeout=5 http://juice-shop:3000',
     'sslscan --starttls-smtp juice-shop',
     'sslscan --starttls-imap juice-shop',
 ])
@@ -160,7 +160,7 @@ SCOPES = ['192.168.56.10']
 
 def test_exploitation_gate_refuses_sqlmap_without_authorization():
     engine = PolicyEngine()
-    command = f'sqlmap -u http://192.168.56.10:3000 --batch'
+    command = f'sqlmap -u http://192.168.56.10:3000 --batch --ignore-redirects'
     valid, reason, _ = engine.validate_command(command, SCOPES)
     assert not valid
     assert 'does not authorize controlled exploitation' in reason

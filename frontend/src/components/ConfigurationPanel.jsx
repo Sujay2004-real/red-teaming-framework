@@ -1,9 +1,23 @@
+import { useState } from 'react'
 import { useApp } from '../lib/AppContext'
 
 // Provider / proxy / execution-engine configuration. Secrets are write-only:
 // the form blanks them after a save and shows only whether one is stored.
 export default function ConfigurationPanel({ settings, setSettings, sshTest, onSave, onTestSsh }) {
-  const { busy } = useApp()
+  const { busy, request, run, setNotice } = useApp()
+  const [discovered, setDiscovered] = useState(null)
+  const inspect = () => run('', async () => {
+    await request('/settings', { method: 'PUT', body: JSON.stringify({ ssh_host: settings.ssh_host, ssh_port: Number(settings.ssh_port || 22) }) })
+    const identity = await request('/settings/ssh-fingerprint', { method: 'POST' })
+    setDiscovered(identity)
+  })
+  const trust = () => run('', async () => {
+    const fresh = await request('/settings')
+    if (fresh.ssh_host !== discovered.host || fresh.ssh_port !== discovered.port) throw new Error('SSH destination changed. Inspect the host again.')
+    await request('/settings', { method: 'PUT', body: JSON.stringify({ ssh_fingerprint: discovered.fingerprint }) })
+    setSettings(s => ({ ...s, ssh_fingerprint: discovered.fingerprint }))
+    setDiscovered(null); setNotice('SSH fingerprint pinned. You can now save credentials and test the connection.')
+  })
   return <section className="panel">
     <div className="panel-title">
       <h2>Configuration</h2>
@@ -27,6 +41,10 @@ export default function ConfigurationPanel({ settings, setSettings, sshTest, onS
       {settings.execution_mode === 'kali_vm' && <>
         <div className="split"><label>VM host<input placeholder="192.168.56.15" value={settings.ssh_host || ''} onChange={e => setSettings({ ...settings, ssh_host: e.target.value })} /><small>Host-only adapter address of your Kali VM.</small></label><label>SSH port<input type="number" min="1" max="65535" value={settings.ssh_port || 22} onChange={e => setSettings({ ...settings, ssh_port: e.target.value })} /></label></div>
         <div className="split"><label>Username<input placeholder="root" value={settings.ssh_username || ''} onChange={e => setSettings({ ...settings, ssh_username: e.target.value })} /></label><label>Password<input type="password" placeholder={settings.ssh_password_configured ? 'Configured ••••••••' : 'VM password'} value={settings.ssh_password || ''} onChange={e => setSettings({ ...settings, ssh_password: e.target.value })} /><small>{settings.ssh_password_configured ? 'Leave blank to keep the stored password.' : 'Encrypted before storage and never returned by the API.'}</small></label></div>
+        <label>SSH private key<textarea rows="3" autoComplete="off" placeholder={settings.ssh_private_key_configured ? 'Configured; leave blank to keep it' : 'Optional PEM private key'} value={settings.ssh_private_key || ''} onChange={e => setSettings({ ...settings, ssh_private_key: e.target.value })} /></label>
+        <label>Key passphrase<input type="password" autoComplete="new-password" value={settings.ssh_key_passphrase || ''} onChange={e => setSettings({ ...settings, ssh_key_passphrase: e.target.value })} /></label>
+        <p>Trusted fingerprint: <code>{settings.ssh_fingerprint || 'Not yet pinned'}</code></p><button type="button" className="secondary" disabled={busy || !settings.ssh_host} onClick={inspect}>Inspect host fingerprint</button>
+        {discovered && <div className="ssh-attest"><p>Compare this with the SHA256 fingerprint shown on the VM console before trusting it.</p><code>{discovered.host}:{discovered.port} {discovered.fingerprint}</code><button type="button" onClick={trust}>Trust this fingerprint</button></div>}
         <button type="button" className="secondary" onClick={onTestSsh} disabled={busy}>{busy ? 'Working…' : 'Test connection'}</button>
         {sshTest && <div className="ssh-attest">
           <b>Attacker VM verified</b>

@@ -3,7 +3,8 @@ import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from datetime import datetime
 
 from modules.phases import is_plan_phase
 
@@ -50,6 +51,33 @@ def _checked_url(value: Optional[str], schemes: tuple) -> Optional[str]:
     return stripped
 
 
+class EngagementPolicy(BaseModel):
+    excluded_scopes: List[str] = Field(default_factory=list, max_length=50)
+    prohibited_tools: List[str] = Field(default_factory=list, max_length=20)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    max_executions: int = Field(default=100, ge=1, le=1000)
+    max_rate: int = Field(default=30, ge=1, le=30)
+    review_notes: str = Field(default='', max_length=4000)
+
+    @field_validator('excluded_scopes', 'prohibited_tools')
+    @classmethod
+    def bounded_rules(cls, value):
+        cleaned = [item.strip() for item in value if item.strip()]
+        if any(len(item) > 255 or any(c in item for c in '\r\n\x00') for item in cleaned):
+            raise ValueError('Rule values must be single lines of at most 255 characters')
+        return list(dict.fromkeys(cleaned))
+
+    @model_validator(mode='after')
+    def window(self):
+        for value in (self.starts_at, self.ends_at):
+            if value and value.tzinfo is None:
+                raise ValueError('Test-window timestamps must include a timezone')
+        if self.starts_at and self.ends_at and self.starts_at >= self.ends_at:
+            raise ValueError('Test-window end must be later than its start')
+        return self
+
+
 class TargetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     scope_domain_ip: str = Field(min_length=1, max_length=255)
@@ -62,6 +90,12 @@ class TargetCreate(BaseModel):
     # this target; the policy engine refuses exploitation-grade commands
     # (sqlmap, msfconsole, curl with a request body) otherwise.
     exploitation_authorized: bool = False
+    # Opt-in aggressive lab mode: weaponized exploitation (data extraction,
+    # single-command RCE, Metasploit exploit modules with payloads/sessions).
+    # Only effective together with exploitation_authorized; per-step approval
+    # still applies. Keep false for any target you do not fully own.
+    aggressive_lab: bool = False
+    engagement_policy: EngagementPolicy = Field(default_factory=EngagementPolicy)
 
     _strip_name = field_validator('name', 'scope_domain_ip')(_required_text)
 
@@ -170,6 +204,9 @@ class SettingsUpdate(BaseModel):
     ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
     ssh_username: Optional[str] = Field(default=None, max_length=255)
     ssh_password: Optional[str] = Field(default=None, max_length=10000)
+    ssh_fingerprint: Optional[str] = Field(default=None, max_length=100)
+    ssh_private_key: Optional[str] = Field(default=None, max_length=20000)
+    ssh_key_passphrase: Optional[str] = Field(default=None, max_length=1000)
 
     @field_validator('api_base_url')
     @classmethod
@@ -202,10 +239,13 @@ class SettingsUpdate(BaseModel):
 class ExecuteRequest(BaseModel):
     step_index: int = Field(ge=0)
     approved: bool = False
+    background: bool = False
+    plan_version: Optional[int] = Field(default=None, ge=1)
 
 
 class PlanUpdate(BaseModel):
     plan: List[Dict[str, Any]]
+    plan_version: Optional[int] = Field(default=None, ge=1)
 
     @field_validator('plan')
     @classmethod

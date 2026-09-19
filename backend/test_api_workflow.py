@@ -81,10 +81,48 @@ def test_completed_assessment_can_be_analyzed_and_reported(client, tmp_path):
     assert analyzed.status_code == 200
     assert analyzed.json()['analyzer'] == 'deterministic-fallback'
 
-    with patch('main.reporter.generate_html_report', return_value=str(tmp_path / 'report.html')):
+    with patch('main.REPORTS_DIR', tmp_path):
         reported = client.post(f"/assessments/{assessment['id']}/report")
 
     assert reported.status_code == 200
+
+
+def test_snapshot_reports_discovered_hosts_after_nmap(client):
+    """The snapshot is the load path the UI uses, so it must carry the nmap
+    host inventory the network-inventory panel renders. A regression here left
+    the panel permanently empty even after discovery ran."""
+    assessment = create_assessment(client)
+    nmap_output = (
+        'Nmap scan report for 192.168.198.86\n'
+        'Host is up (0.0010s latency).\n'
+        'PORT      STATE SERVICE\n'
+        '20128/tcp open  http\n'
+        '\n'
+        'Nmap scan report for 192.168.198.90\n'
+        'Host is up (0.0020s latency).\n'
+        '80/tcp open  http\n'
+    )
+    result = {'stdout': nmap_output, 'stderr': '', 'return_code': 0, 'duration_ms': 10}
+    with patch('main.executor.execute_command', new=AsyncMock(return_value=result)):
+        assert client.post(f"/assessments/{assessment['id']}/execute", json={'step_index': 0, 'approved': True}).status_code == 200
+
+    snapshot = client.get(f"/assessments/{assessment['id']}/snapshot")
+    assert snapshot.status_code == 200
+    assert snapshot.json()['discovered_hosts'] == ['192.168.198.86', '192.168.198.90']
+
+
+def test_aggressive_lab_requires_exploitation_authorization(client):
+    """aggressive_lab is only stored when exploitation is also authorized, so
+    it can never be turned on for a target the letter did not clear."""
+    uncoupled = client.post('/targets/', json={
+        'name': 'A', 'scope_domain_ip': '192.168.56.10', 'authorized_scopes': ['192.168.56.10'],
+        'aggressive_lab': True}).json()
+    assert uncoupled['aggressive_lab'] is False
+    coupled = client.post('/targets/', json={
+        'name': 'B', 'scope_domain_ip': '192.168.56.20', 'authorized_scopes': ['192.168.56.20'],
+        'exploitation_authorized': True, 'aggressive_lab': True}).json()
+    assert coupled['exploitation_authorized'] is True
+    assert coupled['aggressive_lab'] is True
 
 
 def test_prompt_mode_creates_one_assessment_per_picked_target(client):
@@ -140,10 +178,11 @@ ATTESTATION = {
 def enable_kali_vm_mode(client):
     saved = client.put('/settings', json={
         'execution_mode': 'kali_vm', 'ssh_host': '192.168.56.15', 'ssh_port': 22,
-        'ssh_username': 'root', 'ssh_password': 'toor',
+        'ssh_username': 'root', 'ssh_password': 'toor', 'ssh_fingerprint': 'SHA256:test',
     })
     assert saved.status_code == 200
-    return saved.json()
+    trusted = client.put('/settings', json={'ssh_fingerprint': 'SHA256:test'})
+    return trusted.json()
 
 
 def test_kali_vm_settings_round_trip_and_secret_hygiene(client):
@@ -195,7 +234,7 @@ def test_kali_vm_execution_persists_attestation(client):
     assert executed.status_code == 200
     # The remote settings were handed to the executor alongside the command.
     _, kwargs = run_command.call_args
-    assert kwargs.get('remote') == {'host': '192.168.56.15', 'port': 22, 'username': 'root', 'password': 'toor'}
+    assert kwargs.get('remote') == {'host': '192.168.56.15', 'port': 22, 'username': 'root', 'password': 'toor', 'fingerprint': 'SHA256:test', 'private_key': '', 'key_passphrase': ''}
     assert executed.json()['result']['execution_host'] == ATTESTATION
 
     stored = client.get(f"/assessments/{assessment['id']}").json()

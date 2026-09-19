@@ -23,11 +23,11 @@ def test_default_plan_separates_host_and_web_port():
     assert commands['traceroute'] == 'traceroute juice-shop'
     assert commands['dig'] == 'dig +short juice-shop'
     assert commands['curl'] == 'curl -sSI http://juice-shop:3000'
-    assert commands['whatweb'] == 'whatweb -a 3 --color=never http://juice-shop:3000'
+    assert commands['whatweb'] == 'whatweb -a 3 --follow-redirect never --color=never http://juice-shop:3000'
     assert commands['sslscan'] == 'sslscan --no-colour juice-shop:3000'
     assert commands['nuclei'] == ('nuclei -u http://juice-shop:3000 '
                                   '-tags cve,exposure,misconfig '
-                                  '-severity medium,high,critical -rl 30 -nc -stats -duc -silent')
+                                  '-severity medium,high,critical -rl 30 -dr -ni -nc -stats -duc -silent')
     # The default plan is deep: a manual tester would need many more commands
     # and hours of correlation to reach the same coverage.
     assert len(plan) >= 7
@@ -118,7 +118,7 @@ def test_ai_plan_filters_mismatched_declared_tool():
         ])}}],
     }
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.planner.requests.post', return_value=response):
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
@@ -132,7 +132,7 @@ def test_ai_plan_filters_mismatched_declared_tool():
 
 
 def test_provider_failure_is_reported_separately_from_policy_rejection():
-    with patch('requests.post', side_effect=RequestException('boom')):
+    with patch('modules.planner.requests.post', side_effect=RequestException('boom')):
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
@@ -153,7 +153,7 @@ def test_unconfigured_provider_is_reported_separately():
 
 def test_partial_provider_configuration_never_calls_out():
     """A key with no endpoint or model must not reach any provider."""
-    with patch('requests.post') as post:
+    with patch('modules.planner.requests.post') as post:
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
@@ -175,7 +175,7 @@ def test_secondary_authorized_scopes_survive_policy_review():
         ])}}],
     }
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.planner.requests.post', return_value=response):
         plan, source = PlannerAgent().generate_plan(
             'juice-shop:3000',
             'Inspect the target',
@@ -187,4 +187,3 @@ def test_secondary_authorized_scopes_survive_policy_review():
     assert source == 'ai-filtered'
     assert plan[0]['command'] == 'nmap -sV 172.18.0.7'
     assert plan[0]['capability'] == 'network_discovery'
-

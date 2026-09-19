@@ -101,7 +101,7 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 <p class="meta">Priority score (0–100) blends severity (40%), exploitability (25%), asset criticality (20%) and analyzer confidence (15%). Risk score is exploitability × impact × exposure (max 125).</p>
 
 {% if attack_paths %}
-<h2>Attack paths</h2>
+<h2>Finding correlations</h2>
 <p class="meta">Findings that share an origin (or an affected parameter) combine into a single attack path: an attacker working that origin moves from one weakness to the next without leaving the service. Paths are ranked by the combined priority of their members; verification badges mark findings the exploitation phase proved.</p>
 {% for path in attack_paths %}
 <div class="finding attack-path">
@@ -189,5 +189,6 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 {% endfor %}
 
 <div class="footer-note">This report was produced by a semi-autonomous framework: commands were proposed automatically, reviewed against an allowlist policy engine and scope rules, and executed only after explicit human approval. Exploitation-phase commands were additionally gated on the client letter's controlled-verification authorization. For authorized laboratory and contractually permitted engagements only.</div>
+<section><h2>Evidence provenance</h2><p>Report content is versioned. Hashes identify the captured evidence for each attempt; missing tool versions are not inferred.</p><pre>{{ provenance | tojson(indent=2) }}</pre></section>
 </body>
 </html>

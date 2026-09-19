@@ -1,68 +1,46 @@
-FROM python:3.10-slim
-
-# Install system dependencies including nmap and wget for downloading tools.
-# sqlmap is packaged in Debian; the Exploit-DB clone backs searchsploit so
-# the offline exploit lookup works with no network dependency at run time.
-# msfconsole is deliberately NOT installed: the Metasploit console is a
-# VM-only capability (the Kali attacker VM engine), and the execute endpoint
-# refuses it in local mode for exactly that reason.
-RUN apt-get update && apt-get install -y \
-    nmap \
-    curl \
-    dnsutils \
-    traceroute \
-    whatweb \
-    sslscan \
-    sqlmap \
-    git \
-    wget \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Offline Exploit-DB mirror for the searchsploit exploitation-phase steps.
-# Pinned by clone at build time: the database content only affects lookup
-# results, never what the framework is allowed to run.
-RUN git clone --depth 1 https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb \
-    && ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
-    && rm -rf /opt/exploitdb/.git
-
-# Install Nuclei. Pinned so a rebuild cannot silently change scanner behaviour.
-# 3.1.9 died with "fatal error: concurrent map writes" partway through a normal
-# tag-filtered run: exit 2, no findings, 149 seconds burned. Do not downgrade.
-ARG NUCLEI_VERSION=3.11.1
-RUN wget https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip && \
-    unzip nuclei_${NUCLEI_VERSION}_linux_amd64.zip -d /usr/local/bin/ && \
-    rm nuclei_${NUCLEI_VERSION}_linux_amd64.zip
-
-# Seed the nuclei template library at build time. The default plan runs nuclei
-# with -duc (no runtime update check, so scan duration cannot creep past the
-# executor's timeout cap), and -duc makes a container without templates die
-# with "no templates provided for scan". Note -duc must NOT be passed here:
-# it turns the template install itself into a silent no-op.
-RUN nuclei -update-templates
-
-# OWASP ZAP for the passive baseline step. Debian's zaproxy package provides
-# the ZAP core; the baseline wrapper is the ZAP project's own CI entrypoint
-# (Apache-2.0), pinned by tag so a rebuild cannot silently change behaviour.
-# The wrapper imports zap_common from its own directory, so both files go to
-# the same place on PATH. The wrapper invokes ZAP via zap.sh, which the
-# Debian package installs under /usr/share/zaproxy - linked onto PATH.
-# Only the PASSIVE baseline is wired into the policy engine; the active
-# scanner's flag (-a) is refused by the allowlist, so this install can never
-# be turned into a payload-delivery engine through the framework.
-ARG ZAP_WRAPPER_VERSION=v2.14.0
-RUN apt-get update && apt-get install -y zaproxy \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_WRAPPER_VERSION}/docker/zap_common.py -O /usr/local/bin/zap_common.py \
-    && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_WRAPPER_VERSION}/docker/zap-baseline.py -O /usr/local/bin/zap-baseline.py \
-    && chmod +x /usr/local/bin/zap-baseline.py \
-    && ln -sf /usr/share/zaproxy/zap.sh /usr/local/bin/zap.sh
-
+FROM python:3.12-slim-bookworm AS api
 WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && useradd --create-home --uid 10001 redteam \
+    && mkdir -p /app/data && chown redteam:redteam /app/data
+COPY main.py database.py models.py worker.py ./
+COPY modules/ ./modules/
+COPY migrations/ ./migrations/
+USER redteam
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+FROM api AS scanner
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nmap curl dnsutils traceroute whatweb sslscan sqlmap git wget unzip default-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+# Reviewed immutable source revisions. Runtime updates are disabled by policy.
+ARG EXPLOITDB_REVISION=150aef0e7c4757c9dff33016c8352671cdc9b454
+ARG NUCLEI_TEMPLATES_REVISION=8e200457539ad6a70d0d94cf816935688ea65478
+ARG NUCLEI_VERSION=3.11.1
+ARG ZAP_VERSION=2.17.0
+# Revision of zaproxy/zaproxy that ships the docker/ baseline scripts matching
+# the pinned ZAP release (commit touching docker/zap-baseline.py, 2026-07-06).
+ARG ZAP_REVISION=d4ccc5801f34107a213fccd548139d191135b8e5
+RUN git init /opt/exploitdb && cd /opt/exploitdb \
+    && git remote add origin https://gitlab.com/exploit-database/exploitdb.git \
+    && git fetch --depth 1 origin ${EXPLOITDB_REVISION} && git checkout FETCH_HEAD \
+    && ln -s /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
+    && rm -rf /opt/exploitdb/.git
+RUN wget -q https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip -O /tmp/nuclei.zip \
+    && unzip /tmp/nuclei.zip nuclei -d /usr/local/bin && rm /tmp/nuclei.zip \
+    && git init /home/redteam/nuclei-templates && cd /home/redteam/nuclei-templates \
+    && git remote add origin https://github.com/projectdiscovery/nuclei-templates.git \
+    && git fetch --depth 1 origin ${NUCLEI_TEMPLATES_REVISION} && git checkout FETCH_HEAD \
+    && rm -rf .git && chown -R redteam:redteam /home/redteam
+RUN wget -q https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}/ZAP_${ZAP_VERSION}_Linux.tar.gz -O /tmp/zap.tar.gz \
+    && tar -xzf /tmp/zap.tar.gz -C /opt && rm /tmp/zap.tar.gz \
+    && ln -s /opt/ZAP_${ZAP_VERSION}/zap.sh /usr/local/bin/zap.sh \
+    && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_REVISION}/docker/zap_common.py -O /usr/local/bin/zap_common.py \
+    && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_REVISION}/docker/zap-baseline.py -O /usr/local/bin/zap-baseline.py \
+    && chmod +x /usr/local/bin/zap-baseline.py \
+    && pip install --no-cache-dir zaproxy==0.6.0 pyyaml==6.0.2
+RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","zap":"%s"}\n' "$NUCLEI_VERSION" "$NUCLEI_TEMPLATES_REVISION" "$EXPLOITDB_REVISION" "$ZAP_VERSION" > /opt/tool-versions.json
+USER redteam

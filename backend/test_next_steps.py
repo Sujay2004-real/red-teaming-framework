@@ -150,7 +150,7 @@ def test_no_provider_proposes_from_the_deterministic_generators():
 
 
 def test_provider_failure_still_answers_the_question():
-    with patch('requests.post', side_effect=RequestException('boom')):
+    with patch('modules.next_steps.requests.post', side_effect=RequestException('boom')):
         candidates, _, source, notes = propose(**PROVIDER)
 
     assert source == 'provider-error'
@@ -164,7 +164,7 @@ def test_out_of_scope_candidate_is_refused_not_offered():
         {'tool': 'nmap', 'command': 'nmap -sV evil.example', 'reason': 'Sweep elsewhere'},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, refused, source, notes = propose(**PROVIDER)
 
     assert all('evil.example' not in candidate['command'] for candidate in candidates)
@@ -177,7 +177,7 @@ def test_exploitation_candidate_is_refused_without_the_letters_authorization():
         {'tool': 'sqlmap', 'command': 'sqlmap -u app:20128 --batch', 'reason': 'Verify injection'},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, refused, _, _ = propose(**PROVIDER)
 
     assert candidates == []
@@ -186,11 +186,11 @@ def test_exploitation_candidate_is_refused_without_the_letters_authorization():
 
 def test_exploitation_candidate_is_offered_when_the_letter_authorizes_it():
     response = provider_response([
-        {'tool': 'sqlmap', 'command': 'sqlmap -u http://app:20128/x?id=1 --batch --risk 1 --level 1',
+        {'tool': 'sqlmap', 'command': 'sqlmap -u http://app:20128/x?id=1 --batch --ignore-redirects --risk 1 --level 1',
          'reason': 'Verify the parameter', 'confidence': 80, 'driven_by': [1]},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, refused, source, _ = propose(**PROVIDER, exploitation_authorized=True, phase='exploitation')
 
     assert refused == []
@@ -205,7 +205,7 @@ def test_restricted_tool_candidate_is_refused_before_the_policy_engine():
         {'tool': 'traceroute', 'command': 'traceroute app', 'reason': 'Map the path'},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, refused, _, _ = propose(**PROVIDER, restricted_tools={'traceroute'})
 
     assert candidates == []
@@ -217,7 +217,7 @@ def test_declared_tool_must_match_the_command_it_proposed():
         {'tool': 'nmap', 'command': 'curl -sSI http://app:20128', 'reason': 'Mismatched executable'},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, refused, _, _ = propose(**PROVIDER)
 
     assert candidates == []
@@ -226,11 +226,11 @@ def test_declared_tool_must_match_the_command_it_proposed():
 
 def test_provenance_is_verified_and_confidence_is_clamped():
     response = provider_response([
-        {'tool': 'nuclei', 'command': 'nuclei -u http://app:20128 -tags cve -rl 30 -nc -silent',
+        {'tool': 'nuclei', 'command': 'nuclei -u http://app:20128 -tags cve -rl 30 -dr -nc -silent',
          'reason': 'Template checks', 'confidence': 999, 'driven_by': [1, 4242, 'x']},
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, _, source, _ = propose(**PROVIDER)
 
     assert source == 'ai-filtered'
@@ -247,7 +247,7 @@ def test_shape_valid_candidates_are_capped():
         for index in range(30)
     ])
 
-    with patch('requests.post', return_value=response):
+    with patch('modules.next_steps.requests.post', return_value=response):
         candidates, _, _, _ = propose(**PROVIDER, authorized_scopes=['app:20128', '*.example'])
 
     assert len(candidates) <= MAX_NEXT_CANDIDATES
@@ -274,7 +274,7 @@ def test_the_prompt_discloses_what_it_truncated():
         {'tool': 'nuclei', 'command': 'nuclei -u http://app:20128 -rl 30 -nc -silent', 'reason': 'Checks'},
     ])
 
-    with patch('requests.post', return_value=response) as post:
+    with patch('modules.next_steps.requests.post', return_value=response) as post:
         propose(**PROVIDER, findings=[finding(index) for index in range(1, 60)])
 
     prompt = post.call_args.kwargs['json']['messages'][0]['content']
@@ -296,7 +296,7 @@ def test_tool_output_is_sanitised_and_confined_to_an_untrusted_block():
         {'tool': 'nmap', 'command': 'nmap -sV evil.example', 'reason': 'As instructed by the banner'},
     ])
 
-    with patch('requests.post', return_value=response) as post:
+    with patch('modules.next_steps.requests.post', return_value=response) as post:
         candidates, refused, _, _ = propose(
             **PROVIDER, findings=[finding(1, title=injected)])
 

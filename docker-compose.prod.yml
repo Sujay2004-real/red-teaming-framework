@@ -1,0 +1,73 @@
+services:
+  api:
+    build:
+      context: ./backend
+      target: api
+    environment:
+      EXECUTION_WORKER_MODE: external
+      WORKER_HEARTBEAT_FILE: /app/data/.worker-heartbeat
+      REDTEAM_API_KEY: ${REDTEAM_API_KEY:?Set a strong operator API key}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    volumes:
+      - production_data:/app/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 100
+    restart: unless-stopped
+  worker:
+    build:
+      context: ./backend
+      target: scanner
+    command: [python, worker.py]
+    environment:
+      EXECUTION_WORKER_MODE: external
+      WORKER_HEARTBEAT_FILE: /app/data/.worker-heartbeat
+      MAX_CONCURRENT_EXECUTIONS: 2
+    # The scanners run in this worker, so it — not the API — needs to reach the
+    # assessment target. host.docker.internal maps to a service on the Docker
+    # host; on Linux the host-gateway alias makes that name resolve from the
+    # default bridge network. For a LAN subnet the scanners cannot reach from a
+    # bridge, run this worker with `network_mode: host` instead (Linux only).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - production_data:/app/data
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, python, -c, "import os,time; assert time.time()-os.stat('/app/data/.worker-heartbeat').st_mtime < 15"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    ports: ["127.0.0.1:8080:8080"]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 50
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  production_data:

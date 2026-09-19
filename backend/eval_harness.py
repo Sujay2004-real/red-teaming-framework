@@ -156,18 +156,8 @@ def run_one_engagement(target_spec, run_index, letter_pdf=None, checklist=None):
     record['findings']['tools'] = sorted({tool for f in findings for tool in (f.get('source_tools') or [])})
 
     if checklist:
-        matched = 0
-        misses = []
-        for expected in checklist:
-            needle = expected.strip().lower()
-            if needle and any(needle in (f['title'] + ' ' + f.get('endpoint', '')).lower()
-                              for f in findings):
-                matched += 1
-            elif needle:
-                misses.append(expected.strip())
-        record['checklist'] = {'expected': len([e for e in checklist if e.strip()]),
-                               'matched': matched, 'missed': misses,
-                               'recall': round(matched / max(1, len([e for e in checklist if e.strip()])), 3)}
+        from modules.eval_metrics import evaluate
+        record['checklist'] = evaluate(findings, checklist)
 
     timings['total_s'] = round(time.perf_counter() - t0, 2)
     timings['execution_s'] = round(sum(p['seconds'] for p in record['phases']
@@ -242,17 +232,21 @@ def run_ablation(targets, runs, letter, checklist):
         return None
     saved = {'base_url': settings['api_base_url'], 'model': settings['model_name']}
 
-    print('== arm 1: deterministic (provider endpoint cleared) ==')
-    set_provider_endpoint('', saved['model'])
-    det_runs = []
-    for spec in targets:
-        for run_index in range(1, runs + 1):
-            print(f"  run {run_index}/{runs} against {spec['scope_domain_ip']} ...", flush=True)
-            try:
-                det_runs.append(run_one_engagement(spec, run_index, letter, checklist))
-            except Exception as exc:  # noqa: BLE001 - a failed run is a result too
-                det_runs.append({'run': run_index, 'target': spec['scope_domain_ip'],
-                                 'error': f'{type(exc).__name__}: {exc}'})
+    try:
+        print('== arm 1: deterministic (provider endpoint cleared) ==')
+        set_provider_endpoint('', saved['model'])
+        det_runs = []
+        for spec in targets:
+            for run_index in range(1, runs + 1):
+                print(f"  run {run_index}/{runs} against {spec['scope_domain_ip']} ...", flush=True)
+                try:
+                    det_runs.append(run_one_engagement(spec, run_index, letter, checklist))
+                except Exception as exc:  # noqa: BLE001 - a failed run is a result too
+                    det_runs.append({'run': run_index, 'target': spec['scope_domain_ip'],
+                                     'error': f'{type(exc).__name__}: {exc}'})
+
+    finally:
+        set_provider_endpoint(saved['base_url'], saved['model'])
 
     print('== arm 2: AI provider (endpoint restored) ==')
     set_provider_endpoint(saved['base_url'], saved['model'])
@@ -267,10 +261,11 @@ def run_ablation(targets, runs, letter, checklist):
                                 'error': f'{type(exc).__name__}: {exc}'})
 
     ok_det = [r for r in det_runs if 'error' not in r]
-    ok_ai = [r for r in ai_runs if 'error' not in r]
+    ok_ai = [r for r in ai_runs if 'error' not in r and r.get('analyzer') == 'ai-provider']
     return {
         'deterministic': {'runs': det_runs, 'summary': summarize(ok_det) if ok_det else {}},
         'ai-provider': {'runs': ai_runs, 'summary': summarize(ok_ai) if ok_ai else {}},
+        'provider_fallback_runs': [r for r in ai_runs if r.get('analyzer') != 'ai-provider'],
         'comparison': {
             'modes': sorted({r.get('analyzer', '') for r in ok_det + ok_ai}),
             'findings_mean': {
@@ -310,7 +305,7 @@ def main():
     checklist = None
     if args.checklist and os.path.exists(args.checklist):
         with open(args.checklist, encoding='utf-8') as stream:
-            checklist = stream.read().splitlines()
+            checklist = json.load(stream) if args.checklist.endswith('.json') else stream.read().splitlines()
 
     targets = []
     if args.targets:

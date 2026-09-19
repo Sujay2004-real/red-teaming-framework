@@ -4,6 +4,7 @@ import shlex
 from urllib.parse import urlparse
 
 from modules.phases import EXPLOITATION_GATED_TOOLS, PAYLOAD_FLAGS
+from modules.command_values import numeric_error, validate_argument_values
 
 # Commands run through create_subprocess_exec, never a shell, so shell
 # metacharacters carry no injection risk and must stay legal: query strings
@@ -36,6 +37,23 @@ MSF_ALLOWED_SET_KEYS = {
 MSF_TARGET_KEYS = {'RHOST', 'RHOSTS'}
 MSF_ALLOWED_VERBS = ('run', 'exploit', 'exit', 'back')
 
+# Aggressive lab mode ONLY (target.aggressive_lab + exploitation_authorized).
+# These keys let a real exploit module carry a payload and a reverse-handler
+# back to the attacker VM, and start a backgrounded session. LHOST/SRVHOST are
+# the attacker VM's own addresses (the listener side), so they are validated as
+# plain addresses rather than scope-checked against the target. RHOSTS is still
+# scope-checked in every mode.
+MSF_AGGRESSIVE_SET_KEYS = {
+    'PAYLOAD', 'LHOST', 'LPORT', 'SRVHOST', 'SRVPORT', 'TARGETURI', 'SESSION',
+}
+MSF_ATTACKER_SIDE_KEYS = {'LHOST', 'SRVHOST'}
+# Non-interactive post-exploitation: `exploit -z`/`run -j` background the
+# session; `sessions -C "<cmd>"` runs a command on the session without a TTY;
+# `check` probes exploitability without firing. Interactive `sessions -i`
+# stays out — it needs a live console the subprocess cannot provide.
+MSF_AGGRESSIVE_VERBS = ('run', 'exploit', 'check', 'sessions', 'exit', 'back')
+MSF_PAYLOAD_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9/_\-]+$')
+
 
 class PolicyEngine:
     """Allowlist command policy.
@@ -62,9 +80,9 @@ class PolicyEngine:
             'tools': {
                 'nmap': {
                     'risk': 'low',
-                    # -sC and --script are deliberately absent: both run NSE.
+                    # -sC, --script and -A are absent: all can run NSE.
                     'bool_flags': {
-                        '-sV', '-sS', '-sT', '-sU', '-sn', '-sP', '-Pn', '-A', '-O',
+                        '-sV', '-sS', '-sT', '-sU', '-sn', '-sP', '-Pn', '-O',
                         '-v', '-vv', '-vvv', '-d', '-n', '-R', '-F', '-r', '-6',
                         '--open', '--reason', '--traceroute', '--osscan-limit',
                         '--version-light', '--version-all', '--no-stylesheet',
@@ -95,7 +113,7 @@ class PolicyEngine:
                 'dig': {
                     'risk': 'low',
                     'bool_flags': {'-4', '-6', '-v'},
-                    'value_flags': {'-t', '-c', '-p', '-b', '-k', '-y'},
+                    'value_flags': {'-t', '-c', '-p', '-b'},
                     'target_flags': {'-q', '-x'},
                     'resolver_prefix': '@',
                     # dig's +options are self-contained switches such as
@@ -130,7 +148,7 @@ class PolicyEngine:
                     # stays out to preserve the original Host-override control.
                     'bool_flags': {
                         '-I', '--head', '-s', '--silent', '-S', '--show-error',
-                        '-L', '--location', '-k', '--insecure', '-i', '--include',
+                        '-k', '--insecure', '-i', '--include',
                         '-v', '--verbose', '-f', '--fail', '-4', '--ipv4',
                         '-6', '--ipv6', '-g', '--globoff', '--compressed',
                         '--http1.0', '--http1.1', '--http2', '--path-as-is',
@@ -152,7 +170,7 @@ class PolicyEngine:
                         # validation time, so they are listed here for shape
                         # and gated separately for permission.
                         '-d', '--data', '--data-ascii', '--data-binary',
-                        '--data-raw', '--data-urlencode', '-F', '--form',
+                        '--data-raw', '--data-urlencode',
                         '--form-string', '--json',
                     },
                     'target_flags': {'--url'},
@@ -208,11 +226,11 @@ class PolicyEngine:
                     'bool_flags': {
                         '-silent', '-nc', '-no-color', '-v', '-verbose',
                         '-duc', '-disable-update-check', '-ni', '-no-interactsh',
-                        '-jsonl', '-json', '-stats', '-fr', '-follow-redirects',
+                        '-jsonl', '-json', '-stats', '-dr', '-disable-redirects',
                         '-vv', '-debug',
                     },
                     'value_flags': {
-                        '-t', '-templates', '-severity', '-s', '-tags', '-itags',
+                        '-severity', '-s', '-tags', '-itags',
                         '-etags', '-c', '-concurrency', '-rl', '-rate-limit',
                         '-timeout', '-retries', '-eid', '-exclude-id', '-id',
                         '-template-id', '-et', '-exclude-templates', '-mhe',
@@ -257,9 +275,9 @@ class PolicyEngine:
                     # single record the letter authorizes; -z and --wizard
                     # take free-form over-rides of everything below.
                     'bool_flags': {
-                        '--batch', '--flush-session', '--fresh-queries',
+                        '--batch', '--flush-session', '--fresh-queries', '--ignore-redirects',
                         '--no-color', '--colour=never', '--color=never',
-                        '--disable-coloring', '-v', '--verbose', '--eta',
+                        '--disable-coloring', '--eta',
                         '--smart', '--null-connection', '--no-cast',
                         '--no-escape', '--parse-errors',
                         # The bounded post-exploitation facts: banner, current
@@ -270,20 +288,37 @@ class PolicyEngine:
                         '--is-dba', '--hostname',
                     },
                     'value_flags': {
-                        '--data', '--cookie', '--user-agent',
+                        '--data', '--cookie', '--user-agent', '-v', '--verbose',
                         '--referer', '--headers', '--timeout', '--retries',
                         '--delay', '--threads', '--risk', '--level',
                         '--technique', '--dbms', '--method', '--time-sec',
                         '--string', '--not-string', '--regexp', '--code',
-                        '--csrf-url', '--csrf-token', '--csrf-method',
-                        '--csrf-data', '--tamper', '--charset', '--prefix',
+                        '--csrf-token', '--csrf-method',
+                        '--csrf-data', '--charset', '--prefix',
                         '--suffix', '--param-del', '--cookie-del',
                         '--union-cols', '--union-char', '--union-from',
-                        '--second-order', '--exclude', '--identify-tags',
+                        '--exclude', '--identify-tags',
                     },
-                    'target_flags': {'-u', '--url'},
+                    'target_flags': {'-u', '--url', '--csrf-url', '--second-order'},
                     'attached_patterns': (
                         r'^--(risk|level|timeout|retries|delay|threads|technique|dbms|method|time-sec)=\S+$',
+                    ),
+                    # Unlocked ONLY in aggressive lab mode (target.aggressive_lab
+                    # + exploitation_authorized). Real data extraction and a
+                    # single non-interactive OS command / file read. The
+                    # interactive escapes (--os-shell/--sql-shell/--os-pwn) stay
+                    # refused everywhere: they need a live TTY and would hang the
+                    # non-shell subprocess, and --dump-all/-z/--wizard stay out as
+                    # gratuitously broad free-form overrides.
+                    'aggressive_bool_flags': {
+                        '--dump', '--dbs', '--tables', '--columns', '--schema',
+                        '--users', '--passwords', '--privileges', '--roles', '--count',
+                    },
+                    'aggressive_value_flags': {
+                        '-D', '-T', '-C', '--os-cmd', '--file-read', '--dump-format',
+                    },
+                    'aggressive_attached_patterns': (
+                        r'^--dump-format=(CSV|HTML|SQLITE)$',
                     ),
                 },
                 'msfconsole': {
@@ -369,41 +404,14 @@ class PolicyEngine:
             return None
 
     def validate_target(self, target, authorized_scopes):
-        # A CIDR target is a whole range being scanned, not one address. It
-        # must fit INSIDE an authorized network: normalize_host strips the
-        # prefix ('192.168.1.0/24' -> '192.168.1.0'), so the membership check
-        # below used to pass a /24 sweep against a /25 authorization by
-        # validating only the base address - authorizing double the range.
-        if '/' in str(target):
-            requested = self._as_network(str(target).strip())
-            if requested is not None:
-                return any(
-                    (network := self._as_network(str(scope).strip())) is not None
-                    and requested.version == network.version
-                    and requested.subnet_of(network)
-                    for scope in filter(None, authorized_scopes)
-                )
-        host = self.normalize_host(target)
-        if not host:
-            return False
-        host_ip = self._as_ip(host)
-        for scope in filter(None, authorized_scopes):
-            scope_raw = str(scope).strip()
-            network = self._as_network(scope_raw)
-            if host_ip is not None and network is not None:
-                if host_ip in network:
-                    return True
-                continue
-            scope_host = self.normalize_host(scope_raw)
-            if scope_host and (host == scope_host or host.endswith('.' + scope_host)):
-                return True
-        return False
+        from modules.scope_rules import scope_contains
+        return any(scope_contains(target, scope) for scope in authorized_scopes if scope)
 
     def validate_resolver(self, resolver, authorized_scopes):
         host = self.normalize_host(resolver)
         return bool(host) and (host in PUBLIC_RESOLVERS or self.validate_target(resolver, authorized_scopes))
 
-    def _msf_script_errors(self, script, authorized_scopes):
+    def _msf_script_errors(self, script, authorized_scopes, aggressive=False):
         """Validate an msfconsole -x resource script statement by statement.
 
         Returns a list of human-readable problems; empty means the script is
@@ -412,9 +420,19 @@ class PolicyEngine:
         authorized scopes, and set keys are restricted to remote-target and
         benign option keys. Everything else — payloads, credentials, listeners
         — has no legal spelling here, so it fails closed.
+
+        In aggressive lab mode the option set widens to let a real exploit
+        module carry a payload and a reverse handler back to the attacker VM
+        (PAYLOAD/LHOST/LPORT/SRVHOST/SRVPORT/TARGETURI/SESSION) and run a
+        backgrounded, non-interactive session command (`sessions -C`). RHOSTS
+        is still scope-checked; LHOST/SRVHOST are attacker-side and validated
+        as plain addresses; interactive `sessions -i` remains refused.
         """
         errors = []
         used_module = False
+        has_target = False
+        allowed_keys = MSF_ALLOWED_SET_KEYS | (MSF_AGGRESSIVE_SET_KEYS if aggressive else set())
+        allowed_verbs = MSF_AGGRESSIVE_VERBS if aggressive else MSF_ALLOWED_VERBS
         for statement in (script or '').split(';'):
             statement = statement.strip()
             if not statement:
@@ -423,6 +441,7 @@ class PolicyEngine:
             if lowered.startswith('use '):
                 module = statement[4:].strip()
                 used_module = True
+                has_target = False
                 if not any(module.startswith(prefix) for prefix in MSF_ALLOWED_PREFIXES):
                     errors.append(f'msf module {module} is outside the permitted module trees')
                 continue
@@ -432,17 +451,50 @@ class PolicyEngine:
                     errors.append(f'set statement needs a key and a value: {statement!r}')
                     continue
                 key, value = parts[1], parts[2]
-                if key.upper() not in MSF_ALLOWED_SET_KEYS:
+                if key.upper() not in allowed_keys:
                     errors.append(f'msf set key {key} is not in the permitted option set')
                     continue
                 if key.upper() in MSF_TARGET_KEYS:
+                    has_target = bool(value.strip())
                     # RHOSTS accepts a space- or comma-separated list; each
                     # entry must itself be an authorized target.
                     for candidate in re.split(r'[ ,]+', value):
                         if candidate and not self.validate_target(candidate, authorized_scopes):
                             errors.append(f'msf {key} value {candidate} is outside the authorized scope')
+                numeric = {'RPORT': (1, 65535, 'integer'), 'THREADS': (1, 10, 'integer'),
+                           'TIMEOUT': (1, 60, 'integer'), 'LPORT': (1, 65535, 'integer'),
+                           'SRVPORT': (1, 65535, 'integer'), 'SESSION': (1, 4096, 'integer')}.get(key.upper())
+                if numeric and (error := numeric_error(key, value, numeric)):
+                    errors.append(error)
+                if key.upper() == 'PORTS':
+                    error = validate_argument_values('nmap', [('-p', value)])
+                    if error:
+                        errors.append(error)
+                if key.upper() in {'SSL', 'VERBOSE'} and value.lower() not in {'true', 'false'}:
+                    errors.append(f'msf {key} requires true or false')
+                # Attacker-side listener addresses are not scope-checked (they
+                # are the operator's own VM), but must be plain host tokens.
+                if key.upper() in MSF_ATTACKER_SIDE_KEYS and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:_\-]*', value.strip()):
+                    errors.append(f'msf {key} must be a plain host or address')
+                if key.upper() == 'PAYLOAD' and not MSF_PAYLOAD_RE.fullmatch(value.strip()):
+                    errors.append(f'msf PAYLOAD {value} is not a valid module path')
+                if key.upper() == 'TARGETURI' and not re.fullmatch(r'[A-Za-z0-9/_.\-?=&%]+', value.strip()):
+                    errors.append('msf TARGETURI must be a plain URI path')
                 continue
-            if statement.lower() in MSF_ALLOWED_VERBS:
+            verb = lowered.split()[0]
+            if verb in allowed_verbs:
+                if verb in {'run', 'exploit'} and not (used_module and has_target):
+                    errors.append('msf execution requires an explicit in-scope RHOST/RHOSTS for this module')
+                # Only the backgrounding switches are allowed after run/exploit;
+                # an interactive `sessions -i` or an unknown flag fails closed.
+                extra = statement.split()[1:]
+                if verb in {'run', 'exploit'} and any(token not in ('-z', '-j') for token in extra):
+                    errors.append(f'msf {verb} accepts only -z/-j here: {statement!r}')
+                if verb == 'sessions':
+                    if not aggressive:
+                        errors.append('msf sessions is only available in aggressive lab mode')
+                    elif not (extra and extra[0] in ('-C', '-l', '-L')):
+                        errors.append("msf sessions accepts only -C '<command>' or -l here (interactive -i is refused)")
                 continue
             errors.append(f'msf statement is not a permitted use/set/run/exit form: {statement!r}')
         if not used_module and not errors:
@@ -498,7 +550,7 @@ class PolicyEngine:
             return None
         return None, token
 
-    def scan_arguments(self, tokens, spec):
+    def scan_arguments(self, tokens, spec, arguments=None):
         """Split arguments into targets and resolvers using the tool's own spec.
 
         Returns (targets, resolvers, error). Unknown flags produce an error so
@@ -513,9 +565,11 @@ class PolicyEngine:
         targets, resolvers, positionals = [], [], []
         pending = None
         pending_flag = None
+        arguments = arguments if arguments is not None else []
 
         for token in tokens[1:]:
             if pending:
+                arguments.append((pending_flag, token))
                 if pending == 'target':
                     targets.append(token)
                 elif pending == 'resolver':
@@ -531,6 +585,7 @@ class PolicyEngine:
             if self._is_flag(token, spec):
                 base, _, attached = token.partition('=')
                 if token in bool_flags:
+                    arguments.append((token, None))
                     continue
                 if token in value_flags:
                     pending, pending_flag = 'value', token
@@ -542,19 +597,32 @@ class PolicyEngine:
                     pending, pending_flag = 'resolver', token
                     continue
                 if attached:
-                    if base in value_flags or base in bool_flags:
+                    if base in value_flags:
+                        arguments.append((base, attached))
                         continue
                     if base in target_flags:
+                        arguments.append((base, attached))
                         targets.append(attached)
                         continue
                     if base in resolver_flags:
+                        arguments.append((base, attached))
                         resolvers.append(attached)
                         continue
                 if self._matches_attached(token, spec):
+                    if re.fullmatch(r'-T[0-5]', token):
+                        arguments.append(('-T', token[2:]))
+                    elif re.fullmatch(r'-p[\d,\-]+', token):
+                        arguments.append(('-p', token[2:]))
+                    else:
+                        arguments.append((base, attached or None))
                     continue
                 bundle = self._expand_bundle(token, spec)
                 if bundle is not None:
                     pending, pending_flag = bundle
+                    # Keep each boolean and the final value-taking flag so
+                    # bundles cannot bypass payload gates or numeric bounds.
+                    arguments.extend(('-' + ch, None) for ch in token[1:]
+                                     if '-' + ch in bool_flags)
                     continue
                 return None, None, token
             positionals.append(token)
@@ -570,7 +638,12 @@ class PolicyEngine:
             targets.extend(positionals)
         return targets, resolvers, None
 
-    def validate_command(self, command, authorized_scopes, expected_tool=None, allow_exploitation=False):
+    def validate_command(self, command, authorized_scopes, expected_tool=None, allow_exploitation=False, aggressive=False):
+        # Aggressive lab mode is a superset of controlled exploitation: it can
+        # only be reached when the target authorizes exploitation, so it always
+        # implies allow_exploitation here.
+        if aggressive:
+            allow_exploitation = True
         if not command or not command.strip():
             return False, 'A command is required.', None
         if any(char in command for char in CONTROL_CHARS):
@@ -587,6 +660,16 @@ class PolicyEngine:
 
         tool = tokens[0]
         rules = registry[tool]
+        # In aggressive lab mode the tool's aggressive flag sets are folded into
+        # the permitted allowlist; otherwise `rules` is used unchanged, so the
+        # default (safe) behaviour is byte-for-byte identical.
+        if aggressive and (rules.get('aggressive_bool_flags') or rules.get('aggressive_value_flags')):
+            rules = {
+                **rules,
+                'bool_flags': set(rules.get('bool_flags', set())) | set(rules.get('aggressive_bool_flags', set())),
+                'value_flags': set(rules.get('value_flags', set())) | set(rules.get('aggressive_value_flags', set())),
+                'attached_patterns': tuple(rules.get('attached_patterns', ())) + tuple(rules.get('aggressive_attached_patterns', ())),
+            }
 
         # The exploitation gate: a tool (sqlmap, msfconsole) or a payload
         # (curl with a request body) is exploitation-grade, and the client's
@@ -598,22 +681,29 @@ class PolicyEngine:
             return False, ("The client's engagement letter does not authorize controlled exploitation "
                            'against this target, so this command is refused.'), rules
 
-        targets, resolvers, rejected = self.scan_arguments(tokens, rules)
+        arguments = []
+        targets, resolvers, rejected = self.scan_arguments(tokens, rules, arguments)
         if rejected is not None:
             return False, f'Blocked flag for {tool}: {rejected} is not in the permitted flag set for this capability.', rules
+        if not allow_exploitation and any(flag in PAYLOAD_FLAGS.get(tool, ()) for flag, _ in arguments):
+            return False, "The client's engagement letter does not authorize controlled exploitation against this target.", rules
+        error = validate_argument_values(tool, arguments)
+        if error:
+            return False, f'Blocked argument for {tool}: {error}.', rules
 
         # msfconsole's -x value is a script, not a single target: validate it
         # statement by statement (module tree, set keys, RHOSTS scope) after
         # the ordinary flag walk found the flag itself. Scope enforcement
         # lives inside the script check, so success returns here.
         if rules.get('msf'):
-            script = next((tokens[i + 1] for i, token in enumerate(tokens[1:-1], 1) if token in ('-x', '--execute-command')), None)
-            if script is None:
+            scripts = [value for flag, value in arguments if flag in ('-x', '--execute-command')]
+            if len(scripts) != 1:
                 return False, 'msfconsole requires a -x resource script (use ...; set ...; run; exit).', rules
-            errors = self._msf_script_errors(script, authorized_scopes)
+            errors = self._msf_script_errors(scripts[0], authorized_scopes, aggressive=aggressive)
             if errors:
                 return False, f'Blocked msfconsole resource script: {errors[0]}', rules
-            return True, 'Allowed exploitation capability (high risk); resource script scope-checked; HITL approval required.', rules
+            mode = 'aggressive lab' if aggressive else 'controlled verification'
+            return True, f'Allowed exploitation capability (high risk, {mode}); resource script scope-checked; HITL approval required.', rules
 
         if rules.get('offline'):
             # An offline lookup takes search terms as positionals; there is no
@@ -624,12 +714,34 @@ class PolicyEngine:
 
         if not targets:
             return False, 'The command must contain an explicit target.', rules
+        # URL-capable scanners must not reinterpret an allowed hostname as a
+        # local-file URL, credential-bearing authority, or curl URL expansion.
+        for target in targets:
+            if '://' in target:
+                try:
+                    parsed = urlparse(target)
+                    port = parsed.port
+                    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                        raise ValueError('unsupported URL')
+                    if port == 0:
+                        raise ValueError('invalid port')
+                    if tool == 'curl' and any(ch in parsed.path + parsed.query for ch in '{}[]'):
+                        raise ValueError('URL expansion')
+                except ValueError:
+                    return False, 'Targets must be HTTP(S) URLs without credentials or URL expansion.', rules
         outside = [target for target in targets if not self.validate_target(target, authorized_scopes)]
         if outside:
             return False, f'A command target is outside the authorized scope: {outside[0]}.', rules
         unapproved = [resolver for resolver in resolvers if not self.validate_resolver(resolver, authorized_scopes)]
         if unapproved:
             return False, f'Resolver {unapproved[0]} is neither in scope nor a well-known public resolver.', rules
+        flags = {flag for flag, _ in arguments}
+        required = {'whatweb': {'--follow-redirect'},
+                    'sqlmap': {'--ignore-redirects'},
+                    'nuclei': {'-dr', '-disable-redirects'}}.get(tool)
+        if required and not flags.intersection(required):
+            hint = '--follow-redirect never' if tool == 'whatweb' else sorted(required)[0]
+            return False, f'{tool} requires {hint}; redirect destinations need separate scope review.', rules
         return True, f"Allowed {rules['capability']} capability ({rules['risk']} risk); HITL approval required.", rules
 
 

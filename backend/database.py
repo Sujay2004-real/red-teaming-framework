@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Index, create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from modules.secret_store import encrypt_secret, is_encrypted
@@ -10,9 +10,14 @@ from modules.secret_store import encrypt_secret, is_encrypted
 # import (the analyzer has no database dependency by design).
 FINDING_DRIVER_DEFAULTS = {'exploitability': 3, 'impact': 3, 'exposure': 3}
 
-os.makedirs('./data', exist_ok=True)
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./data/redteam.db')
 engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
+if DATABASE_URL.startswith('sqlite'):
+    @event.listens_for(engine, 'connect')
+    def configure_sqlite(connection, _):
+        connection.execute('PRAGMA foreign_keys=ON')
+        connection.execute('PRAGMA busy_timeout=10000')
+        connection.execute('PRAGMA journal_mode=WAL')
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -34,6 +39,13 @@ class Target(Base):
     # The policy engine refuses every exploitation-grade command otherwise,
     # fail-closed like every other letter-derived restriction.
     exploitation_authorized = Column(Boolean, default=False)
+    # Opt-in "aggressive lab mode": unlocks weaponized exploitation (data
+    # extraction, single-command RCE, real Metasploit exploit modules with
+    # payloads/sessions) for a target the operator owns. Only ever effective
+    # when exploitation_authorized is also true, and every step still needs
+    # per-step human approval. Off by default; safe for production targets.
+    aggressive_lab = Column(Boolean, default=False)
+    engagement_policy = Column(JSON, default=dict)
     created_at = Column(DateTime, default=utcnow)
 
 class AppSettings(Base):
@@ -55,6 +67,9 @@ class AppSettings(Base):
     ssh_port = Column(Integer, default=22)
     ssh_username = Column(String, default='')
     ssh_password = Column(Text, default='')
+    ssh_fingerprint = Column(String, default='')
+    ssh_private_key = Column(Text, default='')
+    ssh_key_passphrase = Column(Text, default='')
     # SHA-256 digest of the operator API key (or '' when REDTEAM_API_KEY is
     # used instead). The plaintext is printed to the console on the first
     # start and never stored anywhere.
@@ -86,6 +101,8 @@ class Assessment(Base):
     # outputs analyzed, so the next phase's plan is only draftable from
     # findings that actually exist.
     analyzed_phases = Column(JSON, default=list)
+    plan_version = Column(Integer, default=1, nullable=False)
+    analysis_metadata = Column(JSON, default=dict)
     created_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
 
@@ -108,9 +125,17 @@ class ToolExecution(Base):
     # kernel, SSH host-key fingerprint) - the proof the output came from the
     # attacker VM and not from anywhere the operator could have staged it.
     execution_host = Column(JSON, default=None)
+    state = Column(String, default='queued', index=True)
+    cancel_requested = Column(Boolean, default=False)
+    worker_id = Column(String, default='')
+    heartbeat_at = Column(DateTime)
+    live_output = Column(Text, default='')
+    output_cursor = Column(Integer, default=0)
+    plan_version = Column(Integer, default=1)
 
 class Finding(Base):
     __tablename__ = 'findings'
+    __table_args__ = (Index('ix_finding_assessment_priority', 'assessment_id', 'priority_score'),)
     id = Column(Integer, primary_key=True, index=True)
     assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False)
     fingerprint = Column(String, index=True, default='')
@@ -175,42 +200,54 @@ class Recommendation(Base):
     origin = Column(String, default='auto')
     created_at = Column(DateTime, default=utcnow)
 
-Base.metadata.create_all(bind=engine)
+class ExecutionAttempt(Base):
+    """Immutable completed attempt; ToolExecution is the current projection."""
+    __tablename__ = 'execution_attempts'
+    __table_args__ = (UniqueConstraint('execution_id', 'attempt'),)
+    id = Column(Integer, primary_key=True)
+    execution_id = Column(Integer, ForeignKey('tool_executions.id'), nullable=False, index=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    attempt = Column(Integer, nullable=False)
+    snapshot = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
 
-def _migrate_sqlite():
-    if not DATABASE_URL.startswith('sqlite'):
-        return
-    additions = {
-        # Every column added to AppSettings after the first release has to be
-        # listed here. create_all only creates missing tables, so a database
-        # from an earlier version keeps its old app_settings shape, and
-        # _encrypt_stored_secrets below then SELECTs proxy_password from a
-        # table that has no such column - an OperationalError at import time
-        # that takes the whole backend down before it can serve anything.
-        'app_settings': [
-            ('api_base_url', "VARCHAR DEFAULT ''"), ('model_name', "VARCHAR DEFAULT ''"),
-            ('proxy_url', "VARCHAR DEFAULT ''"), ('proxy_username', "VARCHAR DEFAULT ''"),
-            ('proxy_password', "TEXT DEFAULT ''"), ('updated_at', 'DATETIME'),
-            ('execution_mode', "VARCHAR DEFAULT 'local'"), ('ssh_host', "VARCHAR DEFAULT ''"),
-            ('ssh_port', 'INTEGER DEFAULT 22'), ('ssh_username', "VARCHAR DEFAULT ''"),
-            ('ssh_password', "TEXT DEFAULT ''"), ('operator_key_hash', "VARCHAR DEFAULT ''"),
-        ],
-        'targets': [('authorized_scopes', "JSON DEFAULT '[]'"), ('criticality', 'INTEGER DEFAULT 70'), ('restricted_tools', "JSON DEFAULT '[]'"), ('exploitation_authorized', 'BOOLEAN DEFAULT 0')],
-        'assessments': [('approval_required', 'BOOLEAN DEFAULT 1'), ('completed_at', 'DATETIME'), ('engagement_brief', 'JSON'), ('analysis_mode', "VARCHAR DEFAULT ''"), ('current_phase', "VARCHAR DEFAULT 'recon'"), ('analyzed_phases', "JSON DEFAULT '[]'")],
-        'tool_executions': [('step_index', 'INTEGER DEFAULT 0'), ('duration_ms', 'INTEGER DEFAULT 0'), ('approved_by_user', 'BOOLEAN DEFAULT 0'), ('attempt', 'INTEGER DEFAULT 1'), ('execution_host', 'JSON')],
-        'findings': [('fingerprint', "VARCHAR DEFAULT ''"), ('risk_score', 'INTEGER DEFAULT 0'), ('priority_score', 'INTEGER DEFAULT 0'), ('confidence_score', 'INTEGER DEFAULT 0'), ('source_tools', "JSON DEFAULT '[]'"), ('created_at', 'DATETIME'), ('endpoint', "VARCHAR DEFAULT ''"), ('parameter', "VARCHAR DEFAULT ''"), ('exploitability', 'INTEGER DEFAULT 3'), ('impact', 'INTEGER DEFAULT 3'), ('exposure', 'INTEGER DEFAULT 3'), ('verification', "VARCHAR DEFAULT ''"), ('exploit_evidence', "TEXT DEFAULT ''"), ('verified_by', "JSON DEFAULT '[]'"), ('phase', "VARCHAR DEFAULT 'recon'")],
-    }
-    with engine.begin() as conn:
-        known = inspect(engine)
-        for table, columns in additions.items():
-            existing = {column['name'] for column in known.get_columns(table)}
-            for name, ddl in columns:
-                if name not in existing:
-                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}'))
-        duplicate = conn.execute(text('SELECT 1 FROM tool_executions GROUP BY assessment_id, step_index HAVING COUNT(*) > 1 LIMIT 1')).first()
-        if not duplicate:
-            conn.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS uq_tool_execution_step_idx ON tool_executions (assessment_id, step_index)'))
-_migrate_sqlite()
+
+class FindingReview(Base):
+    __tablename__ = 'finding_reviews'
+    __table_args__ = (UniqueConstraint('assessment_id', 'fingerprint'),)
+    id = Column(Integer, primary_key=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    fingerprint = Column(String, nullable=False)
+    status = Column(String, default='open')
+    owner = Column(String, default='')
+    due_date = Column(String, default='')
+    justification = Column(Text, default='')
+    comments = Column(JSON, default=list)
+    retest_evidence = Column(Text, default='')
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ReportVersion(Base):
+    __tablename__ = 'report_versions'
+    id = Column(Integer, primary_key=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    digest = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    provenance = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class RecommendationTask(Base):
+    __tablename__ = 'recommendation_tasks'
+    __table_args__ = (UniqueConstraint('execution_id', 'attempt'),)
+    id = Column(Integer, primary_key=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    execution_id = Column(Integer, nullable=False)
+    attempt = Column(Integer, default=1)
+    state = Column(String, default='pending')
+    detail = Column(String, default='')
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 def _encrypt_stored_secrets():
     """Bring an existing settings row in line with the no-defaults policy.
@@ -242,7 +279,34 @@ def _encrypt_stored_secrets():
             if updates:
                 assignments = ', '.join(f'{field} = :{field}' for field in updates)
                 conn.execute(text(f'UPDATE app_settings SET {assignments} WHERE id = :id'), {**updates, 'id': row['id']})
-_encrypt_stored_secrets()
+def initialize_database():
+    """Run versioned migrations explicitly at application/worker startup."""
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+    if engine.url.get_backend_name() == 'sqlite' and engine.url.database not in (None, '', ':memory:'):
+        Path(engine.url.database).parent.mkdir(parents=True, exist_ok=True)
+    config = Config()
+    config.set_main_option('script_location', str(Path(__file__).parent / 'migrations'))
+    with engine.begin() as connection:
+        config.attributes['connection'] = connection
+        command.upgrade(config, 'head')
+    _encrypt_stored_secrets()
+
+
+def migration_head():
+    """The Alembic head revision id, derived from the migration scripts.
+
+    The worker startup gate and the /ready check compare the database's applied
+    revision against this instead of a hardcoded id, so adding a new migration
+    does not silently break either.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from pathlib import Path
+    config = Config()
+    config.set_main_option('script_location', str(Path(__file__).parent / 'migrations'))
+    return ScriptDirectory.from_config(config).get_current_head()
 
 def get_db():
     db = SessionLocal()

@@ -35,7 +35,8 @@ existing deterministic generators minus whatever has already been run.
 import json
 import re
 
-import requests
+from modules.provider import transport as requests
+from modules.command_values import PLANNING_RULES
 
 from modules.analyzer import bounded_int, strip_ansi
 from modules.planner import MAX_PLAN_STEPS, planner_agent
@@ -185,6 +186,7 @@ def render_state_prompt(state, available_tools):
         'Authorized scopes (every command must stay inside these): '
         + (', '.join(authorization['authorized_scopes']) or state['target']),
         'Available tools (nothing else is permitted): ' + ', '.join(sorted(available_tools)),
+        'Required command policy: ' + PLANNING_RULES,
     ]
     if authorization['restricted_tools']:
         lines.append('Tools the client letter forbids on this target (never propose): '
@@ -299,7 +301,7 @@ def _already_run_commands(plan, executions):
 
 
 def _deterministic_candidates(phase, target_address, findings, authorized_scopes,
-                              verification_endpoints):
+                              verification_endpoints, aggressive=False):
     """Fallback proposals from the generators the framework already trusts.
 
     This is not a third planner: it is what the framework would have drafted for
@@ -308,12 +310,12 @@ def _deterministic_candidates(phase, target_address, findings, authorized_scopes
     operator could have reached by hand, not a weaker parallel path.
     """
     if phase == 'exploitation':
-        steps, _ = exploit_planner.draft_exploitation_plan(
-            findings, target_address, authorized_scopes, verification_endpoints)
+        steps, _ = exploit_planner.draft_plan('exploitation',
+            findings, target_address, authorized_scopes, verification_endpoints, aggressive=aggressive)
         return steps
     if phase == 'post_exploitation':
-        steps, _ = exploit_planner.draft_post_exploitation_plan(
-            findings, target_address, authorized_scopes)
+        steps, _ = exploit_planner.draft_plan('post_exploitation',
+            findings, target_address, authorized_scopes, aggressive=aggressive)
         return steps
     return planner_agent.default_plan(target_address)
 
@@ -343,7 +345,7 @@ class NextStepsPlanner:
     def propose(self, *, phase, target_address, objective, criticality,
                 authorized_scopes, restricted_tools, exploitation_authorized,
                 verification_endpoints, findings, executions, plan,
-                api_key='', base_url='', model_name=''):
+                api_key='', base_url='', model_name='', aggressive_lab=False):
         """Return (candidates, refused, source, notes).
 
         `refused` carries every candidate the policy engine rejected, with its
@@ -393,7 +395,8 @@ class NextStepsPlanner:
             raw_candidates = [
                 _deterministic_raw_step(step, phase)
                 for step in _deterministic_candidates(phase, target_address, findings,
-                                                      authorized_scopes, verification_endpoints)
+                                                      authorized_scopes, verification_endpoints,
+                                                      aggressive=aggressive_lab)
             ]
             if source == 'ai-filtered':
                 source = 'provider-error'
@@ -427,6 +430,7 @@ class NextStepsPlanner:
                 # Same gate the execute endpoint applies: a step that could
                 # never be approved must not be offered as though it could.
                 allow_exploitation=bool(exploitation_authorized),
+                aggressive=bool(exploitation_authorized and aggressive_lab),
             )
             if not valid:
                 refused.append({'tool': raw['tool'], 'command': command, 'reason': reason})

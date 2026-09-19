@@ -8,7 +8,9 @@ maps to the report chapter it belongs in.
 
 | Layer | Module | Lines | Responsibility |
 |---|---|---|---|
-| API | `main.py` | ~1,480 | 21 REST endpoints, phase lifecycle, execution approval |
+| API | `main.py` | ~1,630 | 29 REST endpoints, phase lifecycle, execution approval |
+| Workspace API | `modules/workspace_api.py` | 161 | 9 mounted endpoints: paginated catalog/snapshot, findings paging + review workflow, assessment compare, evidence, report versions |
+| Reliability | `modules/jobs.py`, `worker.py` | 184 + 34 | Durable background execution jobs, heartbeat-leased worker, reconnectable output |
 | Auth | `modules/api_auth.py` | 89 | Operator API-key gate (env-chosen or generated, digest-stored) |
 | Policy | `modules/policy_engine.py` | ~640 | Per-tool flag allowlists, scope/CIDR checks, letter-gated exploitation, msf script validation |
 | Execution | `modules/executor.py` | 161 | `create_subprocess_exec` (no shell), timeouts, output caps, env sandboxing |
@@ -18,10 +20,11 @@ maps to the report chapter it belongs in.
 | Adaptivity | `modules/next_steps.py` | 503 | Bounded engagement-state digest → ranked, policy-checked proposals |
 | Reasoning | `modules/attack_paths.py` | 260 | Finding graph → attack paths; grounded AI narratives |
 | Reporting | `modules/reporter.py` + template | 33 + ~200 | Client HTML report with phases, verification, attack paths, audit trail |
-| Frontend | `src/App.jsx` + 12 components | ~2,700 | Single-page control center |
+| Frontend | `src/App.jsx` + 14 components | ~1,320 | Single-page control center |
 
-**Total: ~9,300 lines of backend Python, ~2,700 lines of frontend, 233 automated tests
-(all passing, pytest runtime ≈ 12 s).**
+**Total: ~7,900 lines of backend Python excluding tests (~12,300 with the test suite),
+~1,320 lines of React (JS/JSX) plus ~2,060 lines of CSS, 354 backend tests and 6 frontend
+tests (all passing).**
 
 ## Chapter 7 (methodology) — the loop, as actually implemented
 
@@ -100,7 +103,7 @@ Chapter 8 as tables — they replace the estimated comparison table with measure
 
 ## Verification performed (2026-09-12)
 
-- pytest: **233 passed** (0.13 s–12 s per file; full suite ≈ 12 s)
+- pytest: **354 passed**; frontend: **6 passed**, ESLint clean, production build clean, npm audit clean
 - ESLint: 0 errors; production build: 32 modules, 77 kB gzipped JS
 - Live end-to-end smoke run (backend on Windows, no lab): full phased lifecycle
   completed — letter import → 8-step recon plan (incl. `zap-baseline.py`) → execution →

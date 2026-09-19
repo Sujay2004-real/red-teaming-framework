@@ -163,6 +163,6 @@ class TestReportIntegration:
             'host:3000', 'Test objective', findings, [], str(out),
             attack_paths=paths)
         html = out.read_text(encoding='utf-8')
-        assert 'Attack paths' in html
+        assert 'Finding correlations' in html
         assert 'Missing CSP header' in html
         assert 'deterministic' in html

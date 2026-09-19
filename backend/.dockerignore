@@ -6,3 +6,17 @@ __pycache__
 .git
 .gitignore
 .env
+.env.*
+.venv
+data
+**/data
+reports
+**/reports
+*.db
+*.db-*
+*.sqlite*
+**/.secret_key
+*.log
+.pytest_cache
+.pytest_tmp
+.pytest_*

@@ -13,12 +13,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
+          pip install -r backend/requirements-dev.txt
 
       - name: Run test suite
         run: python -m pytest backend -q
@@ -30,10 +30,38 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install and build frontend
         working-directory: frontend
         run: |
           npm ci
+          npm run lint
+          npm test
+          npm audit --audit-level=high
           npm run build
+
+  docker-images:
+    # Proves the production stack the README documents actually builds and its
+    # compose files are valid — the scanner image fetches nmap/nuclei/ZAP/
+    # exploitdb over the network at pinned revisions, so a moved release or a
+    # refused shallow-SHA fetch fails here instead of on first real deploy.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose files
+        env:
+          REDTEAM_API_KEY: ci-validate-key
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          docker compose -f docker-compose.prod.yml config >/dev/null
+
+      - name: Build backend API image
+        run: docker build --target api -t redteam-api:ci ./backend
+
+      - name: Build backend scanner image
+        run: docker build --target scanner -t redteam-scanner:ci ./backend
+
+      - name: Build production frontend image
+        run: docker build -f frontend/Dockerfile.prod -t redteam-frontend:ci ./frontend

@@ -3,6 +3,7 @@ import os
 import shlex
 import signal
 import time
+import threading
 
 MAX_OUTPUT_CHARS = 200_000
 # Stop accumulating well before memory pressure, but keep draining the pipes so
@@ -40,21 +41,27 @@ class LiveRegistry:
 
     def __init__(self):
         self._streams = {}
+        self._lock = threading.Lock()
 
     def start(self, execution_id, command):
-        self._streams[execution_id] = {'command': command, 'output': '', 'done': False}
+        with self._lock:
+            self._streams[execution_id] = {'command': command, 'output': '', 'cursor': 0, 'done': False}
 
     def append(self, execution_id, text):
-        entry = self._streams.get(execution_id)
-        if entry is not None:
-            entry['output'] = (entry['output'] + text)[-LIVE_BUFFER_CHARS:]
+        with self._lock:
+            entry = self._streams.get(execution_id)
+            if entry is not None:
+                entry['output'] = (entry['output'] + text)[-LIVE_BUFFER_CHARS:]
+                entry['cursor'] += len(text)
 
     def finish(self, execution_id):
-        self._streams.pop(execution_id, None)
+        with self._lock:
+            self._streams.pop(execution_id, None)
 
     def snapshot(self, execution_id):
-        entry = self._streams.get(execution_id)
-        return dict(entry) if entry is not None else None
+        with self._lock:
+            entry = self._streams.get(execution_id)
+            return dict(entry) if entry is not None else None
 
 
 live_registry = LiveRegistry()

@@ -96,7 +96,7 @@ Key capabilities:
   exploitation verdicts carried through. Each path gets a one-paragraph explanation —
   grounded, when an AI provider is configured: every finding id a narrative cites is
   verified to exist, and a hallucinated citation falls back to the deterministic
-  explanation. Paths appear in the client report's "Attack paths" section.
+  explanation. Paths appear in the client report's "Finding correlations" section.
 - **Allowlist policy enforcement** — a per-tool flag allowlist, scope-checked targets, and
   an approved-resolver list. Anything not explicitly permitted **fails closed**.
 - **Human-in-the-loop execution** — each approved command runs in a sandboxed async
@@ -149,18 +149,33 @@ Key capabilities:
 | File | Responsibility |
 |------|----------------|
 | `main.py` | FastAPI app: targets, assessments, execution, phase planning, analysis, reporting, settings, uploads |
-| `database.py` | SQLAlchemy models, SQLite auto-migration, one-time credential-encryption migration |
+| `worker.py` | Standalone scanner worker (production `external` mode): drains the durable job queue |
+| `database.py` | SQLAlchemy models, Alembic migrations, one-time credential-encryption migration |
 | `models.py` | Pydantic request models with input validation and bounds |
+| `migrations/` | Alembic revision scripts and the frozen-schema snapshot that adopts legacy columns |
 | `modules/phases.py` | The engagement phase model shared by backend and UI (order, gates, tool tiers) |
+| `modules/api_auth.py` | Operator API-key gate (env-chosen or first-start generated, SHA-256 digest at rest) |
 | `modules/engagement_parser.py` | Deterministic parser: engagement letter text → structured brief (incl. exploitation authorization) |
+| `modules/document_text.py` | Bounded text/table extraction from PDF, Word, Markdown and text uploads |
 | `modules/planner.py` | Recon-plan generation (AI provider or built-in default), policy-filtered |
 | `modules/exploit_planner.py` | Findings → exploitation / post-exploitation steps, every step policy-validated |
 | `modules/next_steps.py` | Adaptive next-step proposals: engagement-state digest → ranked, policy-checked candidates |
+| `modules/attack_paths.py` | Finding graph → ranked attack paths with grounded (citation-verified) narratives |
 | `modules/policy_engine.py` | **The security core** — allowlist command validation, scope + resolver checks, exploitation gate, msfconsole script validation |
+| `modules/scope_rules.py` | Scope containment / overlap, command target extraction, test-window checks |
+| `modules/command_values.py` | Numeric and value bounds the policy engine enforces on tool arguments |
 | `modules/executor.py` | Async subprocess execution with timeouts, output caps, env sandboxing, proxy |
+| `modules/jobs.py` | Durable background execution: leased jobs, heartbeats, reconnectable output, attempt history |
+| `modules/outcomes.py` | Maps tool exit codes to success/failure/finding outcomes |
 | `modules/ssh_executor.py` | Kali attacker-VM engine: paramiko SSH + tmux, per-run attestation |
 | `modules/analyzer.py` | Findings extraction, deduplication, scoring, verification linking |
+| `modules/verification.py` | Independent proof adapter: derives verified verdicts from scanner output, not from AI text |
+| `modules/provider.py` | Shared OpenAI-compatible provider transport, timeouts and usage telemetry |
 | `modules/reporter.py` | Jinja2 HTML report rendering (phases, verification section) |
+| `modules/report_versions.py` | Versioned atomic report writes with provenance |
+| `modules/workspace_api.py` | Mounted router: paginated catalog/snapshot, findings paging + review workflow, assessment compare, report versions |
+| `modules/observability.py` | ASGI middleware: per-request timing and structured logging |
+| `modules/eval_metrics.py` | Metric aggregation for the evaluation harness (mean/stdev/min/max, recall) |
 | `modules/secret_store.py` | Fernet encryption-at-rest for provider credentials |
 
 ### Frontend
@@ -264,9 +279,13 @@ The framework is deliberately conservative — safety is enforced in code, not c
   or `curl` carrying a request body — are refused unless the client's engagement letter
   explicitly authorizes controlled verification for that target. The gate applies at
   plan time, at phase-draft time, and at approval time, always with the reason.
-- **Bounded verification.** Post-exploitation steps retrieve a single benign record per
-  verified flaw (DBMS banner / current user). No privilege escalation, persistence,
-  lateral movement, or data enumeration is possible through the policy engine.
+- **Bounded verification by default.** Post-exploitation steps retrieve a single benign
+  record per verified flaw (DBMS banner / current user). No privilege escalation,
+  persistence, lateral movement, or data enumeration is possible through the policy
+  engine — *unless* a target has opted into
+  [aggressive lab mode](#aggressive-lab-mode-opt-in-weaponized-exploitation), which is
+  doubly gated (`exploitation_authorized` **and** `aggressive_lab`), still scope-checked,
+  and still per-step approved. It is intended only for lab targets you own.
 - **Scope enforcement.** Every command must contain an explicit target inside the target's
   authorized scopes (hostname suffix match, CIDR membership, or — for a CIDR target —
   the requested range being a subnet of an authorized network). DNS resolvers are
@@ -292,6 +311,10 @@ The framework is deliberately conservative — safety is enforced in code, not c
 ---
 
 ## Technology stack
+
+See [priority security fixes](docs/priority_security_fixes.md) for argument-value
+checks, Docker data exclusions, verification rules, and compatibility notes for
+previously saved commands and reports.
 
 **Backend:** Python 3.10 · FastAPI · Uvicorn · SQLAlchemy · SQLite · Pydantic · Jinja2 ·
 cryptography (Fernet) · paramiko (Kali VM execution engine) · pypdf · python-docx · pytest
@@ -465,11 +488,41 @@ target:
   findings name each host individually, but a host it finds is not authorized for
   deeper assessment until you register it separately with the client's say-so.
 
-**Honest scope statement:** this is a *non-destructive scanning and governance*
-framework — reconnaissance, fingerprinting, header/TLS audits and
-template-driven checks, each behind an allowlist policy and a human approval.
-It is deliberately **not** an exploitation framework; that restraint is what
-makes it safe to point at client systems.
+**Honest scope statement:** by default this is a *non-destructive scanning and
+governance* framework — reconnaissance, fingerprinting, header/TLS audits,
+template-driven checks and bounded proof-of-concept verification, each behind an
+allowlist policy and a human approval. That default is what makes it safe to
+point at client systems.
+
+### Aggressive lab mode (opt-in weaponized exploitation)
+
+For a target you **fully own and are authorized to attack** — a lab machine, not
+a client system — a per-target **aggressive lab mode** unlocks real exploitation
+so the engagement can carry the full real-life sequence through to impact:
+
+- **sqlmap** escalates from injection *verification* to **data extraction**
+  (`--dbs`/`--tables`/`--dump`) and a single non-interactive **OS command**
+  (`--os-cmd=id`) that proves code execution.
+- **msfconsole** exploit modules may carry a **payload** and a reverse handler
+  (`PAYLOAD`/`LHOST`/`LPORT`), fire a backgrounded session (`exploit -z`), and run
+  non-interactive post-exploitation commands (`sessions -C "id"`). Mapped services
+  also get a non-destructive exploitability `check`.
+- Post-exploitation loots verified injections (schema + data dump, `--os-cmd`).
+
+The guardrails that stay in force, even here:
+
+- **Doubly gated.** Effective only when a target has *both* `exploitation_authorized`
+  **and** `aggressive_lab` set; the backend refuses to store `aggressive_lab` on a
+  target that is not exploitation-authorized. Off by default; safe for any client target.
+- **Scope still binds.** Every `RHOSTS`/URL is scope-checked exactly as before —
+  aggressive mode widens *what* you may do to a target, never *which* targets.
+- **Attacker-side only for listeners.** `LHOST`/`SRVHOST` (your VM) are not
+  scope-checked; interactive `--os-shell`/`sql-shell` and `sessions -i` stay refused
+  because they need a TTY the non-shell subprocess cannot provide.
+- **Human-in-the-loop unchanged.** Every step is still a per-step, explicit approval.
+
+Leave it **off** for any production or client engagement; the default bounded-verification
+behaviour is unchanged and remains the recommended posture for authorized client work.
 
 ## Kali VM execution engine (attacker-VM mode)
 
@@ -580,7 +633,7 @@ engagements.)
 
 ## Testing
 
-The backend has a pytest suite (233 tests) covering the analyzer, planner, policy engine
+The backend has a pytest suite (354 tests) covering the analyzer, planner, policy engine
 (including the ZAP baseline's flag surface: the active-scan, config-file, daemon-option
 and report-writing flags are all refused), the operator API-key gate, the secret store,
 request models, engagement parser, the phase model, the exploit planner, the
@@ -589,8 +642,9 @@ with their budget cap), attack-path derivation and grounded narrative citation, 
 next-step proposal engine (state-digest bounds, duplicate suppression, provenance
 verification, policy refusals, prompt-injection confinement), the SSH/tmux VM executor,
 and the end-to-end API workflow across all phases. The analyzer and planner tests are
-written against output the scanners really produced in the Docker stack — escape codes,
-tentative nmap matches and all.
+written against real scanner output — escape codes, tentative nmap matches and all —
+captured earlier from these tools and checked in as fixtures, so the suite reproduces
+that fidelity without needing the scanners installed.
 
 ```bash
 cd backend
@@ -632,6 +686,14 @@ recall against a ground-truth list (a Metasploitable2 checklist ships in
 provider endpoint cleared (deterministic path) and once restored (AI path) — producing
 the PentestGPT-style ablation comparison; the provider's stored key is never touched.
 
+> **Two different targets, on purpose.** Recall benchmarking needs a target with
+> documented, countable vulnerabilities, so the checklist arm runs against
+> **Metasploitable2**. The live demo and the shipped engagement letter instead run
+> against a **real self-hosted application (OmniRoute)** through the letter-driven,
+> non-exploitation flow — where the point is that a real, maintained app comes back
+> mostly clean. The eval uses Metasploitable2 for measurable recall; it is not the
+> application the framework is demonstrated against.
+
 ```bash
 cd backend
 venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --exploit \
@@ -648,23 +710,36 @@ venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --explo
 │   ├── main.py                     # FastAPI application & endpoints
 │   ├── database.py                 # ORM models, migrations, secret migration
 │   ├── models.py                   # Pydantic request models
+│   ├── worker.py                   # Standalone scanner worker (production external mode)
+│   ├── migrations/                 # Alembic revisions + frozen-schema snapshot
 │   ├── modules/
 │   │   ├── api_auth.py             # Operator API-key gate (env key or generated digest)
 │   │   ├── engagement_parser.py    # Engagement letter → structured brief
+│   │   ├── document_text.py        # Bounded PDF/Word/Markdown/text extraction
 │   │   ├── phases.py               # The engagement phase model
 │   │   ├── planner.py              # Assessment plan generation
 │   │   ├── exploit_planner.py      # Findings → exploitation / post-exploitation steps
 │   │   ├── next_steps.py           # Adaptive next-step proposals (ranked, policy-checked)
 │   │   ├── attack_paths.py         # Finding graph → attack paths + grounded narratives
 │   │   ├── policy_engine.py        # Allowlist command validation
+│   │   ├── scope_rules.py          # Scope containment/overlap, target extraction, windows
+│   │   ├── command_values.py       # Numeric/value bounds for tool arguments
 │   │   ├── executor.py             # Sandboxed subprocess execution
+│   │   ├── jobs.py                 # Durable background execution (leased jobs, heartbeats)
+│   │   ├── outcomes.py             # Exit code → success/failure/finding outcome
 │   │   ├── ssh_executor.py         # Kali attacker-VM engine (SSH + tmux)
 │   │   ├── analyzer.py             # Findings correlation & scoring (incl. ZAP baseline)
+│   │   ├── verification.py         # Independent proof adapter (verdicts from scanner output)
+│   │   ├── provider.py             # Shared OpenAI-compatible provider transport + telemetry
 │   │   ├── reporter.py             # HTML report rendering
+│   │   ├── report_versions.py      # Versioned atomic reports with provenance
+│   │   ├── workspace_api.py        # Mounted router: catalog/snapshot, findings review, compare
+│   │   ├── observability.py        # Per-request timing/logging middleware
+│   │   ├── eval_metrics.py         # Evaluation metric aggregation
 │   │   ├── secret_store.py         # Credential encryption at rest
 │   │   └── templates/
 │   │       └── report_template.html
-│   ├── test_*.py                   # pytest suite (233 tests)
+│   ├── test_*.py                   # pytest suite (354 tests)
 │   ├── smoke_e2e.py                # live end-to-end phased run
 │   ├── eval_harness.py             # quantitative evaluation + AI ablation
 │   ├── checklists/                 # ground-truth checklists for recall
@@ -719,3 +794,28 @@ All routes except `/health` require the `X-API-Key` operator header.
 
 *Built for authorized laboratory environments only. Human approval is required before
 every command.*
+
+
+## Production deployment
+
+`docker-compose.prod.yml` defines the hardened stack: a read-only API container, a
+separate scanner worker (the only service that reaches the target — it carries the
+`host.docker.internal` gateway alias; use `network_mode: host` on Linux for LAN-subnet
+sweeps), and an unprivileged Nginx frontend that proxies `/api`. All three run
+`read_only` with `cap_drop: ALL`, `no-new-privileges`, tmpfs scratch, memory/CPU/pid
+limits and restart policies; the worker's liveness is a heartbeat-file healthcheck.
+
+The `docker-images` CI job validates this path on every push: it renders both compose
+files (`docker compose config`) and builds all three images — the `api` and `scanner`
+backend targets (the scanner stage fetches nmap/nuclei/ZAP/exploitdb at pinned
+revisions) and the production frontend — so a moved release URL or a compose error is
+caught in CI rather than on first deploy. Set a strong `REDTEAM_API_KEY` (and, for LAN
+access, `CORS_ALLOW_ORIGINS`) before bringing the stack up:
+
+```bash
+REDTEAM_API_KEY=<strong-key> docker compose -f docker-compose.prod.yml up --build -d
+```
+
+> The compose files are validated locally and in CI, and the images build in CI. Docker
+> itself was unavailable on the development laptop, so the images were not built or run
+> there; the CI `docker-images` job is the standing proof that they build.

@@ -198,7 +198,7 @@ def test_phase_lifecycle_recon_to_exploitation_to_report(client, tmp_path):
     # Reporting owns no plan steps, so the loop correctly drafts nothing.
     assert analyzed3.json()['auto_drafted'] == {'phase': None, 'steps': 0, 'note': ''}
 
-    with patch('main.reporter.generate_html_report', return_value=str(tmp_path / 'report.html')):
+    with patch('main.REPORTS_DIR', tmp_path):
         reported = client.post(f'/assessments/{aid}/report')
     assert reported.status_code == 200
     final = client.get(f'/assessments/{aid}').json()

@@ -12,7 +12,7 @@ export default function PlanEditor({
   runningStep, liveExec, liveElapsed, planLocked, planEditable, planDirty,
   capabilities, toolNames, onSave, onExecute,
 }) {
-  const { busy, agentBusy } = useApp()
+  const { busy, agentBusy, setNotice } = useApp()
   const patchStep = (i, key, value) => setDraftPlan(plan => plan.map((s, n) => n === i ? { ...s, [key]: value } : s))
 
   return <section className="panel">
@@ -23,8 +23,8 @@ export default function PlanEditor({
     <div className="plan">{PLAN_PHASES.filter(p => draftPlan.some(step => (step.phase || 'recon') === p)).map(phaseKey => {
       const phaseIdxs = draftPlan.map((step, i) => (step.phase || 'recon') === phaseKey ? i : -1).filter(i => i >= 0)
       const risky = phaseKey === 'exploitation' || phaseKey === 'post_exploitation'
-      return <div key={phaseKey} className={`phase-group${risky ? ' phase-risk' : ''}`}>
-        <div className="phase-head"><b>{PHASE_LABEL(phaseKey)}</b><small>{phaseIdxs.length} step{phaseIdxs.length !== 1 ? 's' : ''}</small></div>
+      return <details open={!selected.analyzed_phases?.includes(phaseKey)} key={phaseKey} className={`phase-group${risky ? ' phase-risk' : ''}`}>
+        <summary className="phase-head"><b>{PHASE_LABEL(phaseKey)}</b><small>{phaseIdxs.length} step{phaseIdxs.length !== 1 ? 's' : ''}</small></summary>
         {phaseIdxs.map(i => {
           const step = draftPlan[i]
           const execution = executionByStep.get(i)
@@ -37,32 +37,32 @@ export default function PlanEditor({
           const execLive = inFlight && liveExec ? liveExec : null
           const label = inFlight ? 'Running…' : running ? 'Running...' : retryable ? 'Re-approve & retry' : executed ? 'Executed' : 'Approve & execute'
           const state = inFlight || running ? 'Execution in progress'
-            : executed && execution.return_code === 0 ? `Execution logged${execution.attempt > 1 ? ` (attempt ${execution.attempt})` : ''}`
+            : executed && ['completed', 'completed_with_findings'].includes(execution.state) ? `Execution logged${execution.attempt > 1 ? ` (attempt ${execution.attempt})` : ''}`
               : executed ? `Did not succeed (exit ${execution.return_code}) after ${execution.attempt} attempt${execution.attempt > 1 ? 's' : ''}`
                 : planDirty ? 'Save the plan before approving'
                   : 'Awaiting explicit approval'
           return <div className={`step ${risky ? 'step-exploit' : ''} ${step.enabled === false ? 'disabled-step' : ''}`} key={i}>
-            {execLive && <div className="live-terminal" role="log" aria-live="polite">
+            {execLive && <div className="live-terminal" role="region" aria-label="Live command output">
               <div className="terminal-bar"><span className="terminal-dot" /><span className="terminal-title">{selectedTarget?.name || 'target'} — live</span><span className="terminal-status">{execLive.running ? `running · ${liveElapsed}s` : 'finishing…'}</span></div>
               <pre className="terminal-body"><span className="terminal-prompt">$ {step.command}</span>{'\n'}{execLive.output || 'connecting…'}{'█'}</pre>
             </div>}
             <div className="step-head"><span className="step-number">{i + 1}</span>
-              <select value={step.tool} onChange={e => patchStep(i, 'tool', e.target.value)} disabled={locked}>
+              <select aria-label={`Tool for step ${i + 1}`} value={step.tool} onChange={e => patchStep(i, 'tool', e.target.value)} disabled={locked}>
                 {!toolNames.has(step.tool) && <option value={step.tool}>{step.tool} (not permitted)</option>}
                 {capabilities.map(group => <optgroup key={group.id} label={String(group.id).replaceAll('_', ' ')}>{(group.tools || []).map(tool => <option key={tool.name} value={tool.name}>{tool.name}</option>)}</optgroup>)}
               </select>
               <label className="toggle"><input type="checkbox" checked={step.enabled !== false} onChange={e => patchStep(i, 'enabled', e.target.checked)} disabled={locked} /><span /> Enabled</label>
               <button className="icon-btn" title="Remove step" aria-label="Remove step" onClick={() => setDraftPlan(plan => plan.filter((_, n) => n !== i))} disabled={locked}>×</button>
             </div>
-            <input className="command" value={step.command} onChange={e => patchStep(i, 'command', e.target.value)} disabled={locked} />
-            <input value={step.reason || ''} onChange={e => patchStep(i, 'reason', e.target.value)} placeholder="Why this command is needed" disabled={locked} />
-            <div className="step-actions"><span className={executed && execution.return_code === 0 ? 'step-complete' : retryable ? 'step-failed' : ''}>{state}</span>
+            <textarea rows="2" aria-label={`Command for step ${i + 1}`} className="command" value={step.command} onChange={e => patchStep(i, 'command', e.target.value.replace(/[\r\n]+/g, ' '))} disabled={locked} />
+            <input aria-label={`Reason for step ${i + 1}`} value={step.reason || ''} onChange={e => patchStep(i, 'reason', e.target.value)} placeholder="Why this command is needed" disabled={locked} />
+            <div className="step-actions"><button className="secondary compact" onClick={() => navigator.clipboard.writeText(step.command).then(() => setNotice('Command copied')).catch(() => setNotice('Copy unavailable; select the command text instead'))}>Copy command</button><span className={executed && ['completed', 'completed_with_findings'].includes(execution.state) ? 'step-complete' : retryable ? 'step-failed' : ''}>{state}</span>
               {execution?.execution_host && <span className="vm-badge" title={`Ran on the attacker VM ${execution.execution_host.user}@${execution.execution_host.host} · ${execution.execution_host.os} · kernel ${execution.execution_host.kernel} · SSH host key ${execution.execution_host.host_key_fingerprint}`}>ran on Kali VM {execution.execution_host.user}@{execution.execution_host.host}</span>}
-              <button disabled={busy || step.enabled === false || running || (executed && !retryable) || planDirty || !savedStep} onClick={() => onExecute(i)}>{label}</button>
+              <button disabled={busy || step.enabled === false || running || (executed && !retryable) || planDirty || !savedStep || selected.status === 'running' || (step.phase || 'recon') !== (selected.current_phase || 'recon')} onClick={() => onExecute(i)}>{label}</button>
             </div>
           </div>
         })}
-      </div>
+      </details>
     })}</div>
     <button className="secondary" onClick={() => setDraftPlan(plan => [...plan, emptyStep(capabilities[0]?.tools?.[0]?.name)])} disabled={busy || !planEditable}>Add command</button>
     {draftPlan.length === 0 && <div className="empty">Add at least one command to continue.</div>}

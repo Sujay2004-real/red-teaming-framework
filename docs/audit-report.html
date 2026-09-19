@@ -1,0 +1,1062 @@
+<title>Red Team Control Center Audit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+
+<style>
+  :root {
+    --ground: #f5f8fa;
+    --surface: #ffffff;
+    --surface-sunk: #eef3f6;
+    --ink: #0e1e2b;
+    --ink-muted: #5c6e7e;
+    --ink-faint: #8b9aa7;
+    --line: #dbe4ea;
+    --line-strong: #c3d1da;
+    --accent: #0e7c72;
+    --accent-soft: #e2f1ef;
+
+    --sev-critical: #b3242b;
+    --sev-high: #b85c13;
+    --sev-medium: #8a6d14;
+    --sev-low: #37678c;
+
+    --shadow: 0 1px 2px rgba(14, 30, 43, .05), 0 4px 14px rgba(14, 30, 43, .05);
+    --radius: 3px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0b141c;
+      --surface: #121f2b;
+      --surface-sunk: #0f1a24;
+      --ink: #e2eaf0;
+      --ink-muted: #93a6b5;
+      --ink-faint: #6d8090;
+      --line: #22323f;
+      --line-strong: #2e4252;
+      --accent: #3fbfae;
+      --accent-soft: #10302e;
+
+      --sev-critical: #f08a86;
+      --sev-high: #e2a05c;
+      --sev-medium: #d4bc63;
+      --sev-low: #7fb0d8;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 14px rgba(0, 0, 0, .25);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0b141c;
+    --surface: #121f2b;
+    --surface-sunk: #0f1a24;
+    --ink: #e2eaf0;
+    --ink-muted: #93a6b5;
+    --ink-faint: #6d8090;
+    --line: #22323f;
+    --line-strong: #2e4252;
+    --accent: #3fbfae;
+    --accent-soft: #10302e;
+
+    --sev-critical: #f08a86;
+    --sev-high: #e2a05c;
+    --sev-medium: #d4bc63;
+    --sev-low: #7fb0d8;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 14px rgba(0, 0, 0, .25);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 900px;
+    margin: 0 auto;
+    padding-block: 0 96px;
+    padding-inline: 30px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding-block: 56px 26px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  h1 {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-size: clamp(30px, 5.2vw, 46px);
+    font-weight: 700;
+    line-height: 1.06;
+    letter-spacing: -.022em;
+    text-wrap: balance;
+    margin: 0;
+    max-width: 17ch;
+  }
+
+  .standfirst {
+    font-size: 17.5px;
+    line-height: 1.55;
+    color: var(--ink-muted);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .scope {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    overflow: hidden;
+  }
+
+  .scope div {
+    flex: 1 1 132px;
+    padding: 13px 16px;
+    border-right: 1px solid var(--line);
+  }
+
+  .scope div:last-child { border-right: 0; }
+
+  .scope dt {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 3px;
+  }
+
+  .scope dd {
+    margin: 0;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 19px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- verdict ---------- */
+
+  .verdict {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-top: 40px;
+  }
+
+  .verdict > div {
+    background: var(--surface);
+    padding: 22px 24px;
+  }
+
+  .verdict h3 {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    margin: 0 0 12px;
+  }
+
+  .verdict .holds h3 { color: var(--accent); }
+  .verdict .gaps h3 { color: var(--sev-high); }
+
+  .verdict ul {
+    margin: 0;
+    padding-left: 17px;
+    font-size: 14.5px;
+    line-height: 1.5;
+  }
+
+  .verdict li { margin-bottom: 8px; }
+  .verdict li:last-child { margin-bottom: 0; }
+
+  /* ---------- section ---------- */
+
+  section { margin-top: 62px; }
+
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    border-bottom: 1px solid var(--line-strong);
+    padding-bottom: 10px;
+    margin-bottom: 26px;
+  }
+
+  h2 {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-size: 23px;
+    font-weight: 600;
+    letter-spacing: -.014em;
+    margin: 0;
+  }
+
+  .count {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .sec-note {
+    font-size: 15px;
+    color: var(--ink-muted);
+    margin: -12px 0 26px;
+    max-width: 66ch;
+  }
+
+  /* ---------- findings ---------- */
+
+  .finding {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left-width: 4px;
+    border-radius: var(--radius);
+    padding: 17px 20px 18px;
+    margin-bottom: 11px;
+    box-shadow: var(--shadow);
+  }
+
+  .finding[data-sev="critical"] { border-left-color: var(--sev-critical); }
+  .finding[data-sev="high"]     { border-left-color: var(--sev-high); }
+  .finding[data-sev="medium"]   { border-left-color: var(--sev-medium); }
+  .finding[data-sev="low"]      { border-left-color: var(--sev-low); }
+
+  .f-head {
+    display: flex;
+    align-items: baseline;
+    gap: 11px;
+    flex-wrap: wrap;
+    margin-bottom: 9px;
+  }
+
+  .f-title {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-size: 16.5px;
+    font-weight: 600;
+    line-height: 1.3;
+    letter-spacing: -.008em;
+    margin: 0;
+    flex: 1 1 340px;
+  }
+
+  .sev {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    white-space: nowrap;
+    flex: none;
+  }
+
+  .sev[data-sev="critical"] { color: var(--sev-critical); }
+  .sev[data-sev="high"]     { color: var(--sev-high); }
+  .sev[data-sev="medium"]   { color: var(--sev-medium); }
+  .sev[data-sev="low"]      { color: var(--sev-low); }
+
+  .anchor {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12.5px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 2px 6px;
+    border-radius: 2px;
+    white-space: nowrap;
+    flex: none;
+  }
+
+  .f-body { font-size: 15px; line-height: 1.55; }
+  .f-body p { margin: 0 0 9px; }
+  .f-body p:last-child { margin-bottom: 0; }
+
+  .f-body .lbl {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-right: 7px;
+  }
+
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .87em;
+    background: var(--surface-sunk);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: .5px 4px;
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+
+  .fix {
+    border-top: 1px dashed var(--line);
+    padding-top: 9px;
+    margin-top: 11px !important;
+    color: var(--ink-muted);
+  }
+
+  .fix strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- sequencing ---------- */
+
+  .roadmap {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 4px 0;
+    box-shadow: var(--shadow);
+  }
+
+  .roadmap ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .roadmap li {
+    display: grid;
+    grid-template-columns: 108px 1fr;
+    gap: 18px;
+    padding: 15px 22px;
+    border-bottom: 1px solid var(--line);
+    font-size: 15px;
+  }
+
+  .roadmap li:last-child { border-bottom: 0; }
+
+  .roadmap .when {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    padding-top: 4px;
+  }
+
+  .roadmap b {
+    font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+    font-weight: 600;
+    display: block;
+    margin-bottom: 2px;
+  }
+
+  .roadmap span { color: var(--ink-muted); }
+
+  footer {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    font-size: 13.5px;
+    color: var(--ink-faint);
+    max-width: 66ch;
+  }
+
+  @media (max-width: 720px) {
+    .wrap { padding-inline: 18px; }
+    .verdict { grid-template-columns: 1fr; }
+    .scope div { flex-basis: 50%; border-bottom: 1px solid var(--line); }
+    .scope div:nth-child(2n) { border-right: 0; }
+    .roadmap li { grid-template-columns: 1fr; gap: 5px; }
+    .roadmap .when { padding-top: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Whole-project review · 13 Sep 2026</p>
+    <h1>Red Team Control Center Audit</h1>
+    <p class="standfirst">
+      A read-through of every backend module, all 21 endpoints, 16 React components, the test
+      suite and the CI workflow — with the improvements worth making, ranked by what they cost
+      you if left alone.
+    </p>
+
+    <dl class="scope">
+      <div><dt>Backend</dt><dd>~9,300 ln</dd></div>
+      <div><dt>Frontend</dt><dd>~2,700 ln</dd></div>
+      <div><dt>Tests</dt><dd>233</dd></div>
+      <div><dt>Findings</dt><dd>42</dd></div>
+    </dl>
+  </header>
+
+  <div class="verdict">
+    <div class="holds">
+      <h3>What already holds up</h3>
+      <ul>
+        <li>The <b>policy engine is the real thing</b> — per-tool flag enumeration, fail-closed, with the exploitation gate re-checked at plan, draft <em>and</em> approval time. That layering is the hardest part to get right and it is right.</li>
+        <li><b>Test depth where it counts.</b> 233 tests that assert refusals, not just successes — msfconsole script validation, payload-flag gating, IPV6 scope containment, provider-outage fallback.</li>
+        <li><b>Prompt-injection discipline.</b> Tool output stripped, confined to untrusted blocks, authorization never derived from it, AI citations verified against real finding ids.</li>
+        <li><b>The UI has genuine responsive work</b> — breakpoints at 850/520px and two <code>prefers-reduced-motion</code> blocks. More than most projects at this stage.</li>
+      </ul>
+    </div>
+    <div class="gaps">
+      <h3>Where it is thin</h3>
+      <ul>
+        <li><b>One 1,493-line module</b> doing routing, orchestration, serialization and startup migration. It is the file most likely to break and the hardest to test in isolation.</li>
+        <li><b>Zero frontend tests</b> against ~2,700 lines of UI. The policy engine has 40 tests; the plan editor has none.</li>
+        <li><b>13 unpinned dependencies</b> and no lockfile. Your reproducibility claim in the report rests on a <code>pip install</code> that resolves differently every month.</li>
+        <li><b>The letter's authority is trusted as parsed.</b> Everything downstream — including whether exploitation is allowed at all — rests on <code>engagement_parser.py</code>, which has 8 tests and no adversarial ones.</li>
+      </ul>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head">
+      <h2>Correctness — fix these first</h2>
+      <span class="count">9 findings</span>
+    </div>
+    <p class="sec-note">
+      Latent bugs that are live in the code today. Three of them sit inside security-relevant
+      paths, which is why they lead the list.
+    </p>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">Duplicate ZAP alert lines resolve to the wrong URLs</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">analyzer.py:693</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The detail-line scan re-splits the whole output and calls <code>.index(line)</code> to find its own position — that returns the <em>first</em> occurrence, not the current one. When ZAP reports the same rule name twice with different URLs, the second alert inherits the first alert's URL block, so findings name the wrong endpoint. It is also O(n²): three full splits of the transcript per matched alert.</p>
+        <p class="fix"><strong>Fix:</strong> iterate once with <code>enumerate(stdout.splitlines())</code>, keep the index, and slice from <code>idx + 1</code>. Two lines changed, both bugs gone.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">The curl payload-flag set is duplicated inline in the gate</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">main.py:677–685</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>create_assessment</code> hardcodes its own literal set of curl body flags instead of importing <code>PAYLOAD_FLAGS</code> from <code>phases.py</code>. Two copies of a security-relevant constant drift: add a flag to one and the plan-time gate and the approval-time gate disagree about what counts as exploitation. That is precisely the class of bug the three-layer gate exists to prevent.</p>
+        <p class="fix"><strong>Fix:</strong> import <code>PAYLOAD_FLAGS</code> and reuse <code>policy_engine._command_uses_payload_flag</code>. One source of truth.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">The auto-recommendation task can be garbage-collected mid-flight</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">main.py:1054, 1255</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>schedule_auto_recommendations</code> returns the task from <code>asyncio.create_task</code>, and the caller discards it. asyncio holds only a weak reference, so the batch can vanish before it writes — an intermittent "the recommendation just didn't appear" bug that will be near-impossible to reproduce on demand.</p>
+        <p class="fix"><strong>Fix:</strong> keep a module-level <code>set()</code> of pending tasks, add on create and <code>discard</code> in a done-callback. Standard asyncio hygiene, ~4 lines.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Recommendation payload fields shadow the serialized record</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">main.py:1084</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>**(record.payload or {})</code> splats last, so a payload carrying <code>id</code>, <code>phase</code> or <code>origin</code> silently overwrites the authoritative column values. The API contract becomes dependent on what the provider happened to emit.</p>
+        <p class="fix"><strong>Fix:</strong> splat first, then set the columns explicitly — or nest it as <code>'payload': record.payload or {}</code>.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Scoped SSH transcript re-joined on every poll</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">ssh_executor.py · _run_blocking</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Each 1-second poll does <code>_exit_code(''.join(chunks), token)</code> — rebuilding the growing transcript from scratch. An nmap sweep producing a few hundred KB means hundreds of full concatenations, on the thread streaming your live terminal.</p>
+        <p class="fix"><strong>Fix:</strong> join once outside the loop and append only the new chunk each pass, or check the marker against just the tail window — the exit marker is always near the end.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Target address has no uniqueness constraint behind the check</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">database.py · Target</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>create_target</code> does query-then-insert on <code>scope_domain_ip</code>, but the column has no <code>unique=True</code>. Two concurrent requests both see "no row" and both insert. Duplicate targets then split findings across two assessment histories — and your test suite already asserts dedupe behaviour, so the contract is intended.</p>
+        <p class="fix"><strong>Fix:</strong> <code>unique=True</code> on the column plus a catch-and-return-existing on <code>IntegrityError</code>. <code>ToolExecution</code> already models this correctly with its composite constraint.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Foreign keys carry no ON DELETE CASCADE</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">database.py · all models</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Every cascade is hand-written in application code. That is why <code>Recommendation</code> had to be added to the delete path by hand, and why <code>test_level2_recommendations_die_with_the_assessment</code> exists as a regression guard. The next table added will be forgotten the same way, leaving orphaned rows in the engagement evidence you cite in your report.</p>
+        <p class="fix"><strong>Fix:</strong> <code>ondelete='CASCADE'</code> on the FKs plus SQLite's <code>PRAGMA foreign_keys=ON</code> per connection. The manual cleanup can then stay as belt-and-braces.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Recommendation recording swallows every exception</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">main.py:1000–1043</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> A bare <code>except Exception: db.rollback(); return None</code> with no log line. The read-only loop is designed to fail quietly so it never blocks execution — correct instinct — but silence means a persistent provider or schema fault looks identical to "no proposals this round".</p>
+        <p class="fix"><strong>Fix:</strong> keep the swallow, add one <code>logger.warning(..., exc_info=True)</code>. Behaviour unchanged, diagnosability restored.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Startup work runs at import time</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">main.py:258 · database.py</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>_ensure_operator_key_at_startup()</code> fires at module import, and <code>database.py</code> runs <code>_migrate_sqlite()</code> and <code>_encrypt_stored_secrets()</code> the same way. Anything that imports the module to inspect it — a test collector, a linter, a REPL — mutates the database and the secret key. It also makes the app untestable without filesystem side effects.</p>
+        <p class="fix"><strong>Fix:</strong> move all three into a FastAPI <code>lifespan</code> handler. This pairs naturally with adding Alembic (see optimization).</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Code optimization</h2>
+      <span class="count">11 findings</span>
+    </div>
+    <p class="sec-note">
+      Structural work. None of it is on fire, but the first three are cheap wins and the
+      <code>main.py</code> split pays for itself the moment you touch the API again.
+    </p>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">The policy engine rebuilds its entire capability table on every call</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">policy_engine.py:327</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>tool_registry()</code> constructs the full nested dict — ~265 lines of per-tool flag tables — fresh on each call, and <code>validate_command</code> calls it every time. The planners then call <code>validate_command</code> once per candidate in a loop. A dozen candidates means a dozen rebuilds of a constant.</p>
+        <p class="fix"><strong>Fix:</strong> return a module-level frozen mapping built once. In the same edit, move the <code>capabilities</code> data into <code>tool_capabilities.py</code> so the 265 lines of tables stop burying the logic.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Next-steps provenance check is quadratic</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">next_steps.py · _verified_provenance</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The verified-id list is rebuilt with a list comprehension inside the per-candidate loop, so it is O(candidates × findings). Small today; it scales with engagement size, and this runs on every completed execution in the automatic loop.</p>
+        <p class="fix"><strong>Fix:</strong> build the id <code>set()</code> once before the loop.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Encryption key re-read from disk on every operation</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">secret_store.py · _load_key</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>_load_key()</code> is deliberately uncached, so every encrypt and decrypt costs a filesystem read. The comment suggests this was a considered choice, but it is not documented <em>why</em>, and a per-process cache with an explicit invalidation on key rotation gives the same safety.</p>
+        <p class="fix"><strong>Fix:</strong> either cache with <code>functools.lru_cache</code> and a documented <code>clear()</code> hook, or write down the reason it must stay uncached. Undocumented is the only wrong answer.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">A database round-trip on every authenticated request</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">api_auth.py · verify_operator_key</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The operator digest is queried from <code>AppSettings</code> for each request, including the 1-second live-terminal poll — so the UI generates a DB read per second while a command runs.</p>
+        <p class="fix"><strong>Fix:</strong> a short-TTL cache (5 s) invalidated on the settings-write path. Note the env-var override must stay checked first.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">SQLite runs with default pragmas under concurrent writes</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">database.py · create_engine</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> No WAL, no <code>busy_timeout</code>, no <code>pool_pre_ping</code>. The live-terminal poll reads while the executor writes findings and the recommendation thread writes batches. Under that overlap SQLite's default rollback journal will raise <code>database is locked</code> — the kind of failure that appears only during a live demo.</p>
+        <p class="fix"><strong>Fix:</strong> a <code>connect</code> event listener setting <code>journal_mode=WAL</code>, <code>busy_timeout=5000</code>, <code>foreign_keys=ON</code>, <code>synchronous=NORMAL</code>. Four lines, removes a whole failure class.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">One module owns routing, orchestration, serialization and startup</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">main.py · 1,493 lines</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> 21 endpoints, the assessment lifecycle, the approval-and-execute path, phase orchestration, four serializer functions and import-time migration all in one file. <code>create_assessment</code> alone does six jobs: brief assembly, AI planning, restricted-tool filtering, exploitation gating, normalization and persistence. Every change touches the file everything else depends on.</p>
+        <p class="fix"><strong>Fix:</strong> split into <code>routers/</code> (<code>targets</code>, <code>assessments</code>, <code>execution</code>, <code>settings</code>, <code>reports</code>), lift the serializers to <code>serializers.py</code>, and extract an <code>AssessmentService</code>. Do it without behaviour change and the existing 233 tests are your safety net — which is exactly what they are for.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">The provider call and fence-stripping are written three times</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">analyzer.py:765 · planner.py · next_steps.py</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>analyzer._ai_findings</code> hand-rolls the OpenAI-compatible POST, and <code>planner._strip_fence</code> and <code>next_steps._strip_fence</code> are near-identical. Three places to fix when a provider returns a slightly different envelope, and three chances for the timeout or the payload bound to differ.</p>
+        <p class="fix"><strong>Fix:</strong> one <code>llm_client.py</code> exposing <code>chat_json(...)</code> that owns the request, the timeout, the fence-stripping and the size bound. The three callers keep only their prompts and their fallbacks.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Schema changes are hand-rolled ALTER TABLE at import</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">database.py · _migrate_sqlite</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> No Alembic, so every column added means another manual <code>ALTER TABLE ADD COLUMN</code> guarded by an introspection check, executed on import. There is no downgrade path and no record of what version a given database file is at — which matters if you demo from a database created weeks ago.</p>
+        <p class="fix"><strong>Fix:</strong> adopt Alembic, generate an initial revision matching current schema, and keep the hand-rolled path as a one-shot compatibility shim. Trigger from the lifespan handler.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Plan equality is key-order sensitive</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">frontend/src/lib/constants.js · samePlan</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>samePlan</code> compares via <code>JSON.stringify</code>, so the same plan serialized with keys in a different order reads as dirty — leaving the save button enabled when nothing changed, and making <code>planDirty</code> unreliable.</p>
+        <p class="fix"><strong>Fix:</strong> compare the fields that matter explicitly (<code>tool</code>, <code>command</code>, <code>reason</code>, length). Cheap, and it makes the dirty state trustworthy.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Derived booleans recomputed on every render</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">frontend/src/App.jsx</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>planLocked</code>, <code>executedPrefixIntact</code>, <code>planEditable</code>, <code>canAnalyze</code> and <code>canReport</code> are plain expressions re-evaluated on each render — and the 1-second live-terminal poll re-renders <code>App</code>, so they recompute every second while a command runs.</p>
+        <p class="fix"><strong>Fix:</strong> <code>useMemo</code> the derived flags, and move the live-terminal poll into its own component so the 1 Hz tick stops re-rendering the whole tree. The phase memoization you already have shows the pattern.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Serializer functions are dense single-line dict literals</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">main.py:59–123</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>serialize_target</code>, <code>serialize_assessment</code>, <code>serialize_execution</code> and <code>serialize_finding</code> are long unbroken lines — hard to review, and hard to confirm at a glance that a secret field has not crept into the response.</p>
+        <p class="fix"><strong>Fix:</strong> one key per line, and add a test that asserts no <code>api_key</code>/<code>password</code>/<code>secret</code> key can appear in any serialized payload. You have that guarantee today by inspection; make it a test.</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Security hardening</h2>
+      <span class="count">4 findings</span>
+    </div>
+    <p class="sec-note">
+      The core is sound. These four are about the edges — the letter, and what happens when
+      a dependency changes under you.
+    </p>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">The engagement letter's authority is trusted as parsed</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">engagement_parser.py · 424 lines, 8 tests</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> This module decides what is in scope, which tools are restricted, and whether exploitation is authorized. Everything downstream inherits its verdict, and the exploitation gate is only as strong as the parse. Its eight tests are all well-formed letters — there is no adversarial case: a letter naming a host <em>outside</em> the declared subnet, contradictory allow/deny sentences, a target list that resolves to a wider CIDR than intended, or a crafted document that smuggles an extra target into the table.</p>
+        <p class="fix"><strong>Fix:</strong> add adversarial parser tests, and — more valuable — surface the parsed scope back to the operator for explicit confirmation before any plan is generated. The human is already in the loop for commands; put them in the loop for authority too.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">Thirteen unpinned dependencies and no lockfile</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">backend/requirements.txt</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>fastapi</code>, <code>sqlalchemy</code>, <code>pydantic</code>, <code>paramiko</code>, <code>cryptography</code> and the rest all float. Two consequences: the Docker image built for your evaluation is not the one you tested, and — for a security tool — you inherit upstream CVEs silently. A framework that gates <code>sqlmap</code> behind a letter should know what version of its own HTTP client it is running.</p>
+        <p class="fix"><strong>Fix:</strong> pin exact versions and add <code>pip-compile</code> (or <code>uv</code>) to produce a hashed lockfile. Add Dependabot. This is also what makes your Chapter 8 numbers reproducible by anyone else.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Focus ring is a box-shadow, invisible in High Contrast Mode</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">App.css:199, 805</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Inputs set <code>outline: none</code> and substitute a <code>box-shadow</code> on focus. Windows High Contrast Mode discards box-shadows, so keyboard users on your own laptop's accessibility settings lose the focus indicator entirely. Note <code>.dropzone</code> gets this right — it uses a real <code>outline</code>.</p>
+        <p class="fix"><strong>Fix:</strong> replace <code>outline: none</code> with <code>:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }</code> and keep the shadow as an enhancement.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">No dark mode despite a token-ready stylesheet</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">App.css · :root</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Eleven custom properties already define the palette, so the groundwork is done — but a good number of rules still use literal colors like <code>#cbd5de</code> and <code>#fff</code> inline. A security operator staring at a live terminal at 2 a.m. will want a dark surface, and the audit trail is a lot of text.</p>
+        <p class="fix"><strong>Fix:</strong> sweep the literals into tokens first (a mechanical pass), then add a <code>prefers-color-scheme</code> block plus a manual toggle. Doing the sweep first means the dark theme is one block, not two hundred edits.</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>UI and UX</h2>
+      <span class="count">8 findings</span>
+    </div>
+    <p class="sec-note">
+      The interface is more considered than most at this stage — tab semantics, <code>aria-pressed</code>,
+      reduced-motion handling. These are the gaps that remain.
+    </p>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">No error boundary anywhere in the tree</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">frontend/src/App.jsx</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> One unexpected value in a nested component — a null <code>restricted_tools</code>, a finding missing a field — unmounts the entire application to a blank white page. During a live demo that is unrecoverable without a reload, and a reload loses the in-flight assessment view.</p>
+        <p class="fix"><strong>Fix:</strong> a small <code>ErrorBoundary</code> around the workspace, rendering the error and a "reload workspace" button. Twenty lines and it turns a demo-ending failure into a recoverable one.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">Validation failures arrive as backend errors, not field feedback</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">NewAssessmentPanel.jsx · TargetPanel.jsx</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Pydantic enforces real bounds — 50 scopes, 255 chars, 256 addresses, usable URL schemes — but the UI only discovers a violation after a round-trip, and reports it as a generic banner. The operator cannot tell which field is wrong or what the limit is, so they guess and resubmit.</p>
+        <p class="fix"><strong>Fix:</strong> mirror the bounds as client-side <code>maxLength</code>/counters, and map a 422's <code>loc</code> back onto the offending field instead of the banner. The "characters left" counter in the prompt form is exactly the right pattern — extend it.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">The plan is locked while a command runs, with no explanation</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">PlanEditor.jsx · planEditable</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The append-only invalidation rule — executed steps freeze, new steps append — is the most interesting design decision in the project, and the UI presents it as a dead input. A new operator reads a disabled editor as "broken", not as "the audit trail is immutable".</p>
+        <p class="fix"><strong>Fix:</strong> replace the disabled state with a short line of copy on the frozen prefix — "Steps 1–4 executed; they are sealed as audit evidence. Append new steps below." The constraint is a feature; say so.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Live terminal re-renders the whole application at 1 Hz</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">App.jsx · live poll effect</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The poll updates state on <code>App</code>, so every second the entire tree — plan editor, findings, audit trail, phase pipeline — reconciles. With a large audit trail this is visible jank on your i3, right when the operator is watching the output most closely.</p>
+        <p class="fix"><strong>Fix:</strong> move the poll into a <code>LiveTerminal</code> component owning its own state. The rest of the tree stops re-rendering entirely.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">2055 lines of global CSS with no layering</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">frontend/src/App.css</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> One global stylesheet for 16 components, with element-level selectors (<code>header</code>, <code>input</code>) sitting alongside component classes. Specificity collisions are already a risk, and there is no way to delete a component's styles with confidence.</p>
+        <p class="fix"><strong>Fix:</strong> surgical, not a rewrite — keep the tokens in a <code>tokens.css</code> and split the rest per component area. The existing BEM-ish class names mean this is mostly cut-and-paste.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">The sidebar/workspace split is tight for the demo laptop</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">App.css · .workspace, breakpoint 850px</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Above 850px the grid is <code>350px 1fr</code>. On an 8 GB i3 laptop at 1366×768 with browser chrome, that leaves under 700px for the plan editor and the live terminal — the two densest views — before the breakpoint stacks them. Worth checking at that exact size rather than assuming.</p>
+        <p class="fix"><strong>Fix:</strong> either raise the breakpoint to ~1000px, or make the sidebar collapsible with a toggle. Test at 1366×768 specifically, since that is the machine this runs on.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Vite scaffolding left in the tree</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">frontend/src · assets</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The default <code>react.svg</code>, <code>vite.svg</code> and a one-line <code>index.css</code> are still present and unreferenced. Small, but they are the first thing a reader of your repository notices, and they signal a template that was never cleaned up.</p>
+        <p class="fix"><strong>Fix:</strong> delete them. Confirm <code>favicon.svg</code> is the one actually linked in <code>index.html</code>.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">No empty, loading or partial-failure states</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">FindingsPanel · AuditTrailPanel · CrewPanel</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Panels render their content when data exists and nothing when it does not. A blank findings panel after a completed scan is ambiguous: no findings, or analysis not run? During your evaluation runs this ambiguity will cost you real time.</p>
+        <p class="fix"><strong>Fix:</strong> explicit empty states that name the next action — "No findings yet. Run <b>Analyze</b> after executing a step." This is also the cheapest way to make the tool feel finished.</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Testing and CI</h2>
+      <span class="count">6 findings</span>
+    </div>
+    <p class="sec-note">
+      Your backend suite is genuinely good. The gaps are all on the frontend and in what CI
+      actually verifies.
+    </p>
+
+    <article class="finding" data-sev="high">
+      <div class="f-head">
+        <h3 class="f-title">Zero frontend tests against 2,700 lines of UI</h3>
+        <span class="sev" data-sev="high">High</span>
+        <span class="anchor">frontend/package.json · no test script</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>App.jsx</code> holds ~30 state hooks and the entire request lifecycle. The most intricate logic in the project — the executed-prefix freeze, plan-dirty detection, phase unlock — is untested and lives in the file that changes most. A Vite+Vitest setup is a ten-minute install.</p>
+        <p class="fix"><strong>Fix:</strong> add Vitest + Testing Library, and start with three pure-logic tests (<code>samePlan</code>, the prefix-integrity check, <code>suggestedObjective</code>) plus one render test of <code>PlanEditor</code>'s frozen state. Highest ratio of confidence to effort available anywhere in this list.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">CI builds the frontend but never lints it</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">.github/workflows/ci.yml</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>npm run lint</code> exists, is configured with the hooks and refresh plugins, and is never invoked. Your report cites "ESLint: 0 errors" as a verified fact, but nothing enforces it — so the claim decays from the next commit onward.</p>
+        <p class="fix"><strong>Fix:</strong> add the lint step. One line, and it makes an existing claim in your report permanently true.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">CI never builds the Docker images or runs the smoke test</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">.github/workflows/ci.yml · smoke_e2e.py</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Tests run against a bare <code>pip install</code> on the runner, which proves nothing about the image that actually ships — and the scanner binaries exist only inside that image, so the highest-risk part of the build is the part CI never touches. <code>smoke_e2e.py</code> exercises the full lifecycle and is never run automatically.</p>
+        <p><strong>Fix:</strong> add a job that does <code>docker compose build</code>, and run <code>smoke_e2e.py</code> against the local engine. That is the check that would have caught the payload-flag drift and the SQLite locking above.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">No Python linter, formatter or type checker</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">repository root · no pyproject.toml</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> There is no <code>pyproject.toml</code>, no ruff/black config, no mypy, no pre-commit. For a codebase whose correctness argument rests on validating untrusted input, the absence of static checking on the Python side is the single biggest asymmetry in the project's quality posture.</p>
+        <p class="fix"><strong>Fix:</strong> <code>ruff</code> (lint + format) and <code>mypy</code> in non-strict mode, wired into CI and pre-commit. Ruff alone will surface unused imports and shadowed names across all 9,300 lines in seconds.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">CI has no caching and tests one Python version</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">.github/workflows/ci.yml</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Every run reinstalls all 13 packages from scratch, and only 3.10 is exercised — despite the README claiming 3.10+. A user on 3.12 is untested.</p>
+        <p class="fix"><strong>Fix:</strong> <code>actions/setup-python</code> and <code>setup-node</code> caching, plus a 3.10/3.12 matrix. Cuts run time and makes the version claim real.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">The executor's subprocess path has no direct tests</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">backend/modules/executor.py</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> <code>ssh_executor.py</code> is tested thoroughly, including timeouts and pane serialization. The local engine — the one that actually runs on the demo machine — has no equivalent coverage of its timeout, output cap or the <code>os.killpg</code> termination path.</p>
+        <p class="fix"><strong>Fix:</strong> mirror the SSH test shape for the local engine: a long-running command hitting <code>EXECUTION_TIMEOUT_SECONDS</code>, an oversized output hitting <code>LIVE_BUFFER_CHARS</code>, and confirmation that the env allowlist excludes everything else.</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Repository hygiene</h2>
+      <span class="count">4 findings</span>
+    </div>
+
+    <article class="finding" data-sev="medium">
+      <div class="f-head">
+        <h3 class="f-title">.clinerules describes a project that no longer exists</h3>
+        <span class="sev" data-sev="medium">Medium</span>
+        <span class="anchor">.clinerules</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> It states that <code>App.jsx</code> is "the ENTIRE single-page React 19 UI (one file)" — there are now 16 components in <code>components/</code> — and it cites 188 tests where the suite has 233. Since this file is the context document for AI-assisted development, a stale map is worse than no map: it directs future work at the wrong files.</p>
+        <p class="fix"><strong>Fix:</strong> update the architecture section and stop hard-coding the test count — point at <code>pytest</code> output instead. Keep the "do not reintroduce" bug list, which is the genuinely valuable part.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">Six scratch scripts and three generated PDFs at the root</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">repository root · untracked</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Five <code>make_*.py</code> scripts (several tens of KB each) and three generated PDFs currently sit untracked in the working tree. They are report-generation tooling, not application code, and they clutter the root next to <code>main.py</code> and <code>package.json</code>.</p>
+        <p class="fix"><strong>Fix:</strong> move the scripts to <code>scripts/</code> and commit them — they are legitimate tooling worth keeping — and either commit the PDFs deliberately under <code>docs/</code> or gitignore them. Generated artifacts should be a decision, not an accident.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">A nested git repository is gitignored as a "placeholder"</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">.gitignore:68 · red-teaming-framework/</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> The name suggests an earlier attempt at this same project, kept as an empty nested repo. Nested repos confuse tooling and readers alike, and a reviewer will ask what it is.</p>
+        <p class="fix"><strong>Fix:</strong> delete it if it holds nothing, or move it to <code>archive/</code> with a one-line README saying what it was. If it contains prior work you want credit for, that belongs in git history on a branch, not as an ignored directory.</p>
+      </div>
+    </article>
+
+    <article class="finding" data-sev="low">
+      <div class="f-head">
+        <h3 class="f-title">README at 42 KB is doing four documents' work</h3>
+        <span class="sev" data-sev="low">Low</span>
+        <span class="anchor">README.md · 23 TOC entries</span>
+      </div>
+      <div class="f-body">
+        <p><span class="lbl">Why</span> Setup, architecture, policy-engine semantics, deployment modes and the demo runbook all live in one file with a 23-entry table of contents. A new reader has no idea which third of it they need, and the architecture sections duplicate what <code>docs/backend_technical_reference.md</code> already covers.</p>
+        <p class="fix"><strong>Fix:</strong> README becomes what it is, how to run it, and a two-minute tour — then links out to <code>docs/architecture.md</code>, <code>docs/policy-engine.md</code> and <code>docs/demo-runbook.md</code>. Much of the prose already exists and only needs moving.</p>
+      </div>
+    </article>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>Suggested order</h2>
+      <span class="count">4 passes</span>
+    </div>
+    <p class="sec-note">
+      Sequenced so that each pass makes the next one safer. The first is a single sitting.
+    </p>
+
+    <div class="roadmap">
+      <ol>
+        <li>
+          <span class="when">Pass one</span>
+          <span>
+            <b>Close the live bugs</b>
+            <span>ZAP duplicate-line index, the duplicated payload-flag set, the GC-able task, the payload splat, the SQLite pragmas. All five are small, local edits with existing tests around them — do them before anything else.</span>
+          </span>
+        </li>
+        <li>
+          <span class="when">Pass two</span>
+          <span>
+            <b>Make the claims enforceable</b>
+            <span>Pin dependencies and add a lockfile, add ruff + mypy, add the missing lint step to CI, add Vitest with the three logic tests. This is the pass that makes every quality statement in your report true by construction rather than by inspection.</span>
+          </span>
+        </li>
+        <li>
+          <span class="when">Pass three</span>
+          <span>
+            <b>Harden the edges</b>
+            <span>Adversarial engagement-parser tests, operator confirmation of parsed scope, the error boundary, real focus-visible outlines, the unique constraint and FK cascades. This is the pass that protects the demo.</span>
+          </span>
+        </li>
+        <li>
+          <span class="when">Pass four</span>
+          <span>
+            <b>Pay down structure</b>
+            <span>Split <code>main.py</code> into routers, extract <code>llm_client.py</code>, add Alembic, sweep CSS literals into tokens, split the README. Do this last and only with the test suite as your safety net — it is the largest change and the least urgent.</span>
+          </span>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <footer>
+    Line counts and test totals are from the working tree as read; findings are anchored to the
+    lines they appear on. Nothing here has been changed — this is the proposal only.
+  </footer>
+
+</div>
