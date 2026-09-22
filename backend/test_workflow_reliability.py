@@ -170,6 +170,22 @@ def test_exclusion_detects_ranges_and_resource_script_destinations():
     assert command_destinations('msfconsole -x "use auxiliary/scanner/ftp/ftp_version; set RHOSTS 10.0.0.2; run"', []) == ['10.0.0.2']
 
 
+@pytest.mark.parametrize('command', [
+    'msfconsole -x "use auxiliary/scanner/ftp/ftp_version; set RHOSTS 10.0.0.2; run"',
+    'msfconsole -x="use auxiliary/scanner/ftp/ftp_version; set RHOSTS 10.0.0.2; run"',
+    'msfconsole --execute-command "use auxiliary/scanner/ftp/ftp_version; set RHOSTS 10.0.0.2; run"',
+    'msfconsole --execute-command="use auxiliary/scanner/ftp/ftp_version; set RHOSTS 10.0.0.2; run"',
+])
+def test_msf_destinations_extracted_from_every_accepted_spelling(command):
+    # The policy engine accepts the resource script under all four spellings
+    # (policy_engine.validate_command reads it from -x and --execute-command,
+    # attached or separated). command_destinations feeds the sole excluded_scopes
+    # enforcement point in main.py, so it must surface RHOSTS from every one of
+    # them; otherwise a spelling this parser missed would slip an in-range but
+    # deliberately-excluded host past the exclusion check.
+    assert command_destinations(command, []) == ['10.0.0.2']
+
+
 def test_expired_policy_refused_at_approval(workspace):
     client, _ = workspace
     assessment = create(client, {'ends_at': '2020-01-01T00:00:00Z'})

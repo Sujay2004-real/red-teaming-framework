@@ -31,11 +31,18 @@ from modules.secret_store import decrypt_secret, encrypt_secret
 from modules.jobs import job_runner, run_execution, archive_attempt
 from modules.outcomes import outcome, SUCCESS
 from modules.scope_rules import scopes_overlap, command_destinations, check_window
+from modules.logging_config import configure_logging
 
+# Configure logging at import so records emitted while the app is being built
+# (and by the observability middleware once requests arrive) reach a handler.
+# Without this, `uvicorn main:app` leaves the root logger at WARNING with no
+# handler and the structured access log is silently dropped.
+configure_logging()
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app):
+    configure_logging()
     initialize_database()
     _ensure_operator_key_at_startup()
     if os.getenv('EXECUTION_WORKER_MODE', 'embedded') == 'embedded':

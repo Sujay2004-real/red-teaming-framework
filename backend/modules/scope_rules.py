@@ -7,11 +7,35 @@ import re
 
 
 def command_destinations(command, targets):
-    """Include destinations embedded in Metasploit's validated resource script."""
+    """Include destinations embedded in Metasploit's validated resource script.
+
+    The policy engine accepts the resource script under four equivalent
+    spellings (``-x s``, ``-x=s``, ``--execute-command s``, ``--execute-command=s``
+    — see policy_engine.validate_command). The exclusion overlap check in
+    main.py depends on this function to surface the script's RHOSTS, so it must
+    recognize every spelling the policy layer does; otherwise a deliberately
+    excluded host could be reached through a spelling this parser missed while
+    the policy layer still validated the script against the authorized scopes.
+    """
     result = list(targets)
     tokens = shlex.split(command)
-    if tokens and tokens[0] == 'msfconsole' and '-x' in tokens:
-        script = tokens[tokens.index('-x') + 1]
+    if not (tokens and tokens[0] == 'msfconsole'):
+        return result
+    scripts = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ('-x', '--execute-command'):
+            if index + 1 < len(tokens):
+                scripts.append(tokens[index + 1])
+            index += 2
+            continue
+        for prefix in ('-x=', '--execute-command='):
+            if token.startswith(prefix):
+                scripts.append(token[len(prefix):])
+                break
+        index += 1
+    for script in scripts:
         for match in re.finditer(r'(?:^|;)\s*set\s+RHOSTS?\s+([^;]+)', script, re.I):
             result.extend(re.split(r'[,\s]+', match.group(1).strip()))
     return result
