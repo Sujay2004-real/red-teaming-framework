@@ -42,12 +42,19 @@ from modules.analyzer import bounded_int, strip_ansi
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
 from modules.exploit_planner import exploit_planner
+from modules.planners import campaign_planner
 
 # The digest is bounded at every level: a fingerprint-rich engagement must not
 # grow the prompt until the provider rejects it and the failure reads as an
 # outage. These mirror the caps the analyzer and planner already work within.
 MAX_STATE_FINDINGS = 40
 MAX_STATE_EXECUTIONS = 50
+# Post-compromise evidence is summarised, not enumerated: the model needs to
+# know which hosts are owned and which credentials exist, not the full loot
+# table, and a secret never reaches the prompt at all.
+MAX_STATE_HOSTS = 20
+MAX_STATE_FOOTHOLDS = 20
+MAX_STATE_LOOT = 20
 MAX_STATE_TEXT_CHARS = 300
 MAX_DIGEST_CHARS = 12000
 # How many proposals the operator is offered at once. Enough to be useful,
@@ -63,7 +70,11 @@ PROVIDER_TIMEOUT_SECONDS = 60
 # never be analyzed at all. Bookend phases are absent on purpose — scoping
 # precedes the assessment and reporting follows the last command, so neither
 # owns plan steps.
-PROPOSAL_PHASES = ('recon', 'exploitation', 'post_exploitation')
+PROPOSAL_PHASES = ('recon', 'exploitation', 'post_exploitation',
+                   'credential_validation', 'lateral_movement', 'impact')
+# Phases that walk the lab-only kill chain, so a proposal for one is only ever
+# offered to an engagement in aggressive lab mode.
+CAMPAIGN_PROPOSAL_PHASES = ('credential_validation', 'lateral_movement', 'impact')
 
 # Why a phase cannot receive proposals. The operator asked a reasonable
 # question and the answer is not "no": it is which door to use instead.
@@ -101,7 +112,7 @@ def _clean_text(value, limit=MAX_STATE_TEXT_CHARS):
 def build_engagement_state(*, phase, objective, target_address, criticality,
                            authorized_scopes, restricted_tools,
                            exploitation_authorized, verification_endpoints,
-                           findings, executions):
+                           findings, executions, loot=(), footholds=(), hosts=()):
     """Condense everything observed so far into one bounded digest.
 
     This is the engagement's working memory, and it is deliberately compact:
@@ -145,6 +156,34 @@ def build_engagement_state(*, phase, objective, target_address, criticality,
         'attributed_findings': str(execution.get('tool_name') or '') in tools_with_findings,
     } for execution in executions[:MAX_STATE_EXECUTIONS]]
 
+    bounded_hosts = [{
+        'address': _clean_text(host.get('address'), 200),
+        'hostname': _clean_text(host.get('hostname'), 200),
+        'role': _clean_text(host.get('role'), 40),
+        'state': _clean_text(host.get('state'), 40),
+    } for host in list(hosts)[:MAX_STATE_HOSTS]]
+
+    bounded_footholds = [{
+        'host': _clean_text(foothold.get('host'), 200),
+        'kind': _clean_text(foothold.get('kind'), 40),
+        'username': _clean_text(foothold.get('username'), 100),
+        'privilege': _clean_text(foothold.get('privilege'), 40),
+        'remote_id': _clean_text(foothold.get('remote_id'), 40),
+        'state': _clean_text(foothold.get('state'), 40),
+        'pivot_ready': bool(foothold.get('pivot_ready')),
+    } for foothold in list(footholds)[:MAX_STATE_FOOTHOLDS]]
+
+    # Only the identifying shape of a recovered credential: host, service,
+    # account, kind, and whether it was proven. The value itself is never in
+    # the digest, so it can never reach a provider prompt.
+    bounded_loot = [{
+        'host': _clean_text(row.get('host'), 200),
+        'service': _clean_text(row.get('service'), 80),
+        'username': _clean_text(row.get('username'), 100),
+        'secret_kind': _clean_text(row.get('secret_kind'), 40),
+        'validated': bool(row.get('validated')),
+    } for row in list(loot)[:MAX_STATE_LOOT]]
+
     return {
         'phase': phase,
         'objective': _clean_text(objective, 600),
@@ -158,11 +197,17 @@ def build_engagement_state(*, phase, objective, target_address, criticality,
         },
         'findings': bounded_findings,
         'executed': bounded_executions,
+        'hosts': bounded_hosts,
+        'footholds': bounded_footholds,
+        'loot': bounded_loot,
         'counts': {
             'findings': len(findings),
             'findings_shown': len(bounded_findings),
             'executed_steps': len(executions),
             'executed_shown': len(bounded_executions),
+            'hosts': len(hosts),
+            'footholds': len(footholds),
+            'loot': len(loot),
         },
     }
 
@@ -225,6 +270,33 @@ def render_state_prompt(state, available_tools):
             lines.append(f"- {execution['command']} -> exit {execution['return_code']}, {outcome}")
     else:
         lines.append('- Nothing has been executed yet.')
+
+    lines.append('Hosts reached so far:')
+    if state['hosts']:
+        for host in state['hosts']:
+            label = f"{host['address']}{' (' + host['hostname'] + ')' if host['hostname'] else ''}"
+            lines.append(f"- {label} [{host['role']}/{host['state']}]")
+    else:
+        lines.append('- No host has been enumerated yet.')
+
+    lines.append('Footholds held:')
+    if state['footholds']:
+        for foothold in state['footholds']:
+            session = f" session {foothold['remote_id']}" if foothold['remote_id'] else ''
+            lines.append(f"- {foothold['host']} [{foothold['kind']}{session}] as "
+                         f"{foothold['username'] or 'unknown'} ({foothold['privilege'] or 'unknown privilege'}), "
+                         f"{'pivot-ready' if foothold['pivot_ready'] else 'no pivot'}, {foothold['state']}")
+    else:
+        lines.append('- No foothold has been obtained yet.')
+
+    lines.append('Recovered credentials (values are never shown; do not ask for them):')
+    if state['loot']:
+        for row in state['loot']:
+            lines.append(f"- {row['host'] or 'unknown host'} {row['service'] or 'service'} account "
+                         f"{row['username'] or 'unknown'} ({row['secret_kind']}), "
+                         f"{'proven to work' if row['validated'] else 'not yet proven'}")
+    else:
+        lines.append('- No credential has been recovered yet.')
 
     return '\n'.join(lines)[:MAX_DIGEST_CHARS]
 
@@ -301,7 +373,8 @@ def _already_run_commands(plan, executions):
 
 
 def _deterministic_candidates(phase, target_address, findings, authorized_scopes,
-                              verification_endpoints, aggressive=False):
+                              verification_endpoints, aggressive=False,
+                              loot=(), footholds=(), hosts=()):
     """Fallback proposals from the generators the framework already trusts.
 
     This is not a third planner: it is what the framework would have drafted for
@@ -309,13 +382,26 @@ def _deterministic_candidates(phase, target_address, findings, authorized_scopes
     commands from. That keeps the no-provider path honest — it proposes work the
     operator could have reached by hand, not a weaker parallel path.
     """
+    if phase in CAMPAIGN_PROPOSAL_PHASES:
+        steps, _ = campaign_planner.draft_plan(
+            phase, findings, target_address, authorized_scopes, aggressive=aggressive,
+            loot=list(loot), footholds=list(footholds), hosts=list(hosts))
+        return steps
+    if phase == 'post_exploitation':
+        # In aggressive lab mode post-exploitation also enumerates through the
+        # footholds the campaign opened, so it comes from the campaign planner;
+        # otherwise it stays exactly the bounded sqlmap impact proof it was.
+        if aggressive:
+            steps, _ = campaign_planner.draft_plan(
+                'post_exploitation', findings, target_address, authorized_scopes, aggressive=True,
+                loot=list(loot), footholds=list(footholds), hosts=list(hosts))
+            return steps
+        steps, _ = exploit_planner.draft_plan('post_exploitation',
+            findings, target_address, authorized_scopes, aggressive=False)
+        return steps
     if phase == 'exploitation':
         steps, _ = exploit_planner.draft_plan('exploitation',
             findings, target_address, authorized_scopes, verification_endpoints, aggressive=aggressive)
-        return steps
-    if phase == 'post_exploitation':
-        steps, _ = exploit_planner.draft_plan('post_exploitation',
-            findings, target_address, authorized_scopes, aggressive=aggressive)
         return steps
     return planner_agent.default_plan(target_address)
 
@@ -345,7 +431,8 @@ class NextStepsPlanner:
     def propose(self, *, phase, target_address, objective, criticality,
                 authorized_scopes, restricted_tools, exploitation_authorized,
                 verification_endpoints, findings, executions, plan,
-                api_key='', base_url='', model_name='', aggressive_lab=False):
+                api_key='', base_url='', model_name='', aggressive_lab=False,
+                loot=(), footholds=(), hosts=()):
         """Return (candidates, refused, source, notes).
 
         `refused` carries every candidate the policy engine rejected, with its
@@ -361,6 +448,7 @@ class NextStepsPlanner:
             exploitation_authorized=exploitation_authorized,
             verification_endpoints=verification_endpoints,
             findings=findings, executions=executions,
+            loot=loot, footholds=footholds, hosts=hosts,
         )
         findings_by_id = {finding.get('id'): finding for finding in findings if finding.get('id') is not None}
         already_run = _already_run_commands(plan, executions)
@@ -396,7 +484,8 @@ class NextStepsPlanner:
                 _deterministic_raw_step(step, phase)
                 for step in _deterministic_candidates(phase, target_address, findings,
                                                       authorized_scopes, verification_endpoints,
-                                                      aggressive=aggressive_lab)
+                                                      aggressive=aggressive_lab,
+                                                      loot=loot, footholds=footholds, hosts=hosts)
             ]
             if source == 'ai-filtered':
                 source = 'provider-error'

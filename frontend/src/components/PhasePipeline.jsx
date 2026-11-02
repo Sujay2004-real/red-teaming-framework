@@ -1,5 +1,6 @@
 import { useApp } from '../lib/AppContext'
 import { PHASE_LABEL, PLAN_PHASES } from '../lib/constants'
+import Icon from './Icon'
 
 // The engagement phase stepper, the next-phase drafting entry point, and the
 // adaptive next-step proposals (manual and automatic alike). Proposals are
@@ -9,32 +10,39 @@ export default function PhasePipeline({
   selected, selectedTarget, phases, nextDraftable, currentPhase,
   nextProposals, pickedCandidates, setPickedCandidates, planEditable,
   onDraftPhase, onPropose, onDismissProposals, onAddPicked,
+  canAnalyze, canReport, planDirty, running, onReviewPlan, onAnalyze, onReport,
 }) {
   const { busy, agentBusy } = useApp()
+  const completed = phases.filter(p => p.done).length
+  const activeKey = phases.find(p => p.key === currentPhase && !p.done && !p.blocked)?.key || phases.find(p => !p.done && !p.blocked)?.key
+  const restricted = nextDraftable === 'exploitation' && !selectedTarget?.exploitation_authorized
+  let next = { title: 'Review your command plan', description: 'Check the purpose and scope of each command, then approve one step at a time.', label: 'Review command plan', action: onReviewPlan, icon: 'shield' }
+  if (running) next = { title: 'A command is running', description: 'Follow its live output. Evidence is recorded as the command completes.', label: 'View live output', action: onReviewPlan, icon: 'activity' }
+  else if (planDirty) next = { title: 'Your plan has unsaved changes', description: 'Review and save the draft before approving another command.', label: 'Review plan changes', action: onReviewPlan, icon: 'planner' }
+  else if (nextDraftable && !restricted) next = { title: `Continue to ${PHASE_LABEL(nextDraftable).toLowerCase()}`, description: 'Draft the next phase from the recorded findings. Each new command still requires your approval.', label: agentBusy('planner') ? 'Drafting…' : 'Draft next phase', action: () => onDraftPhase(nextDraftable), icon: 'planner' }
+  else if (canAnalyze) next = { title: 'Your phase is ready for analysis', description: 'Correlate the recorded outputs, score findings, and review any execution failures.', label: agentBusy('analyst') ? 'Analyzing…' : 'Analyze results', action: onAnalyze, icon: 'analyst' }
+  else if (canReport) next = { title: selected?.status === 'reported' ? 'Your report is ready' : 'Prepare your client report', description: 'Review the findings, evidence, and analysis provenance before delivery.', label: 'Open reporting', action: onReport, icon: 'reporter' }
   return <section className="panel pipeline-panel">
-    <div className="panel-title"><h2>Engagement phases</h2><span className="muted">{selected ? `Assessment #${selected.id} · ${PHASE_LABEL(selected.current_phase || 'recon')}` : 'No assessment selected yet'}</span></div>
+    <div className="panel-title"><div><span className="eyebrow">ENGAGEMENT WORKFLOW</span><h2>From scope to evidence</h2></div><span className="tag">{completed} / {phases.length} phases complete</span></div>
+    {selected && <div className={`next-action${restricted ? ' restricted' : ''}`}>
+      <span className="section-icon"><Icon name={next.icon} /></span><div><span className="eyebrow">NEXT ACTION</span><h3>{next.title}</h3><p>{next.description}</p></div><button onClick={next.action} disabled={busy}>{next.label}<Icon name="arrow" /></button>
+    </div>}
     <ol className="pipeline phases">
       {phases.map((phase, i) => {
-        const active = !phase.done && phases.slice(0, i).every(p => p.done)
-        return <li key={phase.key} className={`${phase.done ? 'done' : ''} ${active ? 'active' : ''}${phase.key === 'exploitation' || phase.key === 'post_exploitation' ? ' phase-risk' : ''}`}>
-          <span className="stage-dot">{phase.done ? '✓' : i + 1}</span>
-          <span className="stage-body"><b>{phase.label}</b><small>{phase.caption}</small></span>
+        const active = !phase.done && !phase.blocked && phase.key === activeKey
+        return <li key={phase.key} aria-current={active ? 'step' : undefined} className={`${phase.done ? 'done' : ''} ${active ? 'current' : ''} ${phase.blocked && !phase.done ? 'blocked' : ''}`}>
+          <span className="stage-dot">{phase.done ? <Icon name="check" /> : phase.blocked ? <Icon name="lock" /> : i + 1}</span>
+          <span className="stage-body"><b>{phase.label}</b><span className="stage-label">{phase.done ? 'Completed' : phase.blocked ? 'Not authorized' : active ? 'Current phase' : 'Upcoming'}</span><small>{phase.caption}</small></span>
         </li>
       })}
     </ol>
-    {selected && nextDraftable && <div className="phase-draft">
-      <button onClick={() => onDraftPhase(nextDraftable)} disabled={busy}>{agentBusy('planner') ? 'Drafting…' : `Draft ${PHASE_LABEL(nextDraftable).toLowerCase()} plan`}</button>
-      {nextDraftable === 'exploitation' && !selectedTarget?.exploitation_authorized && <small className="gate-note">The letter does not authorize exploitation for this target, so verification steps will be refused — and that refusal is itself required evidence.</small>}
-      {nextDraftable === 'exploitation' && selectedTarget?.exploitation_authorized && <small>Steps are drafted from the verified findings: offline exploit lookups, parameter verification, and the letter's proof-of-concept endpoints. Each still waits for your approval.</small>}
-      {nextDraftable === 'post_exploitation' && <small>Bounded impact proof only (DBMS banner, current user) — the single verification record per flaw the letter permits.</small>}
-    </div>}
     {/* Proposing is available in the phase the assessment is working in,
         because that is the only phase whose new steps can be analyzed as a
         unit. The bookend phases own no steps, so they offer nothing. */}
-    {selected && PLAN_PHASES.includes(currentPhase) && <div className="phase-draft proposal-draft">
+    {selected && PLAN_PHASES.includes(currentPhase) && <details className="proposal-options"><summary>Explore adaptive next steps<Icon name="chevron" /></summary><div className="phase-draft proposal-draft">
       <button className="secondary" onClick={onPropose} disabled={busy || selected.status === 'running'}>{agentBusy('planner') ? 'Proposing…' : 'Propose next steps'}</button>
-      <small>Ranked from the findings and the audit trail so far, so it answers what to do <em>next</em> rather than restating the checklist. Every candidate is policy-checked before you see it, anything already run is withheld, and each one still needs your approval.</small>
-    </div>}
+      <small>Proposals use the recorded findings and audit trail. Each candidate is policy-checked and requires approval.</small>
+    </div></details>}
     {nextProposals && <div className="proposals">
       <div className="proposal-head">
         <div><b>Proposed next steps</b>{nextProposals.origin === 'auto' && <span className="tag good auto-tag">automatic</span>}<small>{nextProposals.candidates.length} for {PHASE_LABEL(nextProposals.phase).toLowerCase()} · {String(nextProposals.source).replaceAll('-', ' ')} · from {nextProposals.state.findings} finding{nextProposals.state.findings !== 1 ? 's' : ''} and {nextProposals.state.executed_steps} recorded step{nextProposals.state.executed_steps !== 1 ? 's' : ''}</small></div>

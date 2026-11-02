@@ -43,25 +43,36 @@ class LiveRegistry:
         self._streams = {}
         self._lock = threading.Lock()
 
-    def start(self, execution_id, command):
+    def start(self, execution_id, command, secrets=()):
         with self._lock:
-            self._streams[execution_id] = {'command': command, 'output': '', 'cursor': 0, 'done': False}
+            self._streams[execution_id] = {'command': command, 'output': '', 'cursor': 0, 'done': False,
+                                           '_raw': '', '_secrets': set(secrets)}
 
     def append(self, execution_id, text):
         with self._lock:
             entry = self._streams.get(execution_id)
             if entry is not None:
-                entry['output'] = (entry['output'] + text)[-LIVE_BUFFER_CHARS:]
-                entry['cursor'] += len(text)
+                from modules.evidence import redact
+                # Retain the beginning, including table headers. Never publish
+                # a chunk fragment or the middle of an overlong secret line.
+                entry['_raw'] = (entry['_raw'] + text)[:LIVE_BUFFER_CHARS]
+                complete = entry['_raw'].rfind('\n') + 1
+                entry['output'] = redact(entry['_raw'][:complete], entry['_secrets'])
+                entry['cursor'] = len(entry['output'])
 
     def finish(self, execution_id):
         with self._lock:
             self._streams.pop(execution_id, None)
 
-    def snapshot(self, execution_id):
+    def snapshot(self, execution_id, *, internal=False):
         with self._lock:
             entry = self._streams.get(execution_id)
-            return dict(entry) if entry is not None else None
+            if entry is None:
+                return None
+            public = {key: value for key, value in entry.items() if not key.startswith('_')}
+            if internal:
+                public['output'] = entry['_raw']
+            return public
 
 
 live_registry = LiveRegistry()

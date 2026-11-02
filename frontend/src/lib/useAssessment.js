@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { samePlan } from './constants'
 
 export function useAssessment(request, onError) {
-  const [selected, setSelected] = useState(null)
-  const [draftPlan, setDraftPlan] = useState([])
+  const [workspace, setWorkspace] = useState({ selected: null, draftPlan: [] })
   const current = useRef(null)
+  const loaded = useRef(null)
   const pending = useRef(null)
   const errorRef = useRef(onError)
   useEffect(() => { errorRef.current = onError }, [onError])
-  const load = useCallback(async (id, select = true) => {
+  const load = useCallback(async (id, select = true, { discardDraft = false } = {}) => {
     if (!select && current.current !== id) return
     pending.current?.abort()
     const controller = new AbortController()
@@ -16,14 +17,23 @@ export function useAssessment(request, onError) {
     try {
       const data = await request(`/assessments/${id}/snapshot`, { signal: controller.signal })
       if (controller.signal.aborted || current.current !== id) return
-      setSelected(data)
-      setDraftPlan(data.plan || [])
+      loaded.current = id
+      setWorkspace(previous => ({
+        selected: data,
+        draftPlan: !select && !discardDraft && previous.selected?.id === id && !samePlan(previous.draftPlan, previous.selected.plan)
+          ? previous.draftPlan : data.plan || [],
+      }))
+      return data
     } catch (error) {
-      if (!controller.signal.aborted) errorRef.current(error.message)
+      if (!controller.signal.aborted) {
+        current.current = loaded.current
+        errorRef.current(error.message)
+      }
     }
   }, [request])
   useEffect(() => () => pending.current?.abort(), [])
-  const clear = () => { pending.current?.abort(); current.current = null; setSelected(null); setDraftPlan([]) }
-  return { selected, draftPlan, setDraftPlan, openAssessment: load,
-    reloadAssessment: id => load(id, false), clearAssessment: clear }
+  const setDraftPlan = update => setWorkspace(previous => ({ ...previous, draftPlan: typeof update === 'function' ? update(previous.draftPlan) : update }))
+  const clear = () => { pending.current?.abort(); current.current = null; loaded.current = null; setWorkspace({ selected: null, draftPlan: [] }) }
+  return { ...workspace, setDraftPlan, openAssessment: load,
+    reloadAssessment: (id, options) => load(id, false, options), clearAssessment: clear }
 }

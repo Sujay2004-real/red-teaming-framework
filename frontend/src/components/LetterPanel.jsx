@@ -1,13 +1,14 @@
 import { useRef } from 'react'
 import { useApp } from '../lib/AppContext'
 import { ALLOWED_UPLOAD_SUFFIXES, MAX_UPLOAD_BYTES, fileSuffix } from '../lib/constants'
+import Icon from './Icon'
 
 // The engagement letter: the dropzone reads it, the parsed brief shows what
 // the agent was asked to do, and one click registers every target and drafts
 // a plan for each. Everything downstream (scopes, tool restrictions,
 // exploitation authorization) is derived from this document.
 export default function LetterPanel({
-  brief, briefFilename, targets, onClear, onImport, onRegisterTarget, onSetup,
+  brief, briefFilename, targets, onClear, onImport, onRegisterTarget, onSetup, collapsed = false, rules,
 }) {
   const { busy, agentBusy, setNotice } = useApp()
   const briefFileRef = useRef(null)
@@ -22,22 +23,24 @@ export default function LetterPanel({
     onImport(file)
   }
 
-  return <section className="panel brief-panel">
-    <div className="panel-title"><div><span className="eyebrow">START HERE</span><h2>Read the client's letter</h2></div>{brief && <button className="secondary compact" onClick={onClear} disabled={busy}>Clear</button>}</div>
+  return <details className="panel brief-panel" open={!collapsed}>
+    <summary className="brief-summary"><span className="section-icon"><Icon name="reader" /></span><span><span className="eyebrow">{collapsed ? 'SCOPE & AUTHORIZATION' : 'START HERE'}</span><b>{brief ? 'Engagement letter' : 'Import engagement letter'}</b>{brief && <small>{briefFilename}</small>}</span><span className={`tag ${brief ? 'good' : ''}`}>{brief ? 'Imported' : 'PDF · DOCX · TXT'}</span><Icon name="chevron" /></summary>
+    <div className="brief-body">
     {/* The whole box is the picker: clicks and Enter/Space forward to
         the hidden input, which clears itself after every pick so
         re-choosing the same file still fires onChange. */}
-    {!brief ? <div className="dropzone" role="button" tabIndex={0} aria-label="Import the client engagement letter"
+    {!brief ? <div className={`dropzone${agentBusy('reader') ? ' reading' : ''}`} role="button" tabIndex={busy ? -1 : 0} aria-disabled={busy} aria-busy={agentBusy('reader')} aria-label="Import the client engagement letter"
       onClick={() => { if (!busy) briefFileRef.current?.click() }}
       onKeyDown={e => { if (!busy && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); briefFileRef.current?.click() } }}
       onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (!busy) pickFile(e.dataTransfer.files?.[0]) }}>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-      <label className="drop-pick" htmlFor="brief-file" onClick={e => e.stopPropagation()}>{briefFilename || 'Drop the request letter here'}</label>
+      <span className="upload-mark"><Icon name={agentBusy('reader') ? 'reader' : 'upload'} /></span>
+      <span className="drop-pick">{agentBusy('reader') ? 'Reading your engagement letter…' : 'Drop your engagement letter here'}</span>
       <input id="brief-file" type="file" accept=".txt,.md,.pdf,.docx" hidden ref={briefFileRef}
         onChange={e => { const file = e.target.files?.[0] || null; e.target.value = ''; pickFile(file) }} />
-      <small>PDF, Word or text. I'll read it and work out the scope, targets, criticality and rules of engagement — then wait for your approval on every command.</small>
+      <small>{agentBusy('reader') ? 'Extracting the scope, targets, and rules of engagement.' : 'Or click to browse. PDF, Word, Markdown or text, up to 5 MB.'}</small>
+      <span className="drop-caption">Scope and rules are reviewed before any command runs.</span>
     </div> : <>
-      <p className="brief-meta"><b>{brief.client_name || 'Client'}</b>{brief.engagement_ref && <> · engagement <code>{brief.engagement_ref}</code></>}{brief.test_window && <> · test window {brief.test_window}</>}</p>
+      <div className="brief-toolbar"><p className="brief-meta"><b>{brief.client_name || 'Client'}</b>{brief.engagement_ref && <> · <code>{brief.engagement_ref}</code></>}{brief.test_window && <> · test window {brief.test_window}</>}</p><button className="secondary compact" onClick={onClear} disabled={busy}>Clear letter</button></div>
       <div className="brief-targets">
         {brief.targets.map((t, i) => {
           const registered = targets.some(existing => existing.scope_domain_ip === t.address)
@@ -58,9 +61,10 @@ export default function LetterPanel({
           </div>
         })}
       </div>
+      {rules && <details className="brief-details rules-review"><summary>Review enforceable engagement rules</summary>{rules}</details>}
       <div className="brief-actions">
         <button onClick={onSetup} disabled={busy}>{agentBusy('registrar') || agentBusy('planner') ? 'Setting up…' : 'Set up everything from this letter'}</button>
-        <small>Registers every target above and drafts a plan for each. Still your call on every command — nothing runs until you approve it.</small>
+        <small>Registers the targets and drafts a plan for each. Every command still requires your approval.</small>
       </div>
       {!!brief.objectives?.length && <details className="brief-details" open><summary>What the client asked for ({brief.objectives.length})</summary><ol>{brief.objectives.map((o, i) => <li key={i}>{o}</li>)}</ol></details>}
       {(!!brief.out_of_scope?.length || !!brief.prohibited?.length) && <details className="brief-details"><summary>Out of scope ({brief.out_of_scope?.length || 0}) & prohibited techniques ({brief.prohibited?.length || 0})</summary>
@@ -68,5 +72,6 @@ export default function LetterPanel({
         {!!brief.prohibited?.length && <><b>Never do</b><ul>{brief.prohibited.map((p, i) => <li key={i}>{p}</li>)}</ul></>}
       </details>}
     </>}
-  </section>
+    </div>
+  </details>
 }

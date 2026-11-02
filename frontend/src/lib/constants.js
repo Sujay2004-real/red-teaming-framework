@@ -33,8 +33,21 @@ export const PHASES = [
   { key: 'post_exploitation', label: 'Post-exploitation', caption: 'Bounded impact proof on verified findings' },
   { key: 'reporting', label: 'Reporting', caption: 'Deliver the client report' },
 ]
-export const PHASE_LABEL = key => PHASES.find(p => p.key === key)?.label || key
-export const PLAN_PHASES = ['recon', 'exploitation', 'post_exploitation']
+// The lab-only campaign phases. They sit between post-exploitation and
+// reporting, and exist only for a target in aggressive lab mode; the backend
+// refuses to draft or execute them anywhere else, so the UI never offers them
+// for a production target.
+export const CAMPAIGN_PHASES = [
+  { key: 'credential_validation', label: 'Credential validation', caption: 'Prove the recovered credentials actually authenticate' },
+  { key: 'lateral_movement', label: 'Lateral movement', caption: 'Re-use proven access across the authorized scope' },
+  { key: 'impact', label: 'Impact & objective proof', caption: 'Demonstrate the objective through the access obtained' },
+]
+export const ALL_PHASES = [...PHASES.slice(0, 5), ...CAMPAIGN_PHASES, PHASES[5]]
+// The phases an engagement in this mode walks. Mirrors phases.phase_chain().
+export const engagementPhases = aggressive => (aggressive ? ALL_PHASES : PHASES)
+export const PHASE_LABEL = key => ALL_PHASES.find(p => p.key === key)?.label || key
+export const PLAN_PHASES = ['recon', 'exploitation', 'post_exploitation',
+                            'credential_validation', 'lateral_movement', 'impact']
 
 // The same formats and size cap the backend enforces on uploads, checked
 // client-side so a wrong pick gets a readable message instead of silence or

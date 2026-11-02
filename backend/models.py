@@ -254,3 +254,24 @@ class PlanUpdate(BaseModel):
             if isinstance(step, dict):
                 _checked_plan_step_phase(step)
         return value
+
+
+class AutopilotUpdate(BaseModel):
+    """Opt-in switch for the semi-autonomous campaign loop.
+
+    Autopilot is per assessment and defaults off, so turning it on is an
+    explicit operator decision that can be reversed at any time.
+    """
+
+    enabled: bool
+
+
+class PromoteRequest(BaseModel):
+    """Spawn a child assessment for a host the campaign proved it owned."""
+
+    objective: Optional[str] = Field(default=None, max_length=1000)
+
+    @field_validator('objective')
+    @classmethod
+    def _strip_objective(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if isinstance(value, str) and value.strip() else None

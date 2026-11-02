@@ -268,7 +268,54 @@ The final step writes a clean, self-contained HTML report containing:
 
 ---
 
-## 13. The tests — how we know all this works
+## 13. The campaign — the rest of the red-team chain
+
+For a lab machine you fully own, a per-target **aggressive lab mode** extends the
+six-phase lifecycle with three more phases, so the engagement can carry the whole
+real sequence through to impact:
+
+```
+... exploitation → post_exploitation → credential_validation → lateral_movement → impact → reporting
+```
+
+- **The gate.** Effective only when a target has *both* `exploitation_authorized`
+  and `aggressive_lab`; every tool the chain drives is `lab_only` in the policy
+  engine, so the production allowlist is untouched. The UI shows the extra phases only
+  for such a target.
+- **The evidence — `footholds.py`.** This module reads what the tools actually
+  printed (Metasploit sessions and credentials, `hydra` hits, `nxc` results, an
+  SSH foothold marker, nmap host lines) and files it as three things: **footholds**
+  (an open session you can act through), **loot** (a recovered credential) and
+  **hosts** (what was discovered). A parser that does not match produces *nothing* —
+  unknown or crafted output can never invent campaign state. Passwords and hashes are
+  stored encrypted (Fernet) with a fingerprint, never in plaintext.
+- **The planners — `planners.py`.** Each campaign phase has a planner that drafts
+  only from what is really held: **credential validation** proves a recovered
+  credential authenticates (`hydra`/`nxc`), **lateral movement** re-uses a *validated*
+  credential against another in-scope host (and opens a non-interactive foothold with
+  `impacket-wmiexec`), and **impact** reads the objective's evidence through the access
+  obtained (`impacket-secretsdump`, `smbclient`, or a Metasploit post module).
+- **Secrets never leave the vault — `resolve_references`.** A planner writes a
+  `$loot:<id>$` placeholder, never the password. The real value is substituted (and
+  shell-quoted) only at the instant the command runs; the plan, the audit trail and
+  every list response keep the placeholder. Reading a value is a separate, logged
+  `/loot/{id}/reveal` call.
+- **Semi-autonomy — `auto_recommend.py`.** The opt-in **autopilot** removes the
+  bookkeeping, not the human: one bounded iteration ingests the evidence from the
+  steps you approved, drafts the next phase when the framework allows it, records a
+  fresh batch of proposals, and says exactly what decision is next. It **never
+  approves and never executes**, and it stops on a no-progress signature or a
+  25-iteration budget.
+- **Pivoting without widening scope.** Promoting a compromised host spawns a **child
+  assessment** whose target scope is exactly that one host — strictly narrower than
+  its parent — so lateral movement can never expand what the letter authorizes.
+
+Every campaign step is still a separate, human-approved command, re-checked against
+scope and the letter at execution time.
+
+---
+
+## 14. The tests — how we know all this works
 
 The backend comes with a full test suite (run with `pytest`). Every test is a small program that tries one situation and checks the result. Highlights:
 
@@ -278,11 +325,12 @@ The backend comes with a full test suite (run with `pytest`). Every test is a sm
 - **Letter-reading tests:** a sample letter yields the right targets, criticalities, and banned tools; addresses named as out-of-scope never become targets. The real client PDF (when present) is parsed end-to-end too.
 - **Approval-flow tests:** running a step twice is refused; analyzing before everything ran is refused; a banned tool re-added to a plan by hand is still refused at approval time; changing the plan after execution begins is refused.
 - **Analyzer tests:** a failed connection produces no fake findings; duplicate findings merge; the severity of a template match actually changes its score; a runaway AI response is capped; outputs stuffed with colour codes still parse.
+- **Campaign tests:** a session list and a hashdump line become a foothold and a masked credential; the plaintext never appears in any response; a campaign step runs the real secret while the database keeps only the placeholder; autopilot drafts without executing anything; a promoted host becomes a child scoped to that host alone.
 - **The end-to-end smoke test** (`smoke_e2e.py`): one script that walks the entire journey — import the letter, register the target, run every step, analyze, report, then do the subnet sweep — against the live system, and prints each result so the whole pipeline can be checked in one scroll.
 
 ---
 
-## 14. The numbers, in one place
+## 15. The numbers, in one place
 
 | Setting | Value | What it means |
 |---|---|---|
@@ -295,5 +343,9 @@ The backend comes with a full test suite (run with `pytest`). Every test is a sm
 | Maximum findings | 200 | Cap on a runaway AI response |
 | Default criticality | 70 (out of 100) | Used when the client didn't say |
 | Scanning speed limit | 30 packets/requests per second | Never flood the target |
+| Maximum footholds | 50 per assessment | Cap on campaign sessions |
+| Maximum loot rows | 200 per assessment | Cap on recovered credentials |
+| Maximum discovered hosts | 512 per assessment | Cap on the engagement host list |
+| Autopilot iterations | 25 per assessment | Backstop that stops a stalled loop |
 
 **The priority formula, in words:** priority = 40% severity + 25% ease of attack + 20% target importance + 15% confidence, on a 0–100 scale.

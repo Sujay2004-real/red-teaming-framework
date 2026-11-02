@@ -31,11 +31,17 @@ MSF_ALLOWED_PREFIXES = (
     'auxiliary/scanner/', 'exploit/unix/', 'exploit/linux/',
     'exploit/windows/', 'exploit/multi/',
 )
+# Post-exploitation module trees run against an existing session rather than a
+# network target, so they are available only in aggressive lab mode, where the
+# session that feeds them was itself opened under the letter's authorization.
+MSF_AGGRESSIVE_PREFIXES = (
+    'post/linux/', 'post/windows/', 'post/multi/', 'post/osx/',
+)
 MSF_ALLOWED_SET_KEYS = {
     'RHOST', 'RHOSTS', 'RPORT', 'PORTS', 'THREADS', 'TIMEOUT', 'SSL', 'VERBOSE',
 }
 MSF_TARGET_KEYS = {'RHOST', 'RHOSTS'}
-MSF_ALLOWED_VERBS = ('run', 'exploit', 'exit', 'back')
+MSF_ALLOWED_VERBS = ('run', 'exploit', 'exit', 'back', 'sessions')
 
 # Aggressive lab mode ONLY (target.aggressive_lab + exploitation_authorized).
 # These keys let a real exploit module carry a payload and a reverse-handler
@@ -54,6 +60,105 @@ MSF_ATTACKER_SIDE_KEYS = {'LHOST', 'SRVHOST'}
 MSF_AGGRESSIVE_VERBS = ('run', 'exploit', 'check', 'sessions', 'exit', 'back')
 MSF_PAYLOAD_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9/_\-]+$')
 
+# ---------------------------------------------------------------------------
+# Post-exploitation and lateral movement.
+#
+# Every tool in this group exists to act through a foothold the engagement
+# already obtained, so all of them are lab_only: refused unless the target is
+# in aggressive lab mode, which itself requires the letter to authorize
+# controlled exploitation. The default (production-target) allowlist is
+# therefore untouched by this section - adding a tool here can never widen what
+# a normal engagement permits.
+# ---------------------------------------------------------------------------
+LAB_ONLY_TOOLS = {
+    'nxc', 'smbclient', 'enum4linux-ng', 'hydra', 'ssh', 'proxychains4',
+    'impacket-secretsdump', 'impacket-psexec', 'impacket-wmiexec',
+    'impacket-GetUserSPNs', 'impacket-GetNPUsers',
+}
+
+# Commands that may be typed into an existing Metasploit session with
+# `sessions -C '<command>'`. The bounded set is what non-destructive impact
+# verification needs; the aggressive set adds the read-only enumeration a lab
+# engagement wants. Both are single commands with no shell metacharacters, so a
+# session command can never chain into something the allowlist never saw.
+SESSION_SAFE_COMMANDS = (
+    'id', 'whoami', 'hostname', 'uname -a', 'uname -r', 'cat /etc/os-release',
+    'ip addr', 'ip a', 'ip route', 'netstat -rn', 'systeminfo',
+)
+SESSION_AGGRESSIVE_COMMANDS = (
+    'arp -a', 'ip neigh', 'netstat -an', 'ps aux', 'tasklist', 'env',
+    'getent passwd', 'ls -la /home', 'cat /etc/hosts', 'head -c 200 /etc/passwd',
+    'head -c 200 /etc/shadow', 'net user', 'net localgroup administrators',
+)
+# Charset deliberately excludes ; | & > < $ ` ' " ( ) { } * ? ! so a session
+# command cannot chain, redirect, substitute, or glob its way anywhere.
+SESSION_COMMAND_RE = re.compile(r'^[A-Za-z0-9_./%=\- :,\[\]@+]+$')
+SESSION_FORBIDDEN_PATTERNS = (
+    'rm ', 'rmdir', 'mkfs', 'dd if=', 'dd of=', 'shutdown', 'reboot', 'halt',
+    'poweroff', 'iptables', 'ufw ', 'useradd', 'userdel', 'passwd ',
+    'chmod 777', 'chown ', 'crontab', 'systemctl', 'service ',
+)
+SESSION_COMMAND_MAX_CHARS = 200
+
+# The one remote command an SSH foothold step may run. Fixing it exactly keeps
+# the foothold proof deterministic: the step either prints the marker (a real
+# login) or it does not, and no operator-authored command can ride along.
+SSH_FOOTHOLD_COMMAND = 'echo RT-FOOTHOLD; id; hostname'
+
+
+def split_statements(script):
+    """Split a Metasploit resource script on semicolons outside quotes.
+
+    A naive split would cut a quoted ``sessions -C "id; hostname"`` payload in
+    half, turning one reviewed statement into two statements the validator then
+    judges separately. Respecting quotes keeps the unit of review the same as
+    the unit of execution.
+    """
+    statements, current, quote = [], [], ''
+    for character in script or '':
+        if quote:
+            current.append(character)
+            if character == quote:
+                quote = ''
+            continue
+        if character in ('"', "'"):
+            quote = character
+            current.append(character)
+            continue
+        if character == ';':
+            statements.append(''.join(current).strip())
+            current = []
+            continue
+        current.append(character)
+    statements.append(''.join(current).strip())
+    return [statement for statement in statements if statement]
+
+def session_command_error(command, aggressive=False):
+    """Validate a command destined for an existing Metasploit session.
+
+    Returns a human-readable problem, or '' when the command is legal. This is
+    the one place in the policy engine where the *content* of an argument is
+    executed on a remote host rather than interpreted locally, so it is checked
+    in two layers: a strict character set that makes chaining, redirection and
+    substitution impossible, and a command allowlist.
+    """
+    command = ' '.join((command or '').split())
+    if not command:
+        return 'msf sessions -C needs a command to run'
+    if len(command) > SESSION_COMMAND_MAX_CHARS:
+        return f'msf session command exceeds {SESSION_COMMAND_MAX_CHARS} characters'
+    if not SESSION_COMMAND_RE.fullmatch(command):
+        return ('msf session command may contain only plain command characters; '
+                'chaining, redirection and substitution are refused')
+    lowered = command.lower()
+    for pattern in SESSION_FORBIDDEN_PATTERNS:
+        if pattern in lowered:
+            return f'msf session command contains a refused operation ({pattern.strip()})'
+    allowed = set(SESSION_SAFE_COMMANDS) | (set(SESSION_AGGRESSIVE_COMMANDS) if aggressive else set())
+    if command not in allowed:
+        return ('msf session command is not in the permitted read-only set for this mode; '
+                'aggressive lab mode widens the set')
+    return ''
 
 class PolicyEngine:
     """Allowlist command policy.
@@ -357,6 +462,149 @@ class PolicyEngine:
                 },
             }
         },
+        # ------------------------------------------------------------------
+        # Post-exploitation and lateral movement (lab_only).
+        #
+        # These are the tools a red team reaches for once it holds a foothold:
+        # protocol clients for share/session enumeration, credential reuse,
+        # password auditing against a lab service, SSH pivots, a proxy wrapper
+        # for chaining through a foothold, and the Impacket suite for Windows
+        # credential access and remote execution. Every one is refused unless
+        # the target is in aggressive lab mode, and every one still needs its
+        # own human approval before it runs.
+        # ------------------------------------------------------------------
+        'post_exploitation': {
+            'tools': {
+                'nxc': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    # netexec: authenticate across SMB/SSH/LDAP/WinRM/MSSQL with
+                    # a recovered or supplied secret, and enumerate shares,
+                    # sessions and logged-on users. Absent by design: -x/-X (run
+                    # a command), -M (arbitrary module), --sam/--lsa/--ntds
+                    # (credential dumping) and -o (module options) - they are
+                    # free-form execution or bulk credential theft, which this
+                    # table cannot bound.
+                    'bool_flags': {
+                        '--local-auth', '--continue-on-success', '--shares',
+                        '--sessions', '--loggedon-users', '--users', '--groups',
+                        '--pass-pol', '--no-bruteforce', '--verbose',
+                    },
+                    'value_flags': {
+                        '-u', '--username', '-p', '--password', '-H', '--hash',
+                        '-d', '--domain', '--port', '-t', '--threads',
+                        '--timeout', '--smb-timeout',
+                    },
+                    # nxc is `nxc <protocol> <target>`; the protocol token is not
+                    # a destination, only the target positional is scope-checked.
+                    'positional_targets': (1,),
+                },
+                'smbclient': {
+                    'risk': 'moderate',
+                    'lab_only': True,
+                    # Share listing and non-interactive share access. Absent by
+                    # design: bare interactive mode (no -c) and the put/get
+                    # transfer flags, so a share can be listed and read but bulk
+                    # exfiltration stays an explicit operator decision outside
+                    # the framework's bounded proof.
+                    'bool_flags': {'-N', '--no-pass', '-L', '--list', '-g', '--grep', '-d'},
+                    'value_flags': {'-U', '--user', '-W', '--workgroup', '-c', '--command',
+                                    '-p', '--port', '-m', '--max-protocol', '-A', '--authentication-file'},
+                    'positional_targets': (0,),
+                },
+                'enum4linux-ng': {
+                    'risk': 'moderate',
+                    'lab_only': True,
+                    'bool_flags': {'-A', '-U', '-S', '-G', '-P', '-R', '-o', '-v', '-d'},
+                    'value_flags': {'-w', '-u', '-p', '-L'},
+                    'attached_patterns': (r'^-o[A-Z]$',),
+                    'positional_targets': (0,),
+                },
+                'hydra': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    # Credential auditing against a lab service. Use the
+                    # service://host target form so the destination is one
+                    # scope-checkable token. Absent by design: -M (target list
+                    # file), -x (password generation), -b (brute variant) and
+                    # -R (restore) - they take the destination or the credential
+                    # set outside the reviewed plan.
+                    'bool_flags': {'-f', '-F', '-e', '-u', '-O', '-V', '-d', '-I', '-q'},
+                    'value_flags': {'-l', '-L', '-p', '-P', '-s', '-t', '-S', '-m', '-o', '-w', '-W'},
+                    'attached_patterns': (r'^-t\d+$', r'^-s\d+$'),
+                    'positional_targets': (0,),
+                    'target_uri_schemes': ('ssh', 'ftp', 'smb', 'rdp', 'mssql', 'mysql', 'vnc',
+                                           'telnet', 'http', 'https', 'smbnt', 'smtp', 'imap',
+                                           'pop3', 'postgres'),
+                },
+                'ssh': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    # Foothold proof and tunneling: -N with -D/-L opens a pivot
+                    # without a shell, and a bounded read-only command proves a
+                    # login. Absent by design: -o UserKnownHostsFile/ProxyCommand
+                    # and friends are not enumerated, so the option surface
+                    # cannot be used to retarget the connection; the remote
+                    # command is checked against the session command allowlist.
+                    'bool_flags': {'-N', '-f', '-q', '-T', '-4', '-6', '-v', '-C'},
+                    'value_flags': {'-p', '-i', '-o', '-D', '-L', '-W', '-l', '-F', '-J'},
+                    'attached_patterns': (r'^-p\d+$', r'^-D\d+$'),
+                    'positional_targets': (0,),
+                    'ssh_remote_command': True,
+                },
+                'proxychains4': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    # Wraps another allowed command so it egresses through the
+                    # pivot. The inner command is validated recursively against
+                    # the same scopes, so proxychains cannot smuggle a command
+                    # the allowlist would otherwise refuse.
+                    'wrapper': True,
+                    'bool_flags': {'-q'},
+                    'value_flags': {'-f'},
+                },
+                'impacket-secretsdump': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    # Windows credential extraction. Absent by design: -exec
+                    # (run a command through the target's service), -just-dc-ntlm
+                    # bulk modes are enumerated but bounded by -history/-user
+                    # being off by default; output redirection is the shell's
+                    # job, not this table's.
+                    'bool_flags': {'-history', '-just-dc', '-use-vss', '-debug'},
+                    'value_flags': {'-hashes', '-just-dc-user', '-user-status', '-outputfile', '-dc-ip', '-target-ip'},
+                    'positional_targets': (0,),
+                },
+                'impacket-psexec': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    'bool_flags': {'-debug', '-codec'},
+                    'value_flags': {'-hashes', '-dc-ip', '-target-ip', '-port'},
+                    'positional_targets': (0,),
+                },
+                'impacket-wmiexec': {
+                    'risk': 'high',
+                    'lab_only': True,
+                    'bool_flags': {'-debug', '-codec', '-shell-type'},
+                    'value_flags': {'-hashes', '-dc-ip', '-target-ip', '-port'},
+                    'positional_targets': (0,),
+                },
+                'impacket-GetUserSPNs': {
+                    'risk': 'moderate',
+                    'lab_only': True,
+                    'bool_flags': {'-request', '-debug'},
+                    'value_flags': {'-hashes', '-dc-ip', '-target-ip', '-outputfile', '-usersfile'},
+                    'positional_targets': (0,),
+                },
+                'impacket-GetNPUsers': {
+                    'risk': 'moderate',
+                    'lab_only': True,
+                    'bool_flags': {'-request', '-debug', '-no-pass'},
+                    'value_flags': {'-dc-ip', '-format', '-outputfile', '-usersfile'},
+                    'positional_targets': (0,),
+                },
+            }
+        },
     }
 
     def tool_registry(self):
@@ -431,10 +679,14 @@ class PolicyEngine:
         errors = []
         used_module = False
         has_target = False
+        # A post module acts on an existing session instead of a network host,
+        # so "run" needs either an in-scope RHOST/RHOSTS or a SESSION - and the
+        # session-scoped path is only reachable in aggressive lab mode.
+        has_session = False
+        used_execution = False
         allowed_keys = MSF_ALLOWED_SET_KEYS | (MSF_AGGRESSIVE_SET_KEYS if aggressive else set())
         allowed_verbs = MSF_AGGRESSIVE_VERBS if aggressive else MSF_ALLOWED_VERBS
-        for statement in (script or '').split(';'):
-            statement = statement.strip()
+        for statement in split_statements(script):
             if not statement:
                 continue
             lowered = statement.lower()
@@ -442,7 +694,8 @@ class PolicyEngine:
                 module = statement[4:].strip()
                 used_module = True
                 has_target = False
-                if not any(module.startswith(prefix) for prefix in MSF_ALLOWED_PREFIXES):
+                prefixes = MSF_ALLOWED_PREFIXES + (MSF_AGGRESSIVE_PREFIXES if aggressive else ())
+                if not any(module.startswith(prefix) for prefix in prefixes):
                     errors.append(f'msf module {module} is outside the permitted module trees')
                 continue
             if lowered.startswith('set '):
@@ -454,6 +707,8 @@ class PolicyEngine:
                 if key.upper() not in allowed_keys:
                     errors.append(f'msf set key {key} is not in the permitted option set')
                     continue
+                if key.upper() == 'SESSION':
+                    has_session = value.strip().isdigit()
                 if key.upper() in MSF_TARGET_KEYS:
                     has_target = bool(value.strip())
                     # RHOSTS accepts a space- or comma-separated list; each
@@ -483,22 +738,51 @@ class PolicyEngine:
                 continue
             verb = lowered.split()[0]
             if verb in allowed_verbs:
-                if verb in {'run', 'exploit'} and not (used_module and has_target):
-                    errors.append('msf execution requires an explicit in-scope RHOST/RHOSTS for this module')
+                if verb in {'run', 'exploit'}:
+                    used_execution = True
+                    if not (used_module and (has_target or has_session)):
+                        errors.append('msf execution requires an explicit in-scope RHOST/RHOSTS '
+                                      'or a SESSION on an existing foothold')
                 # Only the backgrounding switches are allowed after run/exploit;
                 # an interactive `sessions -i` or an unknown flag fails closed.
-                extra = statement.split()[1:]
+                try:
+                    extra = shlex.split(statement, posix=True)[1:]
+                except ValueError:
+                    errors.append(f'msf statement syntax is invalid: {statement!r}')
+                    continue
                 if verb in {'run', 'exploit'} and any(token not in ('-z', '-j') for token in extra):
                     errors.append(f'msf {verb} accepts only -z/-j here: {statement!r}')
                 if verb == 'sessions':
-                    if not aggressive:
-                        errors.append('msf sessions is only available in aggressive lab mode')
-                    elif not (extra and extra[0] in ('-C', '-l', '-L')):
-                        errors.append("msf sessions accepts only -C '<command>' or -l here (interactive -i is refused)")
+                    # Listing sessions is read-only and available as soon as the
+                    # letter authorizes exploitation, because everything after
+                    # this point acts on what the list reveals. Running a
+                    # command on a session is the post-exploitation primitive
+                    # and is validated command-by-command.
+                    marker = extra[0] if extra else ''
+                    if marker in ('-l', '-L'):
+                        if len(extra) > 1:
+                            errors.append('msf sessions -l takes no further arguments')
+                        continue
+                    if marker != '-C':
+                        errors.append("msf sessions accepts only -l (list) or -C '<command>' with -i <id> (interactive -i is refused)")
+                        continue
+                    if len(extra) < 2:
+                        errors.append('msf sessions -C needs a command to run on the session')
+                        continue
+                    if problem := session_command_error(extra[1], aggressive=aggressive):
+                        errors.append(problem)
+                    # -i <id> targets one session; without it Metasploit runs
+                    # the same reviewed command on every open session, which is
+                    # the pre-existing documented behaviour and stays legal.
+                    remainder = extra[2:]
+                    if len(remainder) >= 2 and remainder[0] == '-i' and remainder[1].isdigit():
+                        remainder = remainder[2:]
+                    if remainder:
+                        errors.append(f'msf sessions accepts only -C and -i here: {statement!r}')
                 continue
             errors.append(f'msf statement is not a permitted use/set/run/exit form: {statement!r}')
-        if not used_module and not errors:
-            errors.append('msf script must select a module with "use"')
+        if used_execution and not used_module and not errors:
+            errors.append('msf script must select a module with "use" before run/exploit')
         return errors
 
     @staticmethod
@@ -550,6 +834,51 @@ class PolicyEngine:
             return None
         return None, token
 
+    @staticmethod
+    def _wrapper_arguments(tokens, spec):
+        """The wrapper's own flags, as (flag, value) pairs, before the inner command."""
+        pairs, index = [], 1
+        bool_flags = spec.get('bool_flags', set())
+        value_flags = spec.get('value_flags', set())
+        while index < len(tokens):
+            token = tokens[index]
+            if token in bool_flags:
+                pairs.append((token, None))
+                index += 1
+                continue
+            if token in value_flags and index + 1 < len(tokens):
+                pairs.append((token, tokens[index + 1]))
+                index += 2
+                continue
+            if '=' in token and token.split('=', 1)[0] in value_flags:
+                base, _, value = token.partition('=')
+                pairs.append((base, value))
+                index += 1
+                continue
+            break
+        return pairs
+
+    @staticmethod
+    def _wrapper_inner_command(tokens, spec):
+        """The tokens a wrapper such as proxychains4 will actually execute."""
+        consumed = len(PolicyEngine._wrapper_arguments(tokens, spec))
+        index = 1
+        bool_flags = spec.get('bool_flags', set())
+        value_flags = spec.get('value_flags', set())
+        while index < len(tokens) and consumed > 0:
+            token = tokens[index]
+            if token in bool_flags:
+                consumed -= 1
+                index += 1
+            elif token in value_flags and index + 1 < len(tokens):
+                consumed -= 1
+                index += 2
+            elif '=' in token and token.split('=', 1)[0] in value_flags:
+                consumed -= 1
+                index += 1
+            else:
+                break
+        return tokens[index:]
     def scan_arguments(self, tokens, spec, arguments=None):
         """Split arguments into targets and resolvers using the tool's own spec.
 
@@ -634,8 +963,29 @@ class PolicyEngine:
         if cutoff is not None and len(positionals) > cutoff:
             targets.extend(positionals[:cutoff])
             resolvers.extend(positionals[cutoff:])
-        else:
+            return targets, resolvers, None
+        # Some tools put a non-destination token in front of the target
+        # (nxc's protocol, hydra's service is embedded in its URI). When a spec
+        # names which positional indices are targets, everything else is
+        # recorded as a plain argument and must still look like a bare token -
+        # it can never be a URL, path or address that skips the scope check.
+        roles = spec.get('positional_targets')
+        if roles is None:
             targets.extend(positionals)
+            return targets, resolvers, None
+        allowed = set(roles)
+        for index, token in enumerate(positionals):
+            if index in allowed:
+                targets.append(token)
+            elif spec.get('ssh_remote_command') and index == 1:
+                # The one place a positional is a command rather than a
+                # destination: ssh's optional trailing remote command, pinned
+                # to a single reviewed string by validate_command.
+                arguments.append(('remote-command', token))
+            elif not re.fullmatch(r'[A-Za-z0-9_.\-]+', token):
+                return None, None, token
+            else:
+                arguments.append(('positional', token))
         return targets, resolvers, None
 
     def validate_command(self, command, authorized_scopes, expected_tool=None, allow_exploitation=False, aggressive=False):
@@ -671,6 +1021,16 @@ class PolicyEngine:
                 'attached_patterns': tuple(rules.get('attached_patterns', ())) + tuple(rules.get('aggressive_attached_patterns', ())),
             }
 
+        # Lab-only tools act through a foothold on a host the operator owns.
+        # They are refused outright unless the engagement is in aggressive lab
+        # mode, which itself requires the letter to authorize exploitation, so
+        # the default production-target allowlist is unchanged by their
+        # existence.
+        if rules.get('lab_only') and not aggressive:
+            return False, (f'{tool} acts through an obtained foothold and is available only in '
+                           'aggressive lab mode for an engagement that authorizes controlled '
+                           'exploitation.'), rules
+
         # The exploitation gate: a tool (sqlmap, msfconsole) or a payload
         # (curl with a request body) is exploitation-grade, and the client's
         # engagement letter must authorize controlled exploitation for this
@@ -681,6 +1041,24 @@ class PolicyEngine:
             return False, ("The client's engagement letter does not authorize controlled exploitation "
                            'against this target, so this command is refused.'), rules
 
+        # A wrapper (proxychains4) carries an entire command inside it, so it
+        # cannot be validated by the ordinary flag walk: the inner command is
+        # validated recursively, against the same scopes and the same mode.
+        if rules.get('wrapper'):
+            inner = self._wrapper_inner_command(tokens, rules)
+            if not inner:
+                return False, f'{tool} requires a command to run through the pivot.', rules
+            for flag, value in self._wrapper_arguments(tokens, rules):
+                if flag == '-f' and ('..' in (value or '') or not re.fullmatch(r'/(?:tmp|home|opt|etc)/[\w./\-]*', value or '')):
+                    return False, f'{tool} -f must name a configuration file under /tmp, /home, /opt or /etc.', rules
+            valid, reason, _ = self.validate_command(
+                ' '.join(inner), authorized_scopes,
+                allow_exploitation=allow_exploitation, aggressive=aggressive)
+            if not valid:
+                return False, f'Wrapped command refused: {reason}', rules
+            return True, (f'Allowed post-exploitation capability ({rules["risk"]} risk, pivot wrapper); '
+                          'the wrapped command was scope-checked; HITL approval required.'), rules
+
         arguments = []
         targets, resolvers, rejected = self.scan_arguments(tokens, rules, arguments)
         if rejected is not None:
@@ -690,6 +1068,25 @@ class PolicyEngine:
         error = validate_argument_values(tool, arguments)
         if error:
             return False, f'Blocked argument for {tool}: {error}.', rules
+
+        # Some tools insist on a URI target (hydra's service://host). Requiring
+        # one of the enumerated schemes keeps the destination in a single
+        # scope-checkable token instead of a bare service word the scope check
+        # would read as a hostname.
+        schemes = rules.get('target_uri_schemes')
+        if schemes:
+            for target in targets:
+                scheme = target.split('://', 1)[0].lower() if '://' in target else ''
+                if scheme not in schemes:
+                    return False, (f'{tool} targets must use one of these URI schemes: '
+                                   f'{", ".join(sorted(schemes))}.'), rules
+
+        # An SSH remote command is executed on the target, so it is pinned to
+        # the single foothold-proof command rather than left free-form.
+        remote = [value for flag, value in arguments if flag == 'remote-command']
+        if rules.get('ssh_remote_command') and remote and ' '.join(remote[0].split()) != SSH_FOOTHOLD_COMMAND:
+            return False, ('ssh may run only the framework foothold command, or no command at '
+                           'all with -N for a tunnel; use a Metasploit session for other commands.'), rules
 
         # msfconsole's -x value is a script, not a single target: validate it
         # statement by statement (module tree, set keys, RHOSTS scope) after
@@ -716,7 +1113,9 @@ class PolicyEngine:
             return False, 'The command must contain an explicit target.', rules
         # URL-capable scanners must not reinterpret an allowed hostname as a
         # local-file URL, credential-bearing authority, or curl URL expansion.
-        for target in targets:
+        # Tools that take their own application-protocol URI (hydra's
+        # ssh://host) are exempt: their scheme was already pinned above.
+        for target in ([] if schemes else targets):
             if '://' in target:
                 try:
                     parsed = urlparse(target)

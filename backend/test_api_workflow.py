@@ -468,11 +468,14 @@ def test_appending_a_proposal_preserves_earlier_phases_findings(client):
     survived = client.get(f"/assessments/{assessment['id']}").json()
     assert len(survived['findings']) == findings_before
 
-    # Any other edit keeps the whole-assessment invalidation: an edit to a step
-    # in an earlier phase can change what that phase's analysis produces, and
-    # there is no cheap way to know which findings survive that.
+    # Editing the still-unexecuted later phase also preserves its prerequisites.
     edited = [dict(step) for step in survived['plan']]
     edited[-1]['command'] = 'nmap -sV -p 8443 juice-shop'
+    assert client.put(f"/assessments/{assessment['id']}/plan", json={'plan': edited}).status_code == 200
+    assert len(client.get(f"/assessments/{assessment['id']}").json()['findings']) == findings_before
+
+    # New reconnaissance work really does invalidate the earlier evidence.
+    edited.append({'tool': 'curl', 'command': 'curl -I http://juice-shop:3000/status', 'phase': 'recon'})
     assert client.put(f"/assessments/{assessment['id']}/plan", json={'plan': edited}).status_code == 200
     assert client.get(f"/assessments/{assessment['id']}").json()['findings'] == []
 

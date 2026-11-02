@@ -16,9 +16,9 @@ export default function AnalysisPanel({ selected, currentPhase, phaseSteps, phas
     </div>
     <div>
       <button className="secondary" onClick={onAnalyze} disabled={busy || !canAnalyze}>{agentBusy('analyst') ? 'Analyzing…' : 'Analyze results'}</button>
-      <button onClick={onReport} disabled={busy || !canReport}>{agentBusy('reporter') ? 'Writing the report…' : 'Generate report'}</button>
-      {reportUrl && <a className="download-link report-fallback" href={reportUrl} target="_blank" rel="noreferrer">Your browser blocked the report tab — open it here</a>}
-      {selected.status === 'reported' && <button type="button" className="download-link" onClick={onDownloadReport}>Download last report</button>}
+      <button onClick={onReport} disabled={busy || !canReport || planDirty}>{agentBusy('reporter') ? 'Writing the report…' : 'Generate report'}</button>
+      {reportUrl && <a className="download-link report-fallback" href={reportUrl} target="_blank" rel="noreferrer">Open generated report</a>}
+      {selected.status === 'reported' && <button type="button" className="download-link" disabled={busy} onClick={onDownloadReport}>Download last report</button>}
     </div>
   </section>
 }

@@ -4,7 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.orm import Session, defer
 from database import Assessment, Finding, FindingReview, ReportVersion, ToolExecution, get_db, utcnow
 from modules.api_auth import verify_operator_key
@@ -28,7 +28,8 @@ def catalog(offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100), 
     query = db.query(Assessment)
     rows = query.order_by(Assessment.id.desc()).offset(offset).limit(limit).all()
     fields = ('id', 'target_id', 'objective', 'status', 'current_phase', 'created_at', 'completed_at', 'plan_version')
-    return {'items': [{k: getattr(row, k) for k in fields} for row in rows], 'total': query.count(), 'offset': offset, 'limit': limit}
+    return {'items': [{k: getattr(row, k) for k in fields} for row in rows], 'total': query.count(),
+            'reported_total': query.filter(Assessment.status == 'reported').count(), 'offset': offset, 'limit': limit}
 
 
 @router.get('/assessments/{assessment_id}/snapshot')
@@ -65,10 +66,14 @@ def findings(assessment_id: int, offset: int = Query(0, ge=0), limit: int = Quer
     if tool:
         query = query.filter(Finding.source_tools.contains('"' + tool + '"'))
     total = query.count()
+    # Aggregate the filtered result before pagination; the severity chart must
+    # describe the whole matching set, rather than just the visible 30 rows.
+    severity_counts = dict(query.with_entities(Finding.severity, func.count(Finding.id)).group_by(Finding.severity).all())
     rows = query.options(defer(Finding.evidence), defer(Finding.exploit_evidence)).order_by(Finding.priority_score.desc(), Finding.id).offset(offset).limit(limit).all()
     reviews = {r.fingerprint: r for r in db.query(FindingReview).filter_by(assessment_id=assessment_id).filter(FindingReview.fingerprint.in_([r.fingerprint for r in rows])).all()}
     fields = ('id', 'fingerprint', 'title', 'severity', 'endpoint', 'parameter', 'priority_score', 'confidence_score', 'verification', 'source_tools', 'phase')
-    return {'items': [{k: getattr(r, k) for k in fields} | {'review': review_data(reviews.get(r.fingerprint))} for r in rows], 'total': total, 'offset': offset, 'limit': limit}
+    return {'items': [{k: getattr(r, k) for k in fields} | {'review': review_data(reviews.get(r.fingerprint))} for r in rows],
+            'total': total, 'severity_counts': severity_counts, 'offset': offset, 'limit': limit}
 
 
 @router.get('/assessments/{assessment_id}/findings/{finding_id}')
@@ -147,7 +152,7 @@ def execution_evidence(assessment_id: int, execution_id: int, db: Session = Depe
 @router.get('/assessments/{assessment_id}/reports')
 def report_versions(assessment_id: int, db: Session = Depends(get_db)):
     require_assessment(db, assessment_id)
-    return [{k: getattr(r, k) for k in ('id', 'digest', 'provenance', 'created_at')} for r in db.query(ReportVersion).filter_by(assessment_id=assessment_id).order_by(ReportVersion.id.desc()).all()]
+    return [{k: getattr(r, k) for k in ('id', 'digest', 'provenance', 'created_at', 'restricted')} for r in db.query(ReportVersion).filter_by(assessment_id=assessment_id).order_by(ReportVersion.id.desc()).all()]
 
 
 @router.get('/assessments/{assessment_id}/reports/{version_id}')
@@ -155,6 +160,8 @@ def report_version(assessment_id: int, version_id: int, db: Session = Depends(ge
     row = db.query(ReportVersion).filter_by(id=version_id, assessment_id=assessment_id).first()
     if not row:
         raise HTTPException(404, 'Report version not found')
+    if row.restricted:
+        raise HTTPException(409, 'This legacy report contains unreviewed evidence. Generate a redacted report or use audited raw access.')
     from pathlib import Path
     if not Path(row.path).is_file():
         raise HTTPException(404, 'Report file is unavailable')

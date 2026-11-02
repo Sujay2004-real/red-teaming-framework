@@ -51,6 +51,14 @@ Key capabilities:
   phase **auto-drafts the next one**: the moment the recon output is correlated, the
   exploitation plan is already in front of you — still policy-gated, still per-step
   approved; the operator just no longer has to press Draft to see it.
+- **Full kill chain (aggressive lab mode)** — a target in
+  [aggressive lab mode](#aggressive-lab-mode-opt-in-weaponized-exploitation) continues past
+  post-exploitation through the rest of a real red-team chain: **credential validation →
+  lateral movement → impact**. Each phase is drafted only from evidence the engagement
+  actually obtained — a recovered credential, an open foothold, a discovered host — and
+  every step is still individually approved. Secrets never enter a plan or the audit
+  trail: a planner writes a `$loot:<id>$` placeholder and the real value is substituted
+  only at execution time.
 - **Letter-gated controlled exploitation** — when (and only when) the client's engagement
   letter explicitly authorizes controlled vulnerability verification for a target, the
   framework drafts and runs bounded proof-of-concepts: `sqlmap` verification with
@@ -159,6 +167,9 @@ Key capabilities:
 | `modules/document_text.py` | Bounded text/table extraction from PDF, Word, Markdown and text uploads |
 | `modules/planner.py` | Recon-plan generation (AI provider or built-in default), policy-filtered |
 | `modules/exploit_planner.py` | Findings → exploitation / post-exploitation steps, every step policy-validated |
+| `modules/planners.py` | Post-compromise planners: credential validation, foothold, lateral movement, impact — secrets masked as placeholders |
+| `modules/footholds.py` | Tool output → campaign state (footholds, loot, discovered hosts); secrets encrypted at rest, never stored in plaintext |
+| `modules/auto_recommend.py` | Opt-in autopilot: ingests evidence, drafts the next kill-chain phase, records proposals — never approves and never executes |
 | `modules/next_steps.py` | Adaptive next-step proposals: engagement-state digest → ranked, policy-checked candidates |
 | `modules/attack_paths.py` | Finding graph → ranked attack paths with grounded (citation-verified) narratives |
 | `modules/policy_engine.py` | **The security core** — allowlist command validation, scope + resolver checks, exploitation gate, msfconsole script validation |
@@ -188,7 +199,9 @@ execution audit trail. It never holds secrets and reads only server-confirmed st
 
 ## The assessment workflow
 
-The engagement walks six phases, all visible in the UI's phase stepper:
+The engagement walks six phases, all visible in the UI's phase stepper. A target in
+aggressive lab mode walks three more — the campaign phases — between post-exploitation and
+reporting:
 
 1. **Scoping & authorization** — import the client engagement PDF. The parser extracts
    targets, scopes, criticality, tool restrictions, verification endpoints, exploitation
@@ -207,12 +220,19 @@ The engagement walks six phases, all visible in the UI's phase stepper:
    declared verification endpoints, and `msfconsole` scanner modules (attacker-VM
    engine only). Every step still needs explicit approval; on targets without the
    authorization, the policy engine refuses each one with the reason.
-5. **Post-exploitation** *(bounded)* — for verified findings only: a single benign
-   verification record per flaw (DBMS banner, current database user) — exactly what the
-   letter permits. No privilege escalation, no persistence, no lateral movement, no
-   enumeration.
-6. **Reporting** — a client-ready HTML report citing the engagement, phase progress,
-   the verification evidence, and every command that was run.
+5. **Post-exploitation** — for verified findings only: a single benign verification
+   record per flaw (DBMS banner, current database user) — exactly what the letter permits.
+   In aggressive lab mode it additionally enumerates through the footholds the exploitation
+   phase opened and recovers the credentials the campaign phases act on.
+6. **Campaign phases** *(aggressive lab mode only)* — **credential validation** proves each
+   recovered credential actually authenticates, **lateral movement** re-uses a proven
+   credential against the other hosts in scope (promoting a compromised host into its own,
+   strictly narrower child assessment), and **impact** demonstrates the objective through
+   the access obtained. A phase cannot be drafted without the evidence it is built on: no
+   credential, no validation step; no validated credential, no movement step.
+7. **Reporting** — a client-ready HTML report citing the engagement, phase progress,
+   the verification evidence, the post-exploitation evidence (hosts, footholds, a masked
+   loot table, child assessments), and every command that was run.
 
 ---
 
@@ -285,7 +305,11 @@ The framework is deliberately conservative — safety is enforced in code, not c
   engine — *unless* a target has opted into
   [aggressive lab mode](#aggressive-lab-mode-opt-in-weaponized-exploitation), which is
   doubly gated (`exploitation_authorized` **and** `aggressive_lab`), still scope-checked,
-  and still per-step approved. It is intended only for lab targets you own.
+  and still per-step approved. It is intended only for lab targets you own. Enabling it
+  unlocks the campaign kill chain (credential validation → lateral movement → impact) and
+  its tool tier — `hydra`, `nxc`, `smbclient`, `enum4linux-ng`, `proxychains4` and the
+  `impacket-*` family — all of which are `lab_only` in the policy engine, so installing or
+  exposing them cannot widen what a production target permits.
 - **Scope enforcement.** Every command must contain an explicit target inside the target's
   authorized scopes (hostname suffix match, CIDR membership, or — for a CIDR target —
   the requested range being a subnet of an authorized network). DNS resolvers are
@@ -507,7 +531,17 @@ so the engagement can carry the full real-life sequence through to impact:
   (`PAYLOAD`/`LHOST`/`LPORT`), fire a backgrounded session (`exploit -z`), and run
   non-interactive post-exploitation commands (`sessions -C "id"`). Mapped services
   also get a non-destructive exploitability `check`.
-- Post-exploitation loots verified injections (schema + data dump, `--os-cmd`).
+- Post-exploitation loots verified injections (schema + data dump, `--os-cmd`), and the
+  campaign phases carry the engagement through credential validation, lateral movement and
+  impact. Recovered secrets are stored encrypted (Fernet) with a fingerprint, masked in
+  every list response, and readable only through an audited `/loot/{id}/reveal` call; the
+  plan and audit trail hold a `$loot:<id>$` placeholder that is resolved in memory at
+  execution time.
+- **Autopilot (opt-in, per assessment)** removes the bookkeeping round-trips without
+  removing the human: one iteration ingests the evidence from the steps you approved,
+  drafts the next kill-chain phase when the framework allows it, and records fresh
+  proposals — it never approves a step and never runs a command. It stops on a no-progress
+  signature or the iteration budget, and it states the next decision the operator owes.
 
 The guardrails that stay in force, even here:
 
@@ -633,7 +667,7 @@ engagements.)
 
 ## Testing
 
-The backend has a pytest suite (354 tests) covering the analyzer, planner, policy engine
+The backend has a pytest suite (377 tests) covering the analyzer, planner, policy engine
 (including the ZAP baseline's flag surface: the active-scan, config-file, daemon-option
 and report-writing flags are all refused), the operator API-key gate, the secret store,
 request models, engagement parser, the phase model, the exploit planner, the
@@ -641,7 +675,10 @@ recommendation loop (Level 1 auto-drafting and the Level-2 automatic proposal ba
 with their budget cap), attack-path derivation and grounded narrative citation, the
 next-step proposal engine (state-digest bounds, duplicate suppression, provenance
 verification, policy refusals, prompt-injection confinement), the SSH/tmux VM executor,
-and the end-to-end API workflow across all phases. The analyzer and planner tests are
+the campaign evidence parsers (footholds, loot, hosts, and the guarantee that unknown
+output invents nothing), the campaign planners and their secret masking, the
+aggressive-lab gate and child-assessment promotion, and the end-to-end API workflow across
+all phases — including a full kill-chain walk from post-exploitation to impact. The analyzer and planner tests are
 written against real scanner output — escape codes, tentative nmap matches and all —
 captured earlier from these tools and checked in as fixtures, so the suite reproduces
 that fidelity without needing the scanners installed.
@@ -719,6 +756,9 @@ venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --explo
 │   │   ├── phases.py               # The engagement phase model
 │   │   ├── planner.py              # Assessment plan generation
 │   │   ├── exploit_planner.py      # Findings → exploitation / post-exploitation steps
+│   │   ├── planners.py             # Credential validation / foothold / lateral / impact planners
+│   │   ├── footholds.py            # Tool output → footholds, loot, discovered hosts
+│   │   ├── auto_recommend.py       # Opt-in autopilot loop (drafts & proposes, never executes)
 │   │   ├── next_steps.py           # Adaptive next-step proposals (ranked, policy-checked)
 │   │   ├── attack_paths.py         # Finding graph → attack paths + grounded narratives
 │   │   ├── policy_engine.py        # Allowlist command validation
@@ -739,7 +779,7 @@ venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --explo
 │   │   ├── secret_store.py         # Credential encryption at rest
 │   │   └── templates/
 │   │       └── report_template.html
-│   ├── test_*.py                   # pytest suite (354 tests)
+│   ├── test_*.py                   # pytest suite (377 tests)
 │   ├── smoke_e2e.py                # live end-to-end phased run
 │   ├── eval_harness.py             # quantitative evaluation + AI ablation
 │   ├── checklists/                 # ground-truth checklists for recall
@@ -783,6 +823,12 @@ venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --explo
 | `GET` | `/assessments/{id}/recommendations` | The automatic proposal batches recorded after each execution |
 | `POST` | `/assessments/{id}/phases/{phase}/plan` | Draft a later phase's plan from analyzed findings |
 | `GET` | `/assessments/{id}/phases` | Per-phase step and analysis counts (for the stepper) |
+| `GET` | `/assessments/{id}/campaign` | Post-compromise state: footholds, masked loot, discovered hosts, autopilot bookkeeping |
+| `POST` | `/assessments/{id}/autopilot` | Turn the opt-in autopilot loop on or off (aggressive-lab targets only) |
+| `POST` | `/assessments/{id}/autopilot/run` | One autopilot iteration: ingest, draft, propose — never execute |
+| `GET` | `/assessments/{id}/loot/{loot_id}/reveal` | Decrypt one recovered secret (audited; the only way to read a value) |
+| `POST` | `/assessments/{id}/promote/{host_id}` | Spawn a child assessment scoped to one compromised host |
+| `GET` | `/assessments/{id}/executions/{execution_id}/evidence` | Full transcript of one execution for the audit detail view |
 | `POST` | `/assessments/{id}/report` | Generate the HTML report (findings, attack paths, audit trail) |
 | `GET` | `/reports/{id}` | Download a generated report |
 | `DELETE` | `/assessments/{id}` | Delete an assessment with everything derived from it |

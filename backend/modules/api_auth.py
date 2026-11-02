@@ -80,7 +80,7 @@ def verify_operator_key(
     """
     expected = (os.getenv(API_KEY_ENV_VAR) or '').strip()
     if expected:
-        if secrets.compare_digest(expected, x_api_key or ''):
+        if secrets.compare_digest(_digest(expected), _digest(x_api_key or '')):
             return
         raise HTTPException(401, 'The operator API key is missing or wrong. '
                                  f'Send it in the {KEY_HEADER} header.')

@@ -102,7 +102,21 @@ class Assessment(Base):
     # findings that actually exist.
     analyzed_phases = Column(JSON, default=list)
     plan_version = Column(Integer, default=1, nullable=False)
+    workflow_revision = Column(Integer, default=1, nullable=False)
+    current_report_version_id = Column(Integer)
+    evidence_protected = Column(Boolean, default=True, nullable=False)
+    __mapper_args__ = {'version_id_col': workflow_revision}
     analysis_metadata = Column(JSON, default=dict)
+    # Campaign links. A discovery sweep that finds live hosts can spawn a child
+    # assessment per host; the child records the assessment it came from so the
+    # campaign graph survives a reload.
+    parent_assessment_id = Column(Integer, ForeignKey('assessments.id'), default=None)
+    # Opt-in autopilot: when true the framework drives the engagement itself -
+    # ingesting output, drafting the next phase, appending session and lateral
+    # steps - but every command still waits for explicit per-step approval.
+    # Off by default; the stop conditions are recorded in autopilot_state.
+    autopilot = Column(Boolean, default=False)
+    autopilot_state = Column(JSON, default=dict)
     created_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime)
 
@@ -116,6 +130,8 @@ class ToolExecution(Base):
     command = Column(Text, nullable=False)
     stdout = Column(Text, default='')
     stderr = Column(Text, default='')
+    raw_encrypted = Column(Text, default='')
+    evidence_sha256 = Column(String, default='')
     return_code = Column(Integer)
     duration_ms = Column(Integer, default=0)
     approved_by_user = Column(Boolean, default=False)
@@ -209,6 +225,8 @@ class ExecutionAttempt(Base):
     assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
     attempt = Column(Integer, nullable=False)
     snapshot = Column(JSON, nullable=False)
+    raw_encrypted = Column(Text, default='')
+    evidence_sha256 = Column(String, default='')
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -234,6 +252,8 @@ class ReportVersion(Base):
     digest = Column(String, nullable=False)
     path = Column(String, nullable=False)
     provenance = Column(JSON, default=dict)
+    restricted = Column(Boolean, default=False, nullable=False)
+    raw_encrypted = Column(Text, default='')
     created_at = Column(DateTime, default=utcnow)
 
 
@@ -248,6 +268,83 @@ class RecommendationTask(Base):
     detail = Column(String, default='')
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+class Foothold(Base):
+    """One foothold the engagement obtained on a target host.
+
+    A foothold is the pivot point the later phases act from: a Metasploit
+    session, an SSH login, or a shell. It is recorded only from evidence a tool
+    actually printed, never inferred, and it anchors every post-exploitation
+    and lateral-movement step the planners draft.
+    """
+    __tablename__ = 'footholds'
+    __table_args__ = (
+        UniqueConstraint('assessment_id', 'host', 'kind', 'remote_id', name='uq_foothold_identity'),
+        Index('ix_foothold_assessment_state', 'assessment_id', 'state'),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    host = Column(String, default='')
+    kind = Column(String, default='session')
+    remote_id = Column(String, default='')
+    username = Column(String, default='')
+    privilege = Column(String, default='')
+    state = Column(String, default='open')
+    pivot_ready = Column(Boolean, default=False)
+    source_tool = Column(String, default='')
+    source_execution_id = Column(Integer)
+    evidence = Column(Text, default='')
+    opened_at = Column(DateTime, default=utcnow)
+    last_seen_at = Column(DateTime, default=utcnow)
+    closed_at = Column(DateTime)
+
+
+class Loot(Base):
+    """A credential or secret recovered during post-exploitation.
+
+    The plaintext is never stored: only a Fernet ciphertext (secret_store) and
+    a fingerprint of the plaintext, so the same secret recovered twice dedupes
+    without a second copy of the value living in the database.
+    """
+    __tablename__ = 'loot'
+    __table_args__ = (UniqueConstraint(
+        'assessment_id', 'host', 'service', 'username', 'secret_kind', 'secret_fingerprint',
+        name='uq_loot_identity'),)
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    foothold_id = Column(Integer, ForeignKey('footholds.id'), default=None)
+    host = Column(String, default='')
+    service = Column(String, default='')
+    username = Column(String, default='')
+    secret_kind = Column(String, default='password')
+    secret_encrypted = Column(Text, default='')
+    secret_fingerprint = Column(String, default='', index=True)
+    source_tool = Column(String, default='')
+    source_execution_id = Column(Integer)
+    validated = Column(Boolean, default=False)
+    notes = Column(Text, default='')
+    created_at = Column(DateTime, default=utcnow)
+
+
+class EngagementHost(Base):
+    """A host the campaign learned about, and what happened to it.
+
+    The discovery sweep and the session/loot parsers both add rows here, which
+    is what lets the campaign promote a discovered host into its own child
+    assessment without the operator retyping anything.
+    """
+    __tablename__ = 'engagement_hosts'
+    __table_args__ = (UniqueConstraint('assessment_id', 'address', name='uq_engagement_host'),)
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    address = Column(String, default='')
+    hostname = Column(String, default='')
+    role = Column(String, default='discovered')
+    os_name = Column(String, default='')
+    state = Column(String, default='known')
+    child_assessment_id = Column(Integer, default=None)
+    notes = Column(Text, default='')
+    created_at = Column(DateTime, default=utcnow)
 
 def _encrypt_stored_secrets():
     """Bring an existing settings row in line with the no-defaults policy.
@@ -292,6 +389,8 @@ def initialize_database():
         config.attributes['connection'] = connection
         command.upgrade(config, 'head')
     _encrypt_stored_secrets()
+    from modules.evidence import backfill_evidence
+    backfill_evidence(SessionLocal)
 
 
 def migration_head():
@@ -314,3 +413,12 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+from sqlalchemy.orm import Session as ORMSession
+
+
+@event.listens_for(ORMSession, 'before_flush')
+def protect_evidence_before_flush(session, flush_context, instances):
+    from modules.evidence import protect_pending
+    protect_pending(session)

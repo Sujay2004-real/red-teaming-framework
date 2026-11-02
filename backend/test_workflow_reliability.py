@@ -210,6 +210,26 @@ def test_summary_omits_evidence_and_review_requires_proof(workspace):
     assert client.post('/workspace/reset').status_code == 200
 
 
+def test_workspace_totals_and_severity_counts_cover_all_pages(workspace):
+    client, sessions = workspace
+    assessment = create(client)
+    with sessions() as db:
+        for i in range(35):
+            db.add(Assessment(target_id=assessment['target_id'], objective=f'Run {i}', status='reported' if i < 32 else 'awaiting_approval'))
+            db.add(Finding(assessment_id=assessment['id'], fingerprint=f'low-{i}', title=f'Low observation {i}', severity='Low', source_tools=['curl']))
+        for i in range(2):
+            db.add(Finding(assessment_id=assessment['id'], fingerprint=f'high-{i}', title=f'High observation {i}', severity='High', source_tools=['nmap']))
+        db.commit()
+    catalog = client.get('/catalog/assessments?offset=30&limit=1').json()
+    assert len(catalog['items']) == 1
+    assert catalog['total'] == 36 and catalog['reported_total'] == 32
+    page = client.get(f"/assessments/{assessment['id']}/findings?offset=30&limit=1").json()
+    assert len(page['items']) == 1 and page['total'] == 37
+    assert page['severity_counts'] == {'Low': 35, 'High': 2}
+    filtered = client.get(f"/assessments/{assessment['id']}/findings?search=High&severity=High&limit=1").json()
+    assert filtered['total'] == 2 and filtered['severity_counts'] == {'High': 2}
+
+
 def test_report_versions_remain_after_analysis_invalidation(workspace, monkeypatch):
     client, sessions = workspace
     assessment = create(client)

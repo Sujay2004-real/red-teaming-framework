@@ -8,23 +8,61 @@ maps to the report chapter it belongs in.
 
 | Layer | Module | Lines | Responsibility |
 |---|---|---|---|
-| API | `main.py` | ~1,630 | 29 REST endpoints, phase lifecycle, execution approval |
+| API | `main.py` | ~1,945 | 35 REST endpoints, phase lifecycle, execution approval, campaign & autopilot |
 | Workspace API | `modules/workspace_api.py` | 161 | 9 mounted endpoints: paginated catalog/snapshot, findings paging + review workflow, assessment compare, evidence, report versions |
 | Reliability | `modules/jobs.py`, `worker.py` | 184 + 34 | Durable background execution jobs, heartbeat-leased worker, reconnectable output |
 | Auth | `modules/api_auth.py` | 89 | Operator API-key gate (env-chosen or generated, digest-stored) |
-| Policy | `modules/policy_engine.py` | ~640 | Per-tool flag allowlists, scope/CIDR checks, letter-gated exploitation, msf script validation |
+| Policy | `modules/policy_engine.py` | ~1,148 | Per-tool flag allowlists, scope/CIDR checks, letter-gated exploitation, `lab_only` campaign tool tier, msf script validation |
 | Execution | `modules/executor.py` | 161 | `create_subprocess_exec` (no shell), timeouts, output caps, env sandboxing |
-| VM engine | `modules/ssh_executor.py` | 383 | Kali VM over SSH + tmux, per-run attestation |
+| VM engine | `modules/ssh_executor.py` | 434 | Kali VM over SSH + tmux, per-run attestation |
+| Campaign state | `modules/footholds.py` | 491 | Tool output → footholds, loot and discovered hosts; secrets Fernet-encrypted, never plaintext |
+| Campaign planning | `modules/planners.py` | 522 | Credential-validation / foothold / lateral-movement / impact planners; secrets masked as `$loot:<id>$` placeholders |
+| Semi-autonomy | `modules/auto_recommend.py` | 173 | Opt-in per-assessment autopilot: ingest evidence → draft next phase → record proposals; never approves or executes |
 | Analysis | `modules/analyzer.py` | ~850 | 9 deterministic tool parsers (incl. the OWASP ZAP passive baseline), scoring, dedup |
 | Planning | `modules/planner.py`, `exploit_planner.py` | 185 + 253 | Default/subnet plans; findings → verification steps |
 | Adaptivity | `modules/next_steps.py` | 503 | Bounded engagement-state digest → ranked, policy-checked proposals |
 | Reasoning | `modules/attack_paths.py` | 260 | Finding graph → attack paths; grounded AI narratives |
 | Reporting | `modules/reporter.py` + template | 33 + ~200 | Client HTML report with phases, verification, attack paths, audit trail |
-| Frontend | `src/App.jsx` + 14 components | ~1,320 | Single-page control center |
+| Frontend | `src/App.jsx` + 15 components | ~1,320 | Single-page control center |
 
-**Total: ~7,900 lines of backend Python excluding tests (~12,300 with the test suite),
-~1,320 lines of React (JS/JSX) plus ~2,060 lines of CSS, 354 backend tests and 6 frontend
-tests (all passing).**
+**Total: ~9,100 lines of backend Python excluding tests, ~1,320 lines of React (JS/JSX)
+plus ~2,080 lines of CSS, 377 backend tests and 6 frontend tests (all passing).**
+
+## Chapter 6 (kill chain) — the campaign, as actually built
+
+The Phase-1 report scoped the framework to recon + bounded verification. The
+implementation now carries the *complete* red-team chain for a target the
+operator owns, while the production-target posture is unchanged:
+
+```
+scoping → recon → vuln_analysis → exploitation → post_exploitation
+        → credential_validation → lateral_movement → impact → reporting
+```
+
+- The three campaign phases are `lab_only`: unreachable unless the target is in
+  **aggressive lab mode** (`exploitation_authorized` **and** `aggressive_lab`),
+  and their tool tier (`hydra`, `nxc`, `smbclient`, `enum4linux-ng`,
+  `proxychains4`, `impacket-*`) is refused by the policy engine everywhere else.
+  The production allowlist is byte-identical to before.
+- **Evidence-gated drafting.** A phase is drafted only from what the engagement
+  actually obtained. `modules/footholds.py` parses `msfconsole`, `hydra`, `nxc`,
+  `ssh` and `nmap` output into footholds, loot and hosts — and invents nothing:
+  a parser that does not match produces no row.
+- **Secrets never enter the plan or the audit trail.** A planner writes a
+  `$loot:<id>$` placeholder; `resolve_references` substitutes the real value
+  (shell-quoted) only at execution time, and the *masked* form is what is
+  persisted and returned. Loot is Fernet-encrypted at rest, masked in every list
+  view, and readable only through an audited `/loot/{id}/reveal` call.
+- **Still human-in-the-loop.** Every campaign step is a per-step, explicit
+  approval, re-validated against scope and the letter at execution time.
+- **Semi-autonomy, not autonomy.** The opt-in autopilot
+  (`modules/auto_recommend.py`) ingests the evidence from the steps the operator
+  approved, drafts the next phase when the framework allows it, records fresh
+  proposals, and states the next human decision. It never approves and never
+  executes; it stops on a no-progress signature or a 25-iteration budget.
+- **Pivot without widening scope.** Promoting a compromised host spawns a child
+  assessment whose target scope is exactly that host — strictly narrower than its
+  parent — so lateral movement can never expand the authorized engagement.
 
 ## Chapter 7 (methodology) — the loop, as actually implemented
 
@@ -101,10 +139,20 @@ Chapter 8 as tables — they replace the estimated comparison table with measure
    on that line, and the framework's contribution is demonstrating that the loop can
    get faster without crossing it.
 
-## Verification performed (2026-09-12)
+## Verification performed (2026-10-07)
 
-- pytest: **354 passed**; frontend: **6 passed**, ESLint clean, production build clean, npm audit clean
-- ESLint: 0 errors; production build: 32 modules, 77 kB gzipped JS
+- pytest: **377 passed**; frontend: **6 passed**; production build clean.
+- The campaign suite drives the real API against an in-memory database with only
+  the executor mocked: the aggressive-lab gate, evidence ingestion into
+  footholds/loot (with the plaintext hash asserted absent from every response),
+  placeholder-masked plans, execution resolving the secret while persisting only
+  the mask, the audited reveal, child-assessment promotion, autopilot drafting
+  without executing, the report's post-exploitation section, and a full
+  credential-validation → lateral-movement → impact draft/advance walk.
+- A regression was found and fixed in the same pass: `invalidate_analysis` did
+  not know the campaign phases, so running a campaign-phase step fell through to
+  "every phase" and wiped the analysis the phase was drafted from — which then
+  blocked its own execution. It now uses the mode-aware phase order.
 - Live end-to-end smoke run (backend on Windows, no lab): full phased lifecycle
   completed — letter import → 8-step recon plan (incl. `zap-baseline.py`) → execution →
   analysis → **auto-drafted exploitation plan (2 steps)** → execution → analysis →

@@ -1,4 +1,5 @@
 import { useApp } from '../lib/AppContext'
+import Icon from './Icon'
 
 // The agent crew the cards animate. `working` comes from the live request
 // lifecycle; `done` reads saved state only, so a card never claims an agent
@@ -10,7 +11,7 @@ export default function CrewPanel({ crew, activeAgent, feed, onClearFeed }) {
     <div className="panel-title"><div><span className="eyebrow">LIVE</span><h2>The agent crew</h2></div><span className={activeAgent ? 'tag good' : 'tag'}>{workingAgent ? `${workingAgent.name} is working…` : 'Standing by'}</span></div>
     <div className="crew">
       {crew.map(agent => <div className={`crew-card${activeAgent === agent.key ? ' working' : ''}${agent.done && activeAgent !== agent.key ? ' done' : ''}`} key={agent.key}>
-        <span className="crew-avatar" aria-hidden="true">{agent.emoji}</span>
+        <span className="crew-avatar"><Icon name={agent.key} /></span>
         <b>{agent.name}</b>
         <small>{activeAgent === agent.key ? agent.working : agent.done ? agent.doneText : agent.idle}</small>
       </div>)}

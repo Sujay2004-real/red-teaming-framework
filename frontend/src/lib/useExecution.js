@@ -19,7 +19,7 @@ export function useExecution(selected, request, onComplete, onError) {
         cursor = data.cursor
         const elapsed = data.started_at ? Math.max(0, Math.floor((Date.now() - new Date(data.started_at + (/Z$|[+-]\d\d:\d\d$/.test(data.started_at) ? '' : 'Z'))) / 1000)) : 0
         setLive({ ...data, output, elapsed, assessmentId, id: executionId })
-        if (!data.running) { callbacks.current.onComplete(assessmentId, executionId); return }
+        if (!data.running) { await callbacks.current.onComplete(assessmentId, executionId); return }
       } catch (error) {
         if (controller.signal.aborted) return
         callbacks.current.onError(error.message)
@@ -29,7 +29,7 @@ export function useExecution(selected, request, onComplete, onError) {
     tick()
     return () => { controller.abort(); clearTimeout(timer) }
   }, [assessmentId, executionId, attempt, request])
-  return { runningStep: active?.step_index ?? null,
-    liveExec: live?.assessmentId === assessmentId && live?.id === executionId ? live : null,
-    liveElapsed: live?.elapsed || 0 }
+  const currentLive = live?.assessmentId === assessmentId && live?.id === executionId ? live : null
+  return { runningStep: active?.step_index ?? null, liveExec: currentLive,
+    liveElapsed: currentLive?.elapsed || 0 }
 }

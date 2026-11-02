@@ -25,7 +25,7 @@ KEY_ENV_VAR = 'REDTEAM_SECRET_KEY'
 KEY_PATH = Path('./data/.secret_key')
 
 
-def _load_key():
+def _load_key(require_existing=False):
     """Return the Fernet master key, generating a local one on first use.
 
     Deliberately not cached: settings reads and writes are rare, and re-reading
@@ -38,16 +38,34 @@ def _load_key():
         stored = KEY_PATH.read_bytes().strip()
         if stored:
             return stored
+    if require_existing:
+        raise ValueError('The evidence encryption key is unavailable')
+    # Publish a completely written file atomically. Competing first-use
+    # processes must all use the winner's key, never overwrite one another.
+    import tempfile
     KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    key = Fernet.generate_key()
-    KEY_PATH.write_bytes(key)
+    fd, temporary = tempfile.mkstemp(prefix='.key-', dir=KEY_PATH.parent)
     try:
-        # Meaningful on the Linux container that actually runs this; Windows
-        # ignores the mode bits, so the key file relies on directory ACLs there.
-        os.chmod(KEY_PATH, 0o600)
-    except OSError:
-        pass
-    return key
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(Fernet.generate_key())
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, KEY_PATH)
+        except FileExistsError:
+            pass
+        key = KEY_PATH.read_bytes().strip()
+        Fernet(key)  # Refuse an empty or corrupt key, without replacing it.
+        return key
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def decrypt_required(value):
+    """Decrypt protected evidence; missing/wrong keys must fail closed."""
+    if not is_encrypted(value):
+        raise ValueError('Protected evidence is not encrypted')
+    return Fernet(_load_key(require_existing=True)).decrypt(value[len(PREFIX):].encode()).decode()
 
 
 def is_encrypted(value):
@@ -65,6 +83,11 @@ def encrypt_secret(value):
         return ''
     if is_encrypted(value):
         return value
+    return encrypt_value(value)
+
+
+def encrypt_value(value):
+    """Encrypt new plaintext, including values that resemble our envelope."""
     return PREFIX + Fernet(_load_key()).encrypt(value.encode()).decode()
 
 

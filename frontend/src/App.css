@@ -2060,3 +2060,16 @@ footer {
 @media(max-width:900px){.finding-filters{grid-template-columns:1fr 1fr}.workspace{grid-template-columns:1fr}.workspace aside{order:2}.header-actions{justify-content:flex-end}.report-version{align-items:flex-start}.scope-summary{grid-template-columns:1fr}.scope-summary dd{margin-bottom:8px}}
 @media(max-width:550px){header{padding:24px;align-items:flex-start;gap:16px;flex-direction:column}.finding-filters{grid-template-columns:1fr}.assessment-heading{flex-direction:column}.workspace-nav{padding:0 16px}.assessment-tabs{gap:6px}.assessment-tabs button{padding:8px}.report-version{flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+/* Campaign surface: the post-compromise state the kill chain is built on. */
+.campaign-panel .panel-title{align-items:baseline}
+.campaign-blurb p{line-height:1.6;max-width:78ch}
+.campaign-block{border-top:1px solid var(--line);padding-top:16px;margin-top:18px}
+.campaign-block h3{margin:0 0 8px}
+.campaign-block>p{margin:8px 0;line-height:1.6}
+.campaign-table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+.campaign-table th,.campaign-table td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+.campaign-table th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.campaign-table code{overflow-wrap:anywhere}
+.campaign-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+.campaign-actions button{width:auto}

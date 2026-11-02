@@ -6,6 +6,8 @@ import ipaddress
 import shlex
 from datetime import timedelta
 from urllib.parse import quote, urlparse
+from typing import Optional
+
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -13,8 +15,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 
-from database import initialize_database, ExecutionAttempt, FindingReview, ReportVersion, RecommendationTask, SessionLocal, AppSettings, Assessment, Finding, Recommendation, Target, ToolExecution, get_db, utcnow
-from models import AssessmentCreate, ExecuteRequest, PlanUpdate, SettingsUpdate, TargetCreate
+from database import initialize_database, EngagementHost, ExecutionAttempt, FindingReview, Foothold, Loot, ReportVersion, RecommendationTask, SessionLocal, AppSettings, Assessment, Finding, Recommendation, Target, ToolExecution, get_db, utcnow
+from models import AssessmentCreate, AutopilotUpdate, ExecuteRequest, PlanUpdate, PromoteRequest, SettingsUpdate, TargetCreate
 from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent, extract_nmap_hosts, match_verification
 from modules.api_auth import API_KEY_ENV_VAR, ensure_operator_key, verify_operator_key
 from modules.attack_paths import derive_paths, narrate_paths
@@ -22,7 +24,14 @@ from modules.engagement_parser import parse_engagement
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor, live_registry
 from modules.exploit_planner import exploit_planner
 from modules.next_steps import PHASE_PROPOSAL_REFUSALS, PROPOSAL_PHASES, next_steps_planner
-from modules.phases import ANALYSIS_ADVANCES_TO, EXPLOITATION_GATED_TOOLS, NEXT_DRAFTABLE_PHASE, PHASES, PHASE_LABELS, PLAN_PHASES, VM_ONLY_TOOLS, phase_index, validate_phase
+from modules import footholds
+from modules.auto_recommend import AUTOPILOT_MAX_ITERATIONS, autopilot_state, run_autopilot_iteration
+from modules.phases import (
+    ALL_PLAN_PHASES, EXPLOITATION_GATED_TOOLS, PHASES, PHASE_LABELS, PLAN_PHASES, VM_ONLY_TOOLS,
+    analysis_advances_to, next_draftable_phase, phase_chain, phase_index, plan_phases,
+    preceding_plan_phase, validate_phase,
+)
+from modules.planners import campaign_planner, resolve_references
 from modules.planner import MAX_PLAN_STEPS, planner_agent
 from modules.policy_engine import policy_engine
 from modules.reporter import reporter
@@ -32,6 +41,9 @@ from modules.jobs import job_runner, run_execution, archive_attempt
 from modules.outcomes import outcome, SUCCESS
 from modules.scope_rules import scopes_overlap, command_destinations, check_window
 from modules.logging_config import configure_logging
+from modules.workflow import claim as claim_workflow, retire_current_file
+from modules.evidence import redact, original, known_secrets, unseal
+from sqlalchemy.orm.exc import StaleDataError
 
 # Configure logging at import so records emitted while the app is being built
 # (and by the observability middleware once requests arrive) reach a handler.
@@ -55,6 +67,11 @@ async def lifespan(app):
             await asyncio.gather(*list(recommendation_tasks), return_exceptions=True)
 
 app = FastAPI(title='Red Teaming Framework API', version='3.0', lifespan=lifespan)
+
+
+@app.exception_handler(StaleDataError)
+async def stale_workflow_handler(request, exc):
+    return JSONResponse(status_code=409, content={'detail': 'Assessment changed during this operation; reload and retry'})
 from modules.observability import RequestObservability
 app.add_middleware(RequestObservability)
 # The dev server's origin is the default, but it is not the only place this UI
@@ -173,7 +190,7 @@ def get_settings_row(db):
     row = AppSettings(id=1, gemini_api_key='', api_base_url='', model_name='')
     db.add(row)
     try:
-        db.commit()
+        db.flush()
     except IntegrityError:
         # Another request created the singleton row first.
         db.rollback()
@@ -224,8 +241,8 @@ def normalize_plan(plan):
         # phase the assessment started with, so older plans and operator-added
         # commands read as recon without a schema bump.
         item.setdefault('phase', 'recon')
-        if item['phase'] not in PLAN_PHASES:
-            raise HTTPException(422, "Plan step phase must be one of 'recon', 'exploitation', or 'post_exploitation'")
+        if item['phase'] not in ALL_PLAN_PHASES:
+            raise HTTPException(422, "Plan step phase is not a real plan phase: " + str(item['phase']))
         if 'enabled' in item and not isinstance(item['enabled'], bool):
             raise HTTPException(422, 'Plan step enabled must be a boolean')
         item.setdefault('enabled', True)
@@ -310,7 +327,12 @@ def invalidate_analysis(db, assessment_id, phase=None):
     finding set.
     """
     query = db.query(Finding).filter(Finding.assessment_id == assessment_id)
-    order = ['recon', 'exploitation', 'post_exploitation']
+    # The finding-bearing phases in engagement order. ALL_PLAN_PHASES extends
+    # this through the lab-only campaign phases, so executing a
+    # credential-validation step invalidates that phase and the ones after it
+    # rather than falling through to "every phase" and wiping the very analysis
+    # the campaign phase was drafted from.
+    order = list(ALL_PLAN_PHASES)
     affected = order[order.index(phase):] if phase in order else order
     if phase:
         query = query.filter(Finding.phase.in_(affected))
@@ -318,16 +340,14 @@ def invalidate_analysis(db, assessment_id, phase=None):
     if assessment:
         assessment.analyzed_phases = [p for p in (assessment.analyzed_phases or []) if p not in affected]
         assessment.analysis_metadata = {}
+        assessment.current_report_version_id = None
     query.delete()
     if phase in (None, 'recon', 'exploitation'):
         # Proof derived from a replaced exploitation run is no longer current.
         db.query(Finding).filter(Finding.assessment_id == assessment_id).update(
             {Finding.verification: '', Finding.exploit_evidence: '', Finding.verified_by: []},
             synchronize_session='fetch')
-    try:
-        report_path(assessment_id).unlink(missing_ok=True)
-    except OSError:
-        pass
+    retire_current_file(db, report_path(assessment_id))
 
 
 def authorized_scopes_for(target):
@@ -336,6 +356,68 @@ def authorized_scopes_for(target):
 
 def restricted_tools_for(target):
     return set(target.restricted_tools or [])
+
+
+def aggressive_lab(target):
+    """True when this target walks the full kill chain.
+
+    Aggressive lab mode is a superset of controlled exploitation: it can only be
+    on when the letter authorizes exploitation, so this single flag decides both
+    the phase chain and the policy engine's aggressive allowlist.
+    """
+    return bool(target.exploitation_authorized and target.aggressive_lab)
+
+
+def campaign_evidence(db, assessment_id):
+    """The footholds, loot and discovered hosts as serialized views.
+
+    Secrets are never in these views: serialize_loot exposes a fingerprint and a
+    masked placeholder only, so an API response or a planner input can never
+    carry a recovered credential.
+    """
+    return {
+        'footholds': [footholds.serialize_foothold(row) for row in footholds.footholds_for(db, assessment_id, state=None)],
+        'loot': [footholds.serialize_loot(row) for row in footholds.loot_for(db, assessment_id)],
+        'hosts': [footholds.serialize_host(row) for row in footholds.hosts_for(db, assessment_id)],
+    }
+
+
+def ingest_execution_evidence(db, execution):
+    """Persist everything one finished execution proves about the campaign.
+
+    Idempotent, and bounded by the module's own caps. A parser bug or an
+    unexpected output shape can only fail to record evidence, never invent it,
+    because every parser returns nothing unless it matched a known pattern.
+    """
+    if execution is None or execution.return_code is None:
+        return {'footholds': 0, 'closed': 0, 'loot': 0, 'hosts': 0}
+    return footholds.ingest_execution(db, execution.assessment_id, execution)
+
+
+def ingest_execution_evidence_in_session(assessment_id, execution_id, sessions=None):
+    """ingest_execution_evidence in its own session, for the job runner.
+
+    The job runner has already closed the session it finalized the execution
+    row in, so the evidence pass opens its own. A failure here is logged, never
+    raised: the command itself succeeded, its transcript is already stored, and
+    a derived-evidence problem must not turn a successful run into an error.
+    """
+    db = (sessions or SessionLocal)()
+    try:
+        assessment = db.get(Assessment, assessment_id)
+        if assessment is None:
+            return {'footholds': 0, 'closed': 0, 'loot': 0, 'hosts': 0}
+        claim_workflow(db, assessment, allow_running=True)
+        result = ingest_execution_evidence(db, db.get(ToolExecution, execution_id))
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        logger.exception('evidence_ingest_failed', extra={'assessment_id': assessment_id,
+                                                          'execution_id': execution_id})
+        return {'footholds': 0, 'closed': 0, 'loot': 0, 'hosts': 0}
+    finally:
+        db.close()
 
 
 def engagement_restriction_context(target):
@@ -791,11 +873,17 @@ def running_executions(db, assessment_ids=None):
 
 
 def delete_assessment_rows(db, row):
+    """Drop one assessment with everything derived from it."""
+    # Campaign credentials reference footholds, so remove them in that order.
+    # Other campaign inventories must not retain a link to a deleted child.
+    for model in (Loot, Foothold, EngagementHost):
+        db.query(model).filter(model.assessment_id == row.id).delete(synchronize_session=False)
+    db.query(EngagementHost).filter_by(child_assessment_id=row.id).update(
+        {'child_assessment_id': None}, synchronize_session=False)
     for version in db.query(ReportVersion).filter_by(assessment_id=row.id).all():
         Path(version.path).unlink(missing_ok=True)
     for model in (ExecutionAttempt, FindingReview, ReportVersion, RecommendationTask):
         db.query(model).filter(model.assessment_id == row.id).delete(synchronize_session=False)
-    """Drop one assessment with everything derived from it."""
     db.query(Finding).filter(Finding.assessment_id == row.id).delete(synchronize_session=False)
     db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id).delete(synchronize_session=False)
     db.query(Recommendation).filter(Recommendation.assessment_id == row.id).delete(synchronize_session=False)
@@ -816,6 +904,8 @@ def delete_assessment(assessment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, 'Assessment not found')
     if running_executions(db, [assessment_id]):
         raise HTTPException(409, 'A command of this assessment is still executing; wait for it to finish or time out before deleting it')
+    if db.query(Assessment.id).filter_by(parent_assessment_id=assessment_id).first():
+        raise HTTPException(409, 'Delete this assessment\'s child assessments first, or clear the entire workspace')
     delete_assessment_rows(db, row)
     db.commit()
     return {'message': 'Assessment deleted', 'deleted': assessment_id}
@@ -859,6 +949,7 @@ def update_plan(assessment_id: int, payload: PlanUpdate, db: Session = Depends(g
         if any(old.get(key, 'recon' if key == 'phase' else True if key == 'enabled' else '') != new.get(key, 'recon' if key == 'phase' else True if key == 'enabled' else '') for key in ('tool', 'command', 'phase', 'enabled')):
             raise HTTPException(409, 'Executed steps cannot be edited; re-approving a failed step reuses its own row')
     expected_version = row.plan_version or 1
+    claim_workflow(db, row)
     claimed = db.query(Assessment).filter_by(id=row.id, plan_version=expected_version).filter(Assessment.status != 'running').update(
         {'plan_version': expected_version + 1}, synchronize_session=False)
     if not claimed:
@@ -866,25 +957,49 @@ def update_plan(assessment_id: int, payload: PlanUpdate, db: Session = Depends(g
         raise HTTPException(409, 'The assessment changed or is running; reload before editing')
     row.plan_version = expected_version + 1
     row.plan = normalized
-    row.status = 'awaiting_approval'
-    # A pure append — the existing plan untouched and steps added after it —
-    # only affects the phases those new steps belong to, so invalidate exactly
-    # those. Any other edit keeps the whole-assessment invalidation: changing a
-    # step in an earlier phase can change what that phase's analysis produces,
-    # and there is no cheap way to know which findings survive that.
-    #
-    # This matters most for mid-engagement proposals, which append to the phase
-    # the assessment is working in. Without it, accepting one proposal would
-    # delete the earlier phases' findings and the exploitation evidence linking
-    # them — the exact material the report cites.
-    if normalized[:len(previous)] == previous and len(normalized) > len(previous):
-        appended_phases = {step.get('phase', 'recon') for step in normalized[len(previous):]}
-        for phase in sorted(appended_phases):
-            invalidate_analysis(db, assessment_id, phase=phase)
-    else:
-        invalidate_analysis(db, assessment_id)
+    # Compare execution-bearing fields by position. Editing an unexecuted
+    # later phase must not erase the earlier analysis it requires to run.
+    # Reasons and other display metadata do not change scanner evidence.
+    def execution_fields(step):
+        if step is None:
+            return None
+        return (step['tool'], step['command'], step.get('phase', 'recon'), step.get('enabled', True))
+    affected = set()
+    for index in range(max(len(previous), len(normalized))):
+        old = previous[index] if index < len(previous) else None
+        new = normalized[index] if index < len(normalized) else None
+        if execution_fields(old) != execution_fields(new):
+            affected.update(step.get('phase', 'recon') for step in (old, new) if step is not None)
+    if affected:
+        row.status = 'awaiting_approval'
+        earliest = next(phase for phase in ALL_PLAN_PHASES if phase in affected)
+        invalidate_analysis(db, assessment_id, phase=earliest)
+    elif normalized != previous:
+        # A rationale edit needs a fresh report, but its analyzed evidence
+        # remains valid. An unchanged save keeps the existing report usable.
+        if row.status == 'reported':
+            row.status = 'analyzed'
+        row.current_report_version_id = None
+        retire_current_file(db, report_path(assessment_id))
     db.commit()
     return serialize_assessment(row)
+
+
+def try_draft_campaign_phase(db, row, target, phase):
+    """Draft a lab-only kill-chain phase from the campaign evidence so far.
+
+    The evidence is read in serialized form, so a planner never sees a
+    plaintext secret: it writes a placeholder and the execute path resolves it
+    at run time. Returns (steps, notes) like the base planner path.
+    """
+    evidence = campaign_evidence(db, row.id)
+    findings = [serialize_finding(f) for f in db.query(Finding)
+                .filter(Finding.assessment_id == row.id)
+                .order_by(Finding.priority_score.desc()).all()]
+    return campaign_planner.draft_plan(
+        phase, findings, target.scope_domain_ip, authorized_scopes_for(target),
+        aggressive=True, loot=evidence['loot'],
+        footholds=evidence['footholds'], hosts=evidence['hosts'])
 
 
 def try_draft_phase(db, row, target, phase):
@@ -895,19 +1010,27 @@ def try_draft_phase(db, row, target, phase):
       notes    - planner notes on success, the human-readable refusal reason
                  otherwise
       refusal  - None on success, else a key into DRAFT_REFUSALS
+
+    The phase list is mode-aware: a target without aggressive lab mode can only
+    ever draft the base phases, so the extended kill chain is unreachable for a
+    production engagement exactly like the tools it drives.
     """
-    phase = validate_phase(phase)
-    if phase not in PLAN_PHASES:
-        return None, f'Phase must be one of {", ".join(PLAN_PHASES)}', 'invalid_phase'
+    aggressive = aggressive_lab(target)
+    phases = plan_phases(aggressive)
+    phase = validate_phase(phase, aggressive)
+    if phase not in phases:
+        return None, f'Phase must be one of {", ".join(phases)}', 'invalid_phase'
     current = row.current_phase or 'recon'
     # A phase may only be drafted when the assessment sits at the phase that
     # precedes it OR has already advanced into it (analysis of the preceding
     # phase advances current_phase to the next bookkeeping state, so drafting
     # the newly unlocked phase means drafting the phase we are "in").
-    order = {p: i for i, p in enumerate(PLAN_PHASES)}
+    order = {p: i for i, p in enumerate(phases)}
     if order[phase] not in (order.get(current, 0), order.get(current, 0) + 1):
         return None, f'Phase {phase.replace("_", " ")} cannot be drafted while the assessment is in the {current.replace("_", " ")} phase', 'order'
-    required_analysis = {'exploitation': 'recon', 'post_exploitation': 'exploitation'}[phase]
+    required_analysis = preceding_plan_phase(phase, aggressive)
+    if required_analysis is None:
+        return None, 'Reconnaissance is drafted when the assessment is created; edit its existing plan instead', 'order'
     if required_analysis not in (row.analyzed_phases or []):
         return None, f'Analyze the {required_analysis.replace("_", " ")} phase results before drafting the {phase.replace("_", " ")} plan', 'analysis'
     if phase_steps_all(row, phase):
@@ -918,15 +1041,21 @@ def try_draft_phase(db, row, target, phase):
     if phase == 'exploitation' and not target.exploitation_authorized:
         return None, "The client's engagement letter does not authorize controlled exploitation against this target", 'unauthorized'
 
-    findings = [serialize_finding(f) for f in db.query(Finding).filter(Finding.assessment_id == row.id).order_by(Finding.priority_score.desc()).all()]
-    verification_endpoints = _verification_endpoints_for(row, target)
-    steps, notes = exploit_planner.draft_plan(
-        phase, findings, target.scope_domain_ip,
-        authorized_scopes_for(target), verification_endpoints=verification_endpoints,
-        aggressive=bool(target.exploitation_authorized and target.aggressive_lab))
+    if aggressive:
+        steps, notes = try_draft_campaign_phase(db, row, target, phase)
+    else:
+        findings = [serialize_finding(f) for f in db.query(Finding)
+                    .filter(Finding.assessment_id == row.id)
+                    .order_by(Finding.priority_score.desc()).all()]
+        verification_endpoints = _verification_endpoints_for(row, target)
+        steps, notes = exploit_planner.draft_plan(
+            phase, findings, target.scope_domain_ip,
+            authorized_scopes_for(target), verification_endpoints=verification_endpoints,
+            aggressive=False)
     if not steps:
         # Nothing draftable is a legitimate outcome (a clean target has
-        # nothing to exploit), but it must be reported rather than silently
+        # nothing to exploit, an engagement with no recovered credential has
+        # nothing to validate), but it must be reported rather than silently
         # leaving the phase empty.
         return None, (' | '.join(notes) or 'No steps could be drafted for this phase'), 'nothing_draftable'
     return steps, notes, None
@@ -964,6 +1093,9 @@ def draft_phase_plan(assessment_id: int, phase: str, db: Session = Depends(get_d
     if refusal == 'nothing_draftable':
         raise HTTPException(422, notes)
 
+    claim_workflow(db, row)
+    row.current_report_version_id = None
+
     # Copy before extending: row.plan is the loaded JSON object, and mutating
     # it in place would also mutate SQLAlchemy's snapshot of the committed
     # value, so the change-detection at flush would see no difference and
@@ -976,10 +1108,7 @@ def draft_phase_plan(assessment_id: int, phase: str, db: Session = Depends(get_d
     # The report is invalidated (it describes the whole finding set, and the
     # engagement is not finished), but the findings are NOT: they are the
     # evidence this phase's plan was drafted from and the next phase's input.
-    try:
-        report_path(assessment_id).unlink(missing_ok=True)
-    except OSError:
-        pass
+    retire_current_file(db, report_path(assessment_id))
     db.commit()
     result = serialize_assessment(row)
     result['drafted_steps'] = len(steps)
@@ -1022,6 +1151,9 @@ def gather_proposal_inputs(db, row, target):
     ]
     settings = get_settings_row(db)
     api_key, base_url, model_name = provider_credentials(settings)
+    # The post-compromise evidence is part of the engagement state the advisor
+    # reasons from, in its masked form only.
+    evidence = campaign_evidence(db, row.id)
     return {
         'phase': row.current_phase or 'recon',
         'target_address': target.scope_domain_ip,
@@ -1035,6 +1167,9 @@ def gather_proposal_inputs(db, row, target):
         'verification_endpoints': _verification_endpoints_for(row, target),
         'findings': findings,
         'executions': executions,
+        'loot': evidence['loot'],
+        'footholds': evidence['footholds'],
+        'hosts': evidence['hosts'],
         'plan': row.plan or [],
         'api_key': api_key,
         'base_url': base_url,
@@ -1045,7 +1180,9 @@ def gather_proposal_inputs(db, row, target):
 def run_proposal(db, row, target):
     """One proposal pass over the current engagement state."""
     inputs = gather_proposal_inputs(db, row, target)
-    candidates, refused, source, notes = next_steps_planner.propose(**inputs)
+    credentials = {key: inputs.pop(key) for key in ('api_key', 'base_url', 'model_name')}
+    inputs = redact(inputs, known_secrets(db, row.id))
+    candidates, refused, source, notes = next_steps_planner.propose(**inputs, **credentials)
     return {
         'assessment_id': row.id, 'phase': inputs['phase'], 'source': source,
         'state': {'findings': len(inputs['findings']),
@@ -1106,7 +1243,9 @@ def record_auto_recommendations(assessment_id, trigger_execution_id, sessions=No
             return None
         if len(row.plan or []) >= MAX_PLAN_STEPS:
             return None
+        revision = row.workflow_revision
         payload = run_proposal(db, row, target)
+        claim_workflow(db, row, revision)
         record = Recommendation(assessment_id=assessment_id,
                                 trigger_execution_id=trigger_execution_id,
                                 phase=current, payload=payload, origin='auto')
@@ -1227,8 +1366,10 @@ def get_phase_overview(assessment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, 'Assessment not found')
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id, ToolExecution.return_code.is_not(None)).all()
     executed = {execution.step_index for execution in executions}
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    aggressive = bool(target and aggressive_lab(target))
     phases = []
-    for phase in PLAN_PHASES:
+    for phase in plan_phases(aggressive):
         indices = phase_steps_all(row, phase)
         enabled = [i for i in indices if (row.plan or [])[i].get('enabled', True)]
         complete = [i for i in enabled if i in executed]
@@ -1238,18 +1379,45 @@ def get_phase_overview(assessment_id: int, db: Session = Depends(get_db)):
             'analyzed': phase in (row.analyzed_phases or []),
         })
     overview = {'assessment_id': assessment_id, 'current_phase': row.current_phase or 'recon',
-                'phases': phases, 'all_phases': PHASES, 'labels': PHASE_LABELS,
-                'status': row.status}
+                'phases': phases, 'all_phases': phase_chain(aggressive), 'labels': PHASE_LABELS,
+                'aggressive_lab': aggressive, 'status': row.status}
     return overview
 
 
+def resolve_step_command(db, assessment_id, command):
+    """The concrete command an execution runs, and the masked form to store.
+
+    A planner-authored step carries $loot:<id>$ / $foothold:<id>$
+    placeholders instead of the values they stand for, so a recovered secret
+    never reaches the plan, the audit trail, or an API response. Resolution
+    happens here, at the last moment before validation and execution: the
+    concrete form is what the policy engine sees and what the executor runs,
+    and only the masked form is ever written down.
+    """
+    return resolve_references(
+        command,
+        footholds.loot_for(db, assessment_id),
+        footholds.footholds_for(db, assessment_id, state=None),
+    )
+
+
 def enforce_engagement(db, assessment, target, step_index, command, tool):
+    """Re-validate one approved step against the engagement, at run time.
+
+    The command passed in is the concrete, resolved form: placeholders are
+    expanded before this point so scope checking sees the real destination. The
+    re-check is deliberate - the plan was validated at draft time, but the
+    engagement window, the scope, and the target's authorization can all have
+    changed since, and approval is not a licence to run something the letter no
+    longer permits.
+    """
     step = assessment.plan[step_index]
     current = assessment.current_phase or 'recon'
     if step.get('phase', 'recon') != current:
         raise HTTPException(409, 'Only steps in the active phase may execute')
-    prerequisites = {'exploitation': 'recon', 'post_exploitation': 'exploitation'}
-    if current in prerequisites and prerequisites[current] not in (assessment.analyzed_phases or []):
+    aggressive = aggressive_lab(target)
+    prerequisite = preceding_plan_phase(current, aggressive)
+    if prerequisite and prerequisite not in (assessment.analyzed_phases or []):
         raise HTTPException(409, 'Analyze the preceding phase before executing this phase')
     policy = target.engagement_policy or {}
     if message := check_window(policy):
@@ -1258,7 +1426,7 @@ def enforce_engagement(db, assessment, target, step_index, command, tool):
         raise HTTPException(403, f'{tool} is restricted by the engagement letter or reviewed rules')
     valid, reason, capability = policy_engine.validate_command(command, authorized_scopes_for(target),
         expected_tool=tool, allow_exploitation=bool(target.exploitation_authorized),
-        aggressive=bool(target.exploitation_authorized and target.aggressive_lab))
+        aggressive=aggressive)
     if not valid:
         raise HTTPException(403, reason)
     arguments = []
@@ -1290,7 +1458,10 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     if not step.get('enabled', True):
         raise HTTPException(400, 'This step is disabled')
     target = db.get(Target, row.target_id)
-    reason, capability = enforce_engagement(db, row, target, payload.step_index, step['command'], step['tool'])
+    # Resolve placeholders before validation so scope checking sees the real
+    # destination, and keep the masked form as the one that is written down.
+    concrete_command, masked_command = resolve_step_command(db, row.id, step['command'])
+    reason, capability = enforce_engagement(db, row, target, payload.step_index, concrete_command, step['tool'])
     settings = get_settings_row(db)
     remote = remote_execution_settings(settings)
     if remote and not (remote['host'] and remote['username'] and (remote.get('password') or remote.get('private_key'))):
@@ -1311,6 +1482,7 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
         raise HTTPException(403, 'The engagement execution budget is exhausted')
     # Atomically claim the assessment. Two tabs cannot approve concurrent work
     # or both overwrite the same failed attempt.
+    claim_workflow(db, row)
     claimed = db.query(Assessment).filter(Assessment.id == row.id,
         Assessment.plan_version == (row.plan_version or 1), Assessment.status != 'running').update(
         {'status': 'running', 'completed_at': None}, synchronize_session=False)
@@ -1320,13 +1492,16 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     if existing:
         archive_attempt(db, existing)
         execution = existing
+        execution.command = masked_command
         execution.attempt = (execution.attempt or 1) + 1
         execution.stdout, execution.stderr = '', ''
+        execution.raw_encrypted, execution.evidence_sha256 = '', ''
+        execution._protected_projection = {}
         execution.return_code, execution.duration_ms = None, 0
         execution.executed_at = utcnow()
     else:
         execution = ToolExecution(assessment_id=row.id, step_index=payload.step_index,
-            tool_name=step['tool'], command=step['command'], approved_by_user=True, attempt=1)
+            tool_name=step['tool'], command=masked_command, approved_by_user=True, attempt=1)
         db.add(execution)
     execution.state, execution.cancel_requested = 'queued', False
     execution.live_output, execution.output_cursor = '', 0
@@ -1375,6 +1550,7 @@ def cancel_execution(assessment_id: int, execution_id: int, db: Session = Depend
         raise HTTPException(404, 'Execution not found')
     if row.return_code is not None:
         return {'state': row.state}
+    claim_workflow(db, db.get(Assessment, assessment_id), allow_running=True)
     queued = db.query(ToolExecution).filter_by(id=execution_id, assessment_id=assessment_id, state='queued', return_code=None).update({'state': 'cancelled', 'return_code': -1, 'stderr': 'Cancelled before execution', 'cancel_requested': True}, synchronize_session=False)
     db.expire(row)
     row.cancel_requested = True
@@ -1412,21 +1588,21 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     # output was already analyzed, and re-analyzing it alongside exploitation
     # output would re-file recon findings against the verification state.
     phase_executions = [execution for execution in executions if execution.step_index in phase_indices]
-    raw = [{'tool': e.tool_name, 'command': e.command, 'return_code': e.return_code,
-            'stdout': e.stdout or '', 'stderr': e.stderr or ''} for e in phase_executions]
+    raw = [{'tool': e.tool_name, 'return_code': e.return_code, **original(e)} for e in phase_executions]
     settings = get_settings_row(db)
     api_key, base_url, model_name = provider_credentials(settings)
     version_at_start = row.plan_version
+    revision_at_start = row.workflow_revision
     attempts_at_start = {e.id: e.attempt for e in phase_executions}
     analyzed, analyzer_mode = analyzer_agent.analyze_results(
-        raw,
+        redact(raw, known_secrets(db, assessment_id)),
         api_key,
         base_url,
         model_name,
         include_metadata=True,
         asset_criticality=target.criticality if target else None,
     )
-    db.expire_all()
+    claim_workflow(db, row, revision_at_start)
     latest_attempts = {e.id: e.attempt for e in db.query(ToolExecution).filter(ToolExecution.id.in_(attempts_at_start)).all()}
     claimed = db.query(Assessment).filter_by(id=assessment_id, plan_version=version_at_start, current_phase=current).filter(Assessment.status != 'running').update({'status': 'analyzing'}, synchronize_session=False)
     if not claimed or latest_attempts != attempts_at_start:
@@ -1450,7 +1626,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
             source_tools=item.get('source_tools', []),
             phase=current,
         ))
-    db.commit()
+    db.flush()
     # Verify only evidence parsed independently from successful scanner runs.
     # AI text, version banners and HTTP 200 responses cannot establish proof.
     verified_count = 0
@@ -1476,22 +1652,31 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
             row_finding.verified_by = tools
             verified_ids.add(row_finding.id)
         verified_count = len(verified_ids)
-        db.commit()
+        db.flush()
     # Phase bookkeeping: this phase is now analyzed, and the assessment
     # advances to the phase its analysis unlocks (vuln_analysis after recon,
     # post_exploitation after exploitation, reporting after the last).
+    # Everything this phase proved about the campaign - footholds, recovered
+    # credentials, discovered hosts - is derived from the same output the
+    # findings came from. The ingest is idempotent, so the immediate
+    # post-execution ingest in the job runner and this pass cannot double-count.
+    for execution in phase_executions:
+        ingest_execution_evidence(db, execution)
+
     analyzed_phases = row.analyzed_phases or []
     if current not in analyzed_phases:
         analyzed_phases = analyzed_phases + [current]
     row.analyzed_phases = analyzed_phases
-    if current in ANALYSIS_ADVANCES_TO and (row.current_phase or 'recon') == current:
-        row.current_phase = ANALYSIS_ADVANCES_TO[current]
+    aggressive = bool(target and aggressive_lab(target))
+    advances_to = analysis_advances_to(current, aggressive)
+    if advances_to and (row.current_phase or 'recon') == current:
+        row.current_phase = advances_to
     row.status = 'analyzed'
     row.analysis_mode = analyzer_mode
     from modules.provider import metadata
     row.analysis_metadata = {**metadata(), 'mode': analyzer_mode, 'version': '3.0', 'phase': current, 'plan_version': row.plan_version, 'execution_ids': [e.id for e in phase_executions]}
     row.completed_at = utcnow()
-    db.commit()
+    db.flush()
     # Level 1 of the automatic recommendation loop: the analysis just
     # unlocked the next phase, so draft it immediately instead of waiting
     # for the operator to press the Draft button. Nothing new is authorized:
@@ -1501,7 +1686,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     # draft, so "the letter does not authorize exploitation" is information
     # about the engagement, worth showing, not worth failing the analysis.
     auto_drafted = {'phase': None, 'steps': 0, 'note': ''}
-    next_phase = NEXT_DRAFTABLE_PHASE.get(row.current_phase or '')
+    next_phase = next_draftable_phase(row.current_phase or '', aggressive)
     if next_phase:
         steps, notes, refusal = try_draft_phase(db, row, target, next_phase)
         if steps:
@@ -1509,16 +1694,188 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
             row.plan_version = (row.plan_version or 1) + 1
             row.current_phase = next_phase
             row.status = 'awaiting_approval'
-            try:
-                report_path(assessment_id).unlink(missing_ok=True)
-            except OSError:
-                pass
-            db.commit()
+            retire_current_file(db, report_path(assessment_id))
+            db.flush()
             auto_drafted = {'phase': next_phase, 'steps': len(steps), 'note': ''}
         else:
             auto_drafted = {'phase': next_phase, 'steps': 0, 'note': notes}
     failed = [execution.step_index for execution in phase_executions if outcome(execution.tool_name, execution.return_code, execution.stderr, execution.state) not in SUCCESS]
+    db.commit()
     return {'message': 'Analysis complete', 'findings_count': len(analyzed), 'analyzer': analyzer_mode, 'failed_steps': failed, 'phase': current, 'verified_findings': verified_count, 'current_phase': row.current_phase, 'auto_drafted': auto_drafted}
+
+
+@app.get('/assessments/{assessment_id}/campaign', dependencies=PROTECTED)
+def get_campaign(assessment_id: int, db: Session = Depends(get_db)):
+    """The engagement's post-compromise state.
+
+    Footholds, recovered loot and discovered hosts, plus the autopilot
+    bookkeeping. Secrets are never in this response: a loot row carries a
+    fingerprint and a masked placeholder only, and reading the value behind one
+    is a separate, audited action.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    aggressive = bool(target and aggressive_lab(target))
+    return {
+        'assessment_id': assessment_id,
+        'current_phase': row.current_phase or 'recon',
+        'aggressive_lab': aggressive,
+        'campaign_enabled': aggressive,
+        'autopilot': bool(row.autopilot),
+        'autopilot_iteration_budget': AUTOPILOT_MAX_ITERATIONS,
+        'autopilot_state': autopilot_state(row),
+        **campaign_evidence(db, assessment_id),
+    }
+
+
+@app.post('/assessments/{assessment_id}/autopilot', dependencies=PROTECTED)
+def set_autopilot(assessment_id: int, payload: AutopilotUpdate, db: Session = Depends(get_db)):
+    """Turn the semi-autonomous loop on or off for one assessment.
+
+    Opt-in and reversible, and it cannot be enabled for a target that is not in
+    aggressive lab mode: the loop only ever drafts the lab-only kill chain, so
+    enabling it there would be a promise the policy engine then refuses to keep.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    if payload.enabled and not (target and aggressive_lab(target)):
+        raise HTTPException(403, 'Autopilot drives the lab-only kill chain, so it requires a target in '
+                                 'aggressive lab mode that authorizes controlled exploitation')
+    claim_workflow(db, row, allow_running=True)
+    row.autopilot = bool(payload.enabled)
+    if payload.enabled and not (row.autopilot_state or {}).get('updated_at'):
+        row.autopilot_state = {'iterations': 0, 'stopped': '', 'next_action': '', 'updated_at': utcnow().isoformat()}
+    db.commit()
+    return {'assessment_id': assessment_id, 'autopilot': bool(row.autopilot),
+            'autopilot_state': autopilot_state(row)}
+
+
+@app.post('/assessments/{assessment_id}/autopilot/run', dependencies=PROTECTED)
+def run_autopilot(assessment_id: int, db: Session = Depends(get_db)):
+    """One autopilot iteration.
+
+    It ingests evidence, drafts the next phase and records proposals. It never
+    approves a step and never runs a command: the summary states which human
+    decision comes next.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    if not row.autopilot:
+        raise HTTPException(409, 'Enable autopilot for this assessment before running it')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    if not target:
+        raise HTTPException(404, 'Target not found')
+    return run_autopilot_iteration(db, row, target)
+
+
+@app.get('/assessments/{assessment_id}/loot/{loot_id}/reveal', dependencies=PROTECTED)
+def reveal_loot(assessment_id: int, loot_id: int, db: Session = Depends(get_db)):
+    """Decrypt one recovered secret. Every reveal is logged.
+
+    Loot is encrypted at rest and masked in every list response, so this is the
+    single explicit way to read a value. The structured log record is the audit
+    trail for that access: which engagement, which row, which host and account,
+    and when.
+    """
+    row = db.query(Loot).filter(Loot.id == loot_id, Loot.assessment_id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Loot not found')
+    try:
+        value = footholds.reveal_secret(row)
+    except Exception:
+        raise HTTPException(409, 'The stored secret could not be decrypted')
+    logger.warning('loot_revealed', extra={'assessment_id': assessment_id, 'loot_id': loot_id,
+                                           'host': row.host, 'username': row.username,
+                                           'service': row.service})
+    audit_raw_access(db, assessment_id, 'loot', loot_id)
+    return JSONResponse(content={'id': row.id, 'host': row.host, 'service': row.service, 'username': row.username,
+            'secret_kind': row.secret_kind, 'secret': value}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/assessments/{assessment_id}/promote/{host_id}', dependencies=PROTECTED)
+def promote_host(assessment_id: int, host_id: int, payload: Optional[PromoteRequest] = None,
+                 db: Session = Depends(get_db)):
+    """Spawn a child assessment scoped to a host the campaign proved it owned.
+
+    The child gets its own target whose authorized scope is exactly that one
+    host - strictly narrower than the parent's - so pivoting into it cannot
+    widen what the engagement letter permits. It inherits the parent's
+    authorization flags so it can itself walk the kill chain.
+    """
+    row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Assessment not found')
+    target = db.query(Target).filter(Target.id == row.target_id).first()
+    if not target:
+        raise HTTPException(404, 'Target not found')
+    if not aggressive_lab(target):
+        raise HTTPException(403, 'Promoting a compromised host is part of the lab-only kill chain, '
+                                 'which requires aggressive lab mode')
+    host = db.query(EngagementHost).filter(EngagementHost.id == host_id,
+                                           EngagementHost.assessment_id == assessment_id).first()
+    if not host:
+        raise HTTPException(404, 'Host not found')
+    if host.child_assessment_id:
+        raise HTTPException(409, 'This host already has a child assessment')
+    from modules.scope_rules import promotion_scope
+    if host.state != 'owned' and host.role != 'owned':
+        raise HTTPException(409, 'Only an owned host can be promoted; discovery is not proof of compromise')
+    if not promotion_scope(host.address, authorized_scopes_for(target),
+                           (target.engagement_policy or {}).get('excluded_scopes', [])):
+        raise HTTPException(403, 'Host promotion requires host-wide permission within the parent scope and outside its exclusions')
+    claim_workflow(db, row)
+    child_target = Target(
+        name=f'{target.name} - {host.address}'[:200],
+        scope_domain_ip=host.address,
+        authorized_scopes=[host.address],
+        criticality=target.criticality,
+        restricted_tools=list(target.restricted_tools or []),
+        exploitation_authorized=bool(target.exploitation_authorized),
+        aggressive_lab=bool(target.aggressive_lab),
+        engagement_policy=dict(target.engagement_policy or {}),
+    )
+    db.add(child_target)
+    db.flush()
+    objective = (payload.objective if payload else None) or f'Independent assessment of the compromised host {host.address}'
+    child = Assessment(
+        target_id=child_target.id,
+        objective=objective,
+        plan=normalize_plan([{**step, 'phase': step.get('phase', 'recon')}
+                             for step in planner_agent.default_plan(host.address)]),
+        current_phase='recon',
+        parent_assessment_id=assessment_id,
+        engagement_brief=row.engagement_brief if isinstance(row.engagement_brief, dict) else None,
+    )
+    db.add(child)
+    db.flush()
+    host.child_assessment_id = child.id
+    host.state = 'owned'
+    db.commit()
+    return {'parent_assessment_id': assessment_id, 'host_id': host.id,
+            'child_assessment_id': child.id, 'target_id': child_target.id,
+            'objective': objective, 'plan_steps': len(child.plan or [])}
+
+
+@app.get('/assessments/{assessment_id}/executions/{execution_id}/evidence', dependencies=PROTECTED)
+def get_execution_evidence(assessment_id: int, execution_id: int, db: Session = Depends(get_db)):
+    """The raw transcript of one execution, for the audit trail's detail view.
+
+    The assessment summary deliberately omits evidence - it is a bounded index,
+    not a transcript dump - so the full output is fetched only for the one
+    execution the operator opens.
+    """
+    row = db.query(ToolExecution).filter_by(id=execution_id, assessment_id=assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Execution not found')
+    return {'execution_id': row.id, 'attempt': row.attempt, 'tool': row.tool_name,
+            'command': row.command, 'state': row.state, 'stdout': row.stdout or '',
+            'stderr': row.stderr or '', 'return_code': row.return_code,
+            'plan_version': row.plan_version}
 
 
 @app.post('/assessments/{assessment_id}/report', dependencies=PROTECTED)
@@ -1531,17 +1888,29 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, 'Target not found')
     if row.status not in {'analyzed', 'reported'}:
         raise HTTPException(409, 'Analyze the completed phase before generating a report')
+    revision_at_start = row.workflow_revision
     findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).order_by(Finding.priority_score.desc()).all()
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id).order_by(ToolExecution.step_index).all()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = report_path(assessment_id)
+    import uuid
+    path = REPORTS_DIR / f'.staged-{assessment_id}-{uuid.uuid4().hex}.html'
     # Per-phase step counts for the report's progress summary, and the
     # verification outcomes for the exploitation section.
     phase_summary = [
         {'phase': phase, 'label': PHASE_LABELS[phase],
          'steps': len(phase_steps_all(row, phase)),
          'analyzed': phase in (row.analyzed_phases or [])}
-        for phase in PLAN_PHASES
+        for phase in plan_phases(aggressive_lab(target))
+    ]
+    # The post-compromise evidence: which hosts were owned, which footholds
+    # exist, and the masked loot table. Secrets stay encrypted - the report
+    # shows a fingerprint and a placeholder, never a recovered credential.
+    campaign = campaign_evidence(db, assessment_id)
+    campaign['children'] = [
+        {'id': child.id, 'objective': child.objective, 'status': child.status,
+         'current_phase': child.current_phase}
+        for child in db.query(Assessment).filter(Assessment.parent_assessment_id == assessment_id)
+            .order_by(Assessment.id).all()
     ]
     # Attack paths: the findings as a graph, so the report shows which of
     # them combine on one origin instead of only a flat prioritised list.
@@ -1553,31 +1922,83 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
         paths = narrate_paths(paths)
     from modules.report_versions import provenance, archive_report
     source = provenance(row, executions)
-    reporter.generate_html_report(
-        target.scope_domain_ip,
-        row.objective,
-        serialized_findings,
-        [serialize_execution(execution) for execution in executions],
-        str(path),
-        engagement_brief=row.engagement_brief,
-        analysis_mode=row.analysis_mode,
-        current_phase=row.current_phase or 'recon',
-        phase_summary=phase_summary,
-        attack_paths=paths,
-        provenance=source,
-    )
-    version = archive_report(db, assessment_id, path, source)
-    row.status = 'reported'
-    db.commit()
+    secrets = known_secrets(db, assessment_id)
+    try:
+        reporter.generate_html_report(
+            target.scope_domain_ip,
+            redact(row.objective, secrets),
+            redact(serialized_findings, secrets),
+            redact([serialize_execution(execution) for execution in executions], secrets),
+            str(path),
+            engagement_brief=redact(row.engagement_brief, secrets),
+            analysis_mode=row.analysis_mode,
+            current_phase=row.current_phase or 'recon',
+            phase_summary=phase_summary,
+            attack_paths=redact(paths, secrets),
+            provenance=source,
+            campaign=redact(campaign, secrets),
+        )
+        claim_workflow(db, row, revision_at_start)
+        version = archive_report(db, assessment_id, path, source)
+        row.current_report_version_id = version.id
+        row.status = 'reported'
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        path.unlink(missing_ok=True)
     return {'message': 'Report generated', 'version_id': version.id, 'digest': version.digest, 'download_url': f'/assessments/{assessment_id}/reports/{version.id}'}
 
 
+def audit_raw_access(db, assessment_id, kind, identifier, attempt=None):
+    db.add(Recommendation(assessment_id=assessment_id, origin='evidence_access',
+        payload={'action': 'reveal', 'kind': kind, 'id': identifier, 'attempt': attempt}))
+    db.commit()  # Access fails if the durable audit record cannot be written.
+
+
+@app.post('/assessments/{assessment_id}/executions/{execution_id}/evidence/reveal', dependencies=PROTECTED)
+def reveal_execution_evidence(assessment_id: int, execution_id: int, attempt: Optional[int] = Query(None, ge=1), db: Session = Depends(get_db)):
+    row = db.query(ToolExecution).filter_by(id=execution_id, assessment_id=assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Execution not found')
+    selected = row
+    if attempt is not None and attempt != row.attempt:
+        selected = db.query(ExecutionAttempt).filter_by(execution_id=execution_id, assessment_id=assessment_id, attempt=attempt).first()
+        if selected is None:
+            raise HTTPException(404, 'Execution attempt not found')
+    try:
+        raw = unseal(selected.raw_encrypted)
+    except Exception:
+        raise HTTPException(409, 'The original evidence could not be decrypted; check the evidence key')
+    audit_raw_access(db, assessment_id, 'execution', execution_id, selected.attempt)
+    return JSONResponse(content={'execution_id': execution_id, 'attempt': selected.attempt,
+        'evidence_sha256': selected.evidence_sha256, **raw}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/assessments/{assessment_id}/reports/{version_id}/reveal', dependencies=PROTECTED)
+def reveal_legacy_report(assessment_id: int, version_id: int, db: Session = Depends(get_db)):
+    row = db.query(ReportVersion).filter_by(id=version_id, assessment_id=assessment_id).first()
+    if not row:
+        raise HTTPException(404, 'Report version not found')
+    try:
+        import base64
+        content = base64.b64decode(unseal(row.raw_encrypted)['content_base64'], validate=True)
+    except Exception:
+        raise HTTPException(409, 'The original report could not be decrypted; check the evidence key')
+    audit_raw_access(db, assessment_id, 'report', version_id)
+    from fastapi.responses import Response
+    return Response(content=content, media_type='application/octet-stream', headers={
+        'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="assessment-{assessment_id}-original-{version_id}.html"'})
+
+
 @app.get('/reports/{assessment_id}', dependencies=PROTECTED)
-def download_report(assessment_id: int):
-    path = report_path(assessment_id)
-    if not path.exists():
+def download_report(assessment_id: int, db: Session = Depends(get_db)):
+    assessment = db.get(Assessment, assessment_id)
+    version = db.get(ReportVersion, assessment.current_report_version_id) if assessment and assessment.current_report_version_id else None
+    if not version or version.restricted or not Path(version.path).is_file():
         raise HTTPException(404, 'Report not generated')
-    return FileResponse(str(path), media_type='text/html', filename=f'security-assessment-{assessment_id}.html')
+    return FileResponse(version.path, media_type='text/html', filename=f'security-assessment-{assessment_id}.html')
 
 
 @app.post('/workspace/reset', dependencies=PROTECTED)
@@ -1596,14 +2017,16 @@ def reset_workspace(db: Session = Depends(get_db)):
         report_path(row.id).unlink(missing_ok=True)
     for version in db.query(ReportVersion).all():
         Path(version.path).unlink(missing_ok=True)
-    for model in (ExecutionAttempt, RecommendationTask, FindingReview, ReportVersion):
+    for model in (Loot, Foothold, EngagementHost, ExecutionAttempt, RecommendationTask, FindingReview, ReportVersion):
         db.query(model).delete(synchronize_session=False)
     deleted_findings = db.query(Finding).delete(synchronize_session=False)
     deleted_executions = db.query(ToolExecution).delete(synchronize_session=False)
     db.query(Recommendation).delete(synchronize_session=False)
     deleted_assessments = len(assessments)
-    for row in assessments:
-        db.delete(row)
+    # Explicit database deletes also work with production's autoflush=False.
+    # Detach parent links before removing a campaign graph in arbitrary order.
+    db.query(Assessment).update({'parent_assessment_id': None}, synchronize_session=False)
+    db.query(Assessment).delete(synchronize_session=False)
     deleted_targets = db.query(Target).delete(synchronize_session=False)
     db.commit()
     return {

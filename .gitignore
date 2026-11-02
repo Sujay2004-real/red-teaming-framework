@@ -75,5 +75,6 @@ output/
 
 .npm-cache/
 .pytest_tmp*/
+.rt_tmp_*/
 .pytest_results.txt
 audit-results.json

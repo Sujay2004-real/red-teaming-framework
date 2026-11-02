@@ -135,6 +135,44 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 {% endfor %}
 {% endif %}
 
+{% if post_exploitation.hosts or post_exploitation.footholds or post_exploitation.loot %}
+<h2>Post-exploitation evidence</h2>
+<p class="meta">What the engagement obtained after exploitation: the hosts it reached, the footholds it held (with the source tool that established them), and the credentials it recovered. Recovered secrets are stored encrypted and listed here only as an account, a host and a fingerprint — never the value itself. Every act below was individually approved by the human operator and still appears in the audit trail.</p>
+{% if post_exploitation.hosts %}
+<h3>Hosts reached</h3>
+<table>
+  <tr><th>Host</th><th>Hostname</th><th>Role</th><th>OS</th><th>State</th></tr>
+  {% for h in post_exploitation.hosts %}
+  <tr><td>{{ h.address }}</td><td>{{ h.hostname or '—' }}</td><td>{{ h.role }}</td><td>{{ h.os_name or '—' }}</td><td>{{ h.state }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if post_exploitation.footholds %}
+<h3>Footholds</h3>
+<table>
+  <tr><th>Host</th><th>Kind</th><th>Account</th><th>Privilege</th><th>Session</th><th>Established by</th><th>State</th><th>Pivot</th></tr>
+  {% for f in post_exploitation.footholds %}
+  <tr><td>{{ f.host }}</td><td>{{ f.kind }}</td><td>{{ f.username or '—' }}</td><td>{{ f.privilege or '—' }}</td><td>{{ f.remote_id or '—' }}</td><td>{{ f.source_tool or '—' }}</td><td>{{ f.state }}</td><td>{{ 'ready' if f.pivot_ready else '—' }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if post_exploitation.loot %}
+<h3>Recovered credentials (masked)</h3>
+<table>
+  <tr><th>Host</th><th>Service</th><th>Account</th><th>Kind</th><th>Secret</th><th>Validated</th><th>Recovered by</th></tr>
+  {% for l in post_exploitation.loot %}
+  <tr><td>{{ l.host or '—' }}</td><td>{{ l.service or '—' }}</td><td>{{ l.username or '—' }}</td><td>{{ l.secret_kind }}</td><td><code>{{ l.secret_masked }}</code></td><td>{{ 'proven' if l.validated else 'unproven' }}</td><td>{{ l.source_tool or '—' }}</td></tr>
+  {% endfor %}
+</table>
+<p class="meta">A fingerprint identifies a value without disclosing it: the same secret recovered twice shows the same fingerprint, and the plaintext can be read only through the audited framework action.</p>
+{% endif %}
+{% if post_exploitation.children %}
+<h3>Follow-on assessments</h3>
+<p class="meta">Hosts promoted into their own scoped assessment, each restricted to the single host it targets.</p>
+<ul>{% for c in post_exploitation.children %}<li><b>{{ c.objective }}</b> — {{ c.status }}, phase {{ c.current_phase or 'recon' }}</li>{% endfor %}</ul>
+{% endif %}
+{% endif %}
+
 <h2>Remediation summary (ordered by priority)</h2>
 {% if findings %}
 <table>
@@ -188,7 +226,7 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 </div>
 {% endfor %}
 
-<div class="footer-note">This report was produced by a semi-autonomous framework: commands were proposed automatically, reviewed against an allowlist policy engine and scope rules, and executed only after explicit human approval. Exploitation-phase commands were additionally gated on the client letter's controlled-verification authorization. For authorized laboratory and contractually permitted engagements only.</div>
+<div class="footer-note">This report was produced by a semi-autonomous framework: commands were proposed automatically, reviewed against an allowlist policy engine and scope rules, and executed only after explicit human approval. Exploitation-phase commands were additionally gated on the client letter's controlled-verification authorization, and the post-exploitation kill-chain phases on the separate aggressive-lab authorization for a lab engagement. For authorized laboratory and contractually permitted engagements only.</div>
 <section><h2>Evidence provenance</h2><p>Report content is versioned. Hashes identify the captured evidence for each attempt; missing tool versions are not inferred.</p><pre>{{ provenance | tojson(indent=2) }}</pre></section>
 </body>
 </html>

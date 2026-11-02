@@ -29,6 +29,17 @@ test('request cancellation forwards the caller signal and does not report a time
   await expect(pending).rejects.toHaveProperty('name', 'AbortError')
 })
 
+test('a late unauthorized response for an old key does not lock the new session', async () => {
+  const old = deferred(), unauthorized = vi.fn()
+  let key = 'old-key'
+  vi.stubGlobal('fetch', vi.fn(() => old.promise))
+  const pending = createRequest(() => key, unauthorized)('/settings')
+  key = 'new-key'
+  old.resolve({ status: 401, ok: false })
+  await expect(pending).rejects.toHaveProperty('status', 401)
+  expect(unauthorized).not.toHaveBeenCalled()
+})
+
 test('late assessment responses cannot replace the newly selected assessment', async () => {
   const first = deferred(), second = deferred()
   const request = vi.fn(path => path.includes('/1/') ? first.promise : second.promise)

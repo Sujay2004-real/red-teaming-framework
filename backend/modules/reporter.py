@@ -6,7 +6,7 @@ class Reporter:
         self.template_dir = os.path.join(os.path.dirname(__file__), 'templates')
         self.env = Environment(loader=FileSystemLoader(self.template_dir), autoescape=select_autoescape(['html']))
 
-    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode='', current_phase='recon', phase_summary=None, attack_paths=None, provenance=None):
+    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode='', current_phase='recon', phase_summary=None, attack_paths=None, provenance=None, campaign=None):
         template = self.env.get_template('report_template.html')
         severity_counts = {level: sum(1 for f in findings if f.get('severity') == level) for level in ('Critical','High','Medium','Low')}
         verified_counts = {
@@ -25,7 +25,15 @@ class Reporter:
             'out_of_scope': [str(o) for o in (brief.get('out_of_scope') or [])][:20],
             'prohibited': [str(o) for o in (brief.get('prohibited') or [])][:20],
         }
-        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, verified_counts=verified_counts, engagement=engagement, analysis_mode=analysis_mode or '', current_phase=current_phase or 'recon', phase_summary=phase_summary or [], attack_paths=attack_paths or [], provenance=provenance or {})
+        # The post-compromise evidence, normalized so the template never has to
+        # defend itself. Loot rows arrive already masked by serialize_loot; the
+        # plaintext never reaches this layer.
+        evidence = campaign if isinstance(campaign, dict) else {}
+        post_exploitation = {
+            key: [row for row in (evidence.get(key) or []) if isinstance(row, dict)]
+            for key in ('footholds', 'loot', 'hosts', 'children')
+        }
+        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, verified_counts=verified_counts, engagement=engagement, analysis_mode=analysis_mode or '', current_phase=current_phase or 'recon', phase_summary=phase_summary or [], attack_paths=attack_paths or [], provenance=provenance or {}, post_exploitation=post_exploitation)
         from modules.report_versions import atomic_write
         atomic_write(output_path, html.encode('utf-8'))
         return output_path

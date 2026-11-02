@@ -15,6 +15,7 @@ FROM api AS scanner
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nmap curl dnsutils traceroute whatweb sslscan sqlmap git wget unzip default-jre-headless \
+    hydra smbclient proxychains4 \
     && rm -rf /var/lib/apt/lists/*
 # Reviewed immutable source revisions. Runtime updates are disabled by policy.
 ARG EXPLOITDB_REVISION=150aef0e7c4757c9dff33016c8352671cdc9b454
@@ -41,6 +42,15 @@ RUN wget -q https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}
     && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_REVISION}/docker/zap_common.py -O /usr/local/bin/zap_common.py \
     && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_REVISION}/docker/zap-baseline.py -O /usr/local/bin/zap-baseline.py \
     && chmod +x /usr/local/bin/zap-baseline.py \
-    && pip install --no-cache-dir zaproxy==0.6.0 pyyaml==6.0.2
+    && pip install --no-cache-dir setuptools==69.5.1 zaproxy==0.6.0 pyyaml==6.0.2
 RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","zap":"%s"}\n' "$NUCLEI_VERSION" "$NUCLEI_TEMPLATES_REVISION" "$EXPLOITDB_REVISION" "$ZAP_VERSION" > /opt/tool-versions.json
+# Campaign tooling for the post-compromise kill chain. Every one is lab_only in
+# the policy engine, so installing them here cannot widen what a production
+# target permits. netexec provides nxc, impacket provides the impacket-* family,
+# and enum4linux-ng is the maintained replacement for the Perl original that
+# actually carries the command name the policy engine allows.
+# msfconsole is deliberately NOT installed: it is VM-only and runs on the Kali
+# attacker VM over SSH, which is also where a real exploit module belongs.
+USER root
+RUN pip install --no-cache-dir impacket netexec enum4linux-ng
 USER redteam

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import './interface.css'
 import { useAssessment } from './lib/useAssessment'
 import { useExecution } from './lib/useExecution'
 import { useRecommendations } from './lib/useRecommendations'
@@ -10,7 +11,7 @@ import {
   createRequest, fetchProtectedObjectUrl, getOperatorKey, loadStoredKey, setOperatorKey,
 } from './lib/api'
 import {
-  FALLBACK_CAPABILITIES, PHASES, PHASE_LABEL, PLAN_SOURCE_NOTE, samePlan, suggestedObjective,
+  FALLBACK_CAPABILITIES, engagementPhases, PHASE_LABEL, PLAN_SOURCE_NOTE, samePlan, suggestedObjective,
 } from './lib/constants'
 import { AppContext } from './lib/AppContext'
 import ApiKeyGate from './components/ApiKeyGate'
@@ -25,6 +26,8 @@ import PlanEditor from './components/PlanEditor'
 import AnalysisPanel from './components/AnalysisPanel'
 import FindingsPanel from './components/FindingsPanel'
 import AuditTrailPanel from './components/AuditTrailPanel'
+import CampaignPanel from './components/CampaignPanel'
+import Icon from './components/Icon'
 
 // The single-page control center. App owns the shared state and the request
 // lifecycle; each panel in components/ renders one slice of it and receives
@@ -34,8 +37,17 @@ function App() {
   const [targets, setTargets] = useState([]), [assessments, setAssessments] = useState([])
   const [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
   const [page, setPage] = useState('Assessments'), [tab, setTab] = useState('Overview')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const assessmentView = useRef(null)
   const [rememberKey, setRememberKey] = useState(false)
   const [catalogPage, setCatalogPage] = useState(0), [catalogTotal, setCatalogTotal] = useState(0)
+  const [reportedTotal, setReportedTotal] = useState(null)
+  const refreshVersion = useRef(0)
+  const refreshRef = useRef(null)
+  const savedSettings = useRef({})
+  const [savedExecutionMode, setSavedExecutionMode] = useState('local')
+  const [reportRevision, setReportRevision] = useState(0)
+  const busyRef = useRef(false)
   const [reviewedPolicy, setReviewedPolicy] = useState({ max_executions: 100, max_rate: 30 })
   // Server plan lives on `selected`; `draftPlan` holds unsaved edits so the
   // progress gauges below can never describe a plan the backend has not seen.
@@ -80,14 +92,15 @@ function App() {
   const pushFeed = (text, kind = 'info') => setFeed(entries => [{ text, kind, at: Date.now() }, ...entries].slice(0, 30))
   // Live backend reachability, polled independently of any button so dead
   // buttons always have a visible cause instead of a silent failure.
-  const [backendUp, setBackendUp] = useState(true)
-  const backendUpRef = useRef(true)
+  const [backendUp, setBackendUp] = useState(null)
+  const backendUpRef = useRef(null)
   // The step whose approval request is mid-flight, so its own button says
   // "Running…" during a long command instead of looking disabled for no reason.
 
   // Set when a popup blocker swallowed the report tab; a plain link needs no
   // user gesture, so the report stays one click away.
   const [reportUrl, setReportUrl] = useState('')
+  useEffect(() => () => { if (reportUrl) URL.revokeObjectURL(reportUrl) }, [reportUrl])
   // Live terminal: which execution is being streamed, and the output fetched
   // so far. The command's real output scrolls in as the scanner produces it.
 
@@ -99,39 +112,69 @@ function App() {
   // the backend raises the key prompt; until a valid key is saved, protected
   // endpoints are unreachable by design. The live value lives in api.js (the
   // request wrapper reads it at call time); this state only drives re-render.
-  const [apiKey, setApiKey] = useState(loadStoredKey)
+  const [apiKey, setApiKey] = useState(getOperatorKey)
   const [keyInput, setKeyInput] = useState('')
   const [keyPrompt, setKeyPrompt] = useState(false)
+  const [keyError, setKeyError] = useState(''), [keyBusy, setKeyBusy] = useState(false)
 
   const request = useMemo(
     () => createRequest(getOperatorKey, () => setKeyPrompt(true)),
     [])
 
-  const refresh = async () => {
-    const [t, a, s, c] = await Promise.all([request('/targets/'), request(`/catalog/assessments?offset=${catalogPage * 30}&limit=30`), request('/settings'), request('/capabilities').catch(() => null)])
-    setTargets(t); setAssessments(a.items); setCatalogTotal(a.total); setSettings(v => ({ ...v, ...s }))
+  const refresh = async ({ replaceSettings = false } = {}) => {
+    const version = ++refreshVersion.current
+    const requestKey = getOperatorKey()
+    let t, a, s, c
+    try {
+      [t, a, s, c] = await Promise.all([request('/targets/'), request(`/catalog/assessments?offset=${catalogPage * 30}&limit=30`), request('/settings'), request('/capabilities').catch(() => null)])
+    } catch (error) {
+      if (version !== refreshVersion.current || requestKey !== getOperatorKey()) return
+      throw error
+    }
+    if (version !== refreshVersion.current || requestKey !== getOperatorKey()) return
+    setTargets(t); setAssessments(a.items); setCatalogTotal(a.total)
+    const previousSettings = savedSettings.current
+    savedSettings.current = s
+    setSavedExecutionMode(s.execution_mode || 'local')
+    setSettings(values => {
+      const next = { ...values, ...s }
+      if (!replaceSettings) for (const key of Object.keys(s)) {
+        if (key in previousSettings && values[key] !== previousSettings[key]) next[key] = values[key]
+      }
+      return next
+    })
+    setReportedTotal(a.reported_total ?? null)
+    if (catalogPage > 0 && catalogPage * 30 >= a.total) setCatalogPage(Math.max(0, Math.ceil(a.total / 30) - 1))
     if (Array.isArray(c) && c.length) setCapabilities(c)
   }
+  useEffect(() => { refreshRef.current = refresh })
   const { selected, draftPlan, setDraftPlan, openAssessment, reloadAssessment, clearAssessment } = useAssessment(request, setNotice)
   const { runningStep, liveExec, liveElapsed } = useExecution(selected, request,
     async id => { await reloadAssessment(id); await refresh(); pushFeed('Execution finished; evidence and attempt history are available in Activity.') }, setNotice)
   useRecommendations(selected?.id, request, batch => { setNextProposals(batch); setPickedCandidates(new Set()) })
-  /* eslint-disable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
-  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [apiKey, catalogPage])
-  /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => { refresh().catch(e => setNotice(e.message)).finally(() => setLoading(false)) }, [catalogPage])
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // Saving the key retries the whole refresh immediately, so the operator
   // sees the workspace the moment the key is right instead of reloading.
-  const saveApiKey = e => {
+  const saveApiKey = async e => {
     e.preventDefault()
     const value = keyInput.trim()
-    if (!value) return
-    setOperatorKey(value, rememberKey)
-    setApiKey(value)
-    setKeyInput('')
-    setKeyPrompt(false)
+    if (!value || keyBusy) return
+    const previous = getOperatorKey(), wasStored = loadStoredKey() === previous && !!previous
+    setKeyBusy(true); setKeyError('')
+    setOperatorKey(value)
+    try {
+      await request('/settings')
+      await refresh()
+      setOperatorKey(value, rememberKey)
+      setApiKey(value); setKeyInput(''); setKeyPrompt(false); setNotice('')
+    } catch (error) {
+      setOperatorKey(previous, wasStored)
+      setKeyError(error.status === 401 ? 'This key was not accepted. Check the operator key and try again.' : error.message)
+    } finally { setKeyBusy(false); setLoading(false) }
   }
-  /* eslint-disable react-hooks/exhaustive-deps */
   // A dead backend turns every button into a silent no-op, so reachability is
   // polled on its own schedule and announced in a banner. Coming back online
   // triggers a refresh, because the UI's data is stale by the length of the
@@ -144,7 +187,7 @@ function App() {
         const timer = setTimeout(() => controller.abort(), 5000)
         try { up = (await fetch(API + '/health', { signal: controller.signal })).ok } finally { clearTimeout(timer) }
       } catch { up = false }
-      if (up && !backendUpRef.current) refresh().catch(() => { })
+      if (up && backendUpRef.current === false) refreshRef.current?.().catch(() => { })
       backendUpRef.current = up
       setBackendUp(up)
     }
@@ -152,11 +195,10 @@ function App() {
     const interval = setInterval(check, HEALTH_POLL_MS)
     return () => clearInterval(interval)
   }, [])
-  /* eslint-enable react-hooks/exhaustive-deps */
   // The agent argument lights the matching crew card for exactly as long as
   // the request is in flight; the finally clause guarantees it clears even on
   // failure, so no agent is ever left "working" after a crash.
-  const run = async (agent, fn) => { setBusy(true); setNotice(''); setActiveAgent(agent || ''); try { await fn() } catch (e) { setNotice(e.message) } finally { setBusy(false); setActiveAgent('') } }
+  const run = async (agent, fn) => { if (busyRef.current) return; busyRef.current = true; setBusy(true); setNotice(''); setActiveAgent(agent || ''); try { await fn() } catch (e) { setNotice(e.message) } finally { busyRef.current = false; setBusy(false); setActiveAgent('') } }
   // Buttons explain themselves while their own agent works, so a minute-long
   // request reads as progress instead of a dead UI.
   const agentBusy = agent => busy && activeAgent === agent
@@ -181,14 +223,16 @@ function App() {
     const clearedVm = settings.ssh_password_configured && !settings.ssh_host
     await request('/settings', { method: 'PUT', body: settingsPayload() })
     setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '', ssh_password: '', ssh_private_key: '', ssh_key_passphrase: '' }))
-    await refresh()
+    await refresh({ replaceSettings: true })
     setNotice(clearedProxy ? 'Settings saved. Clearing the proxy URL also cleared its stored credentials.' : clearedVm ? 'Settings saved. Clearing the VM host also cleared its stored password.' : 'Settings saved. Secrets are masked after storage.')
   })
   // Saves the form first, then connects: the endpoint tests the stored
   // configuration, so what gets verified is what executions will use.
   const testSshConnection = () => run('', async () => {
+    setSshTest(null)
     await request('/settings', { method: 'PUT', body: settingsPayload() })
-    setSettings(v => ({ ...v, ssh_password: '' }))
+    setSettings(v => ({ ...v, gemini_api_key: '', proxy_password: '', ssh_password: '', ssh_private_key: '', ssh_key_passphrase: '' }))
+    await refresh({ replaceSettings: true })
     try {
       const result = await request('/settings/ssh-test', { method: 'POST' })
       setSshTest(result)
@@ -203,7 +247,7 @@ function App() {
     }
   })
   const addTarget = e => run('registrar', async () => { e.preventDefault(); await request('/targets/', { method: 'POST', body: JSON.stringify({ ...target, criticality: Math.min(100, Math.max(0, Number(target.criticality) || 0)), authorized_scopes: target.authorized_scopes.split(',').map(x => x.trim()).filter(Boolean), exploitation_authorized: !!target.exploitation_authorized, aggressive_lab: !!(target.exploitation_authorized && target.aggressive_lab) }) }); setTarget({ name: '', scope_domain_ip: '', authorized_scopes: '', criticality: 70, exploitation_authorized: false, aggressive_lab: false }); await refresh(); pushFeed(`Registered “${target.name}” as an authorized target.`) })
-  const createAssessment = e => run('planner', async () => { e.preventDefault(); let requirements = assessment.requirements; if (requirementFile) { const form = new FormData(); form.append('file', requirementFile); const data = await request('/requirements/extract', { method: 'POST', body: form }); requirements = data.text } const selectedTarget = targets.find(t => t.id === Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t => t.address === selectedTarget.scope_domain_ip); const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ ...assessment, target_id: Number(assessment.target_id), requirements, ...(briefApplies ? { engagement_brief: brief } : {}) }) }); setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null); await refresh(); await openAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source === 'ai-filtered' ? 'ok' : 'info'); const dropped = a.restricted_steps_dropped || 0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped > 1 ? 's' : ''} using tools the client's letter restricts for this target.` : '')) })
+  const createAssessment = e => run('planner', async () => { e.preventDefault(); let requirements = assessment.requirements; if (requirementFile) { const form = new FormData(); form.append('file', requirementFile); const data = await request('/requirements/extract', { method: 'POST', body: form }); requirements = data.text } const selectedTarget = targets.find(t => t.id === Number(assessment.target_id)); const briefApplies = !!brief && !!selectedTarget && brief.targets.some(t => t.address === selectedTarget.scope_domain_ip); const a = await request('/assessments/', { method: 'POST', body: JSON.stringify({ ...assessment, target_id: Number(assessment.target_id), requirements, ...(briefApplies ? { engagement_brief: brief } : {}) }) }); setAssessment({ target_id: '', objective: '', requirements: '' }); setRequirementFile(null); await refresh(); await openWorkspaceAssessment(a.id); pushFeed(`Drafted a ${a.plan.length}-step plan for assessment #${a.id}. Nothing runs until you approve it.`, a.plan_source === 'ai-filtered' ? 'ok' : 'info'); const dropped = a.restricted_steps_dropped || 0; setNotice((PLAN_SOURCE_NOTE[a.plan_source] || '') + (dropped ? ` Removed ${dropped} step${dropped > 1 ? 's' : ''} using tools the client's letter restricts for this target.` : '')) })
   // The second way in: the operator picks one or more registered targets
   // and writes the engagement as their own prompt. The prompt becomes the
   // objective the planner plans from — with an AI provider configured it
@@ -223,13 +267,13 @@ function App() {
       totalDropped += a.restricted_steps_dropped || 0
       if (firstId === null) firstId = a.id
     }
-    await refresh(); await openAssessment(firstId)
+    await refresh(); await openWorkspaceAssessment(firstId)
     setPromptTargetIds([])
     pushFeed(`Drafted ${picked.length} plan${picked.length !== 1 ? 's' : ''} from your prompt for ${picked.map(t => t.name).join(', ')}. Nothing runs until you approve it.`, 'ok')
     setNotice(`Drafted ${picked.length} plan${picked.length !== 1 ? 's' : ''} from your prompt${totalDropped ? ` — ${totalDropped} step${totalDropped > 1 ? 's' : ''} using tools the client's letter restricts were removed` : ''}. Review the commands, then approve each one when you're ready.`)
   })
   const togglePromptTarget = id => setPromptTargetIds(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
-  const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan, plan_version: selected.plan_version }) }); await reloadAssessment(id); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
+  const savePlan = () => run('planner', async () => { const id = selected.id; await request(`/assessments/${id}/plan`, { method: 'PUT', body: JSON.stringify({ plan: draftPlan, plan_version: selected.plan_version }) }); await reloadAssessment(id, { discardDraft: true }); await refresh(); pushFeed(`Saved the edited plan for assessment #${id}.`); setNotice('Command plan saved and ready for individual approval.') })
   // The assessment id is captured up front so switching assessments
   // mid-request cannot write one assessment's results into another. The command
   // is queued in the background (the request returns as soon as the job is
@@ -256,18 +300,18 @@ function App() {
     const id = selected.id
     const d = await request(`/assessments/${id}/report`, { method: 'POST' })
     const url = await fetchProtectedObjectUrl(d.download_url, getOperatorKey)
-    const opened = window.open(url, '_blank', 'noopener')
-    // A window.open that follows an await has lost its user gesture, so popup
-    // blockers swallow it silently; a plain link needs no gesture, so the
-    // report stays one click away instead of looking like a dead button.
-    setReportUrl(opened ? '' : url)
+    // A visible link retains a real user gesture and works with popup blockers.
+    setReportUrl(url)
+    setReportRevision(v => v + 1)
     await reloadAssessment(id); await refresh()
-    pushFeed(opened ? 'Report written and opened in a new tab — it cites the engagement brief and every command.' : 'Report written — your browser blocked the automatic tab; open it from the link below.', 'ok')
+    pushFeed('Report ready. Open it from the reporting panel to review the evidence and provenance.', 'ok')
+    setNotice('Report generated. Use “Open generated report” to view it.')
   })
   const downloadReport = () => run('reporter', async () => {
     const url = await fetchProtectedObjectUrl(`/reports/${selected.id}`, getOperatorKey)
-    const opened = window.open(url, '_blank', 'noopener')
-    if (!opened) setReportUrl(url)
+    const link = document.createElement('a')
+    link.href = url; link.download = `security-assessment-${selected.id}.html`; link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
   })
   const importBrief = file => {
     return run('reader', async () => {
@@ -343,7 +387,7 @@ function App() {
       if (firstId === null) firstId = a.id
       setActiveAgent('registrar')
     }
-    await refresh(); if (firstId !== null) await openAssessment(firstId)
+    await refresh(); if (firstId !== null) await openWorkspaceAssessment(firstId)
     pushFeed(`Set up the whole letter: ${registered} target${registered !== 1 ? 's' : ''} registered, ${drafted} plan${drafted !== 1 ? 's' : ''} drafted${skipped ? `, ${skipped} already set up earlier` : ''}. Each waits for your approval.`, 'ok')
     setNotice(skipped
       ? `This letter was already set up: ${drafted} new plan${drafted !== 1 ? 's' : ''} drafted, ${skipped} target${skipped !== 1 ? 's' : ''} kept their existing assessment${skipped !== 1 ? 's' : ''}. Use “Clear workspace” first if you want a completely fresh run.`
@@ -382,23 +426,23 @@ function App() {
   const phases = useMemo(() => {
     const registered = targets.length > 0
     const hasBrief = !!brief
-    const current = selected?.current_phase || 'recon'
     const analyzed = new Set(selected?.analyzed_phases || [])
     const reported = selected?.status === 'reported'
     const plan = selected?.plan || []
     const phaseCount = p => plan.filter(step => (step.phase || 'recon') === p).length
-    const phaseDone = p => phaseCount(p) > 0 && plan.filter(step => (step.phase || 'recon') === p && step.enabled !== false).every(step => executionByStep.get(plan.indexOf(step))?.complete)
-    return PHASES.map(phase => {
+    const reconSteps = plan.map((step, index) => ({ step, index })).filter(({ step }) => (step.phase || 'recon') === 'recon' && step.enabled !== false)
+    const reconRecorded = reconSteps.filter(({ index }) => executionByStep.get(index)?.complete).length
+    return engagementPhases(!!selectedTarget?.aggressive_lab).map(phase => {
       const { key, label, caption } = phase
       let done = false, captionText = caption
       if (key === 'scoping') {
-        done = hasBrief && registered
-        captionText = hasBrief && registered ? 'Letter read; targets registered' : caption
+        done = !!selectedTarget || (hasBrief && registered)
+        captionText = selectedTarget ? 'Target scope registered and enforced' : hasBrief && registered ? 'Letter read; targets registered' : caption
       } else if (key === 'recon') {
         done = analyzed.has('recon')
-        captionText = selected ? (analyzed.has('recon') ? 'Recon executed and analyzed' : `${phaseDone('recon') ? 'All' : 'Some'} recon steps executed${analyzed.has('recon') ? '' : ' — analysis pending'}`) : caption
+        captionText = done ? 'Recon executed and analyzed' : !reconSteps.length ? 'No enabled reconnaissance steps' : reconRecorded === 0 ? `${reconSteps.length} step${reconSteps.length === 1 ? '' : 's'} awaiting your approval` : `${reconRecorded} / ${reconSteps.length} steps recorded — analysis pending`
       } else if (key === 'vuln_analysis') {
-        done = analyzed.has('recon') && (current !== 'vuln_analysis' || !!selected)
+        done = analyzed.has('recon')
         captionText = analyzed.has('recon') ? `${selected?.finding_count || 0} correlated findings` : 'Analyze the recon output to complete this phase'
       } else if (key === 'exploitation') {
         done = analyzed.has('exploitation')
@@ -406,11 +450,21 @@ function App() {
       } else if (key === 'post_exploitation') {
         done = analyzed.has('post_exploitation')
         captionText = done ? 'Bounded impact evidence collected' : phaseCount('post_exploitation') ? `${phaseCount('post_exploitation')} bounded steps planned` : 'Drafted after exploitation findings are analyzed'
+      } else if (key === 'credential_validation') {
+        done = analyzed.has('credential_validation')
+        captionText = done ? 'Recovered credentials proven to authenticate' : phaseCount('credential_validation') ? `${phaseCount('credential_validation')} validation steps planned` : 'Drafted once post-exploitation recovers a credential'
+      } else if (key === 'lateral_movement') {
+        done = analyzed.has('lateral_movement')
+        captionText = done ? 'Proven access re-used across the scope' : phaseCount('lateral_movement') ? `${phaseCount('lateral_movement')} movement steps planned` : 'Drafted once a recovered credential is validated'
+      } else if (key === 'impact') {
+        done = analyzed.has('impact')
+        captionText = done ? 'Objective demonstrated end to end' : phaseCount('impact') ? `${phaseCount('impact')} impact steps planned` : 'Drafted once lateral movement is analyzed'
       } else if (key === 'reporting') {
         done = reported
         captionText = reported ? 'Report ready to download' : 'Generated after the engagement evidence is complete'
       }
-      return { key, label, caption: captionText, done }
+      const blocked = ['exploitation', 'post_exploitation'].includes(key) && !selectedTarget?.exploitation_authorized
+      return { key, label, caption: captionText, done, blocked }
     })
   }, [targets, brief, selected, selectedTarget, executionByStep])
 
@@ -420,10 +474,19 @@ function App() {
     if (!selected) return null
     const current = selected.current_phase || 'recon'
     const analyzed = new Set(selected.analyzed_phases || [])
+    if ((selected.plan || []).some(step => (step.phase || 'recon') === current)) return null
     if (current === 'vuln_analysis' && analyzed.has('recon')) return 'exploitation'
     if (current === 'post_exploitation' && analyzed.has('exploitation')) return 'post_exploitation'
+    // The lab-only campaign phases are drafted from the phase the assessment
+    // has advanced into, exactly like the base chain, and only for a target in
+    // aggressive lab mode.
+    if (selectedTarget?.aggressive_lab) {
+      for (const phase of ['credential_validation', 'lateral_movement', 'impact']) {
+        if (current === phase) return phase
+      }
+    }
     return null
-  }, [selected])
+  }, [selected, selectedTarget])
 
   const draftPhase = phase => run('planner', async () => {
     const id = selected.id
@@ -515,48 +578,71 @@ function App() {
     window.addEventListener('beforeunload', warn)
     return () => window.removeEventListener('beforeunload', warn)
   }, [planDirty])
-  const lock = () => { setOperatorKey(''); setApiKey(''); setKeyInput(''); setKeyPrompt(true); forgetAssessment(); setTargets([]); setAssessments([]); setSettings({}); setFeed([]) }
-  const navigateAssessment = id => {
+  const lock = () => { refreshVersion.current++; setOperatorKey(''); setApiKey(''); setKeyInput(''); setKeyError(''); setKeyPrompt(true); forgetAssessment(); setTargets([]); setAssessments([]); setCatalogTotal(0); setReportedTotal(null); setSettings({}); savedSettings.current = {}; setSshTest(null); setFeed([]) }
+  const navigateAssessment = async id => {
+    if (selected?.id === id) { setSidebarOpen(false); assessmentView.current?.focus(); return }
     if (planDirty && !window.confirm('Discard unsaved plan edits?')) return
-    setNextProposals(null); setPickedCandidates(new Set()); setReportUrl(''); setTab('Overview'); openAssessment(id)
+    await openWorkspaceAssessment(id)
+  }
+  const startAssessment = (event, action) => {
+    event?.preventDefault()
+    if (planDirty && !window.confirm('Discard unsaved plan edits and create a new assessment?')) return
+    action(event)
+  }
+  const openWorkspaceAssessment = async id => {
+    const opened = await openAssessment(id)
+    if (opened) {
+      setNextProposals(null); setPickedCandidates(new Set()); setReportUrl(''); setTab('Overview')
+      setPage('Assessments')
+      setSidebarOpen(false)
+      requestAnimationFrame(() => { assessmentView.current?.focus({ preventScroll: true }); assessmentView.current?.scrollIntoView({ block: 'start' }) })
+    }
   }
   const app = { request, run, pushFeed, busy, activeAgent, agentBusy, notice, setNotice }
 
-  if (keyPrompt) return <ApiKeyGate keyInput={keyInput} setKeyInput={setKeyInput} onSave={saveApiKey} remember={rememberKey} setRemember={setRememberKey} />
-  if (loading) return <main className="loading-screen"><div className="loading-mark" /><p>Loading control center...</p></main>
+  if (keyPrompt) return <ApiKeyGate keyInput={keyInput} setKeyInput={setKeyInput} onSave={saveApiKey} remember={rememberKey} setRemember={setRememberKey} error={keyError} busy={keyBusy} backendUp={backendUp} />
+  if (loading) return <main className="loading-screen" role="status"><div className="loading-mark" aria-hidden="true" /><p>Loading control center…</p></main>
 
   return <AppContext.Provider value={app}>
     <main>
+      <a className="skip-link" href="#workspace-content">Skip to workspace</a>
       {busy && <div className="busy-bar" aria-hidden="true" />}
-      {!backendUp && <div className="offline-banner">⚠ Cannot reach the backend at <code>{API}</code> — buttons will not respond until the stack is running again.</div>}
-      <header><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>Hand me the client's letter — I'll draft the plan, and every command waits for your approval.</p></div><div className="header-actions"><span className="health"><i /> Authorized workspace</span><button className="secondary compact" onClick={lock}>Lock workspace</button></div></header>
-      {notice && <div className="notice" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button></div>}
-      <section className="stats"><div><b>{targets.length}</b><span>Authorized targets</span></div><div><b>{assessments.length}</b><span>Assessments</span></div><div><b>{assessments.filter(a => a.status === 'reported').length}</b><span>Reports completed</span></div><div><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>Configured analyzer</span></div></section>
+      {backendUp === false && <div className="offline-banner" role="status">Backend offline at <code>{API}</code>. Start the backend to resume your work.</div>}
+      <header><div className="brand"><span className="brand-mark"><Icon name="shield" /></span><div><span className="eyebrow">AUTHORIZED SECURITY ORCHESTRATION</span><h1>Red Team Control Center</h1><p>From authorized scope to evidence. Every command stays in your hands.</p></div></div><div className="header-actions"><span className={`health ${backendUp === true ? 'connected' : backendUp === false ? 'disconnected' : 'checking'}`} role="status"><i />{backendUp === true ? 'Backend connected' : backendUp === false ? 'Backend offline' : 'Checking connection'}</span><span className="access-label"><Icon name="lock" />{apiKey ? 'Operator access' : 'Workspace locked'}</span><button className="secondary compact" onClick={lock}><Icon name="lock" />Lock</button></div></header>
+      {notice && <div className="notice workspace-notice" role="status"><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice('')}><Icon name="close" /></button></div>}
+      <section className="stats" aria-label="Workspace totals"><div><Icon name="target" /><b>{targets.length}</b><span>Authorized targets</span></div><div><Icon name="planner" /><b>{catalogTotal}</b><span>Assessments</span></div><div><Icon name="reporter" /><b>{reportedTotal ?? '—'}</b><span>Reports completed</span></div><div><Icon name="analyst" /><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>{settings.provider_ready ? 'Provider configured' : 'Deterministic analyzer'}</span></div></section>
 
-      <nav className="workspace-nav" aria-label="Workspace">{['Assessments', 'Targets', 'Settings'].map(name => <button key={name} aria-current={page === name ? 'page' : undefined} className={page === name ? 'active' : 'secondary'} onClick={() => setPage(name)}>{name}</button>)}</nav>
-      {page === 'Settings' && <div className="settings-layout"><ConfigurationPanel settings={settings} setSettings={setSettings} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} /></div>}
-      {page === 'Targets' && <div className="settings-layout"><TargetPanel target={target} setTarget={setTarget} onAdd={addTarget} />{targets.map(t => <section className="panel" key={t.id}><h2>{t.name}</h2><code>{t.scope_domain_ip}</code><p>Authorized scopes: {t.authorized_scopes.join(', ')}</p><ScopePolicy value={t.engagement_policy || {}} readOnly /></section>)}</div>}
+      <nav className="workspace-nav" aria-label="Workspace">{['Assessments', 'Targets', 'Settings'].map(name => <button key={name} aria-current={page === name ? 'page' : undefined} className={page === name ? 'active' : 'secondary'} onClick={() => setPage(name)}><Icon name={name === 'Assessments' ? 'planner' : name === 'Targets' ? 'target' : 'settings'} />{name}</button>)}<span className="nav-context">{savedExecutionMode === 'kali_vm' ? 'Kali VM engine' : 'Local execution engine'}<span>Human approval required</span></span></nav>
+      {page === 'Settings' && <div className="settings-layout" id="workspace-content" tabIndex={-1}><ConfigurationPanel settings={settings} setSettings={value => { setSettings(value); setSshTest(null) }} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} /></div>}
+      {page === 'Targets' && <div className="settings-layout targets-layout" id="workspace-content" tabIndex={-1}>
+        <section className="target-inventory"><div className="panel-title"><div><span className="eyebrow">AUTHORIZED SCOPE</span><h2>Registered targets</h2></div><span className="tag">{targets.length} total</span></div><p className="muted">Review each target’s scope and rules before creating an assessment.</p>
+          {!targets.length && <div className="empty"><Icon name="target" /><b>No targets registered yet</b><span>Add your first target using the form below, or import an engagement letter in Assessments.</span></div>}
+          {targets.map(t => <article className="panel target-card" key={t.id}><div className="panel-title"><h3>{t.name}</h3><Icon name="target" /></div><code>{t.scope_domain_ip}</code><p><span className="muted">Authorized scopes</span><br />{(t.authorized_scopes || []).join(', ') || 'Primary host only'}</p><div className="target-badges"><span className="tag">{t.exploitation_authorized ? 'Verification authorized' : 'Assessment only'}</span>{t.aggressive_lab && <span className="tag">Lab mode</span>}</div><details className="target-rules"><summary>Scope rules<Icon name="chevron" /></summary><ScopePolicy value={t.engagement_policy || {}} readOnly /></details></article>)}
+        </section><TargetPanel target={target} setTarget={setTarget} onAdd={addTarget} />
+      </div>}
       {page === 'Assessments' && <div className="workspace">
-        <aside>
-          <NewAssessmentPanel targets={targets} brief={brief} briefFilename={briefFilename} mode={assessmentMode} setMode={setAssessmentMode} assessment={assessment} setAssessment={setAssessment} setRequirementFile={setRequirementFile} promptTargetIds={promptTargetIds} togglePromptTarget={togglePromptTarget} promptText={promptText} setPromptText={setPromptText} onCreateFromLetter={createAssessment} onCreateFromPrompt={createFromPrompt} />
+        <button className="secondary workspace-switcher" aria-expanded={sidebarOpen} aria-controls="assessment-sidebar" onClick={() => setSidebarOpen(v => !v)}><Icon name="planner" /><span>{selected ? 'Switch or create an assessment' : 'Browse or create an assessment'}</span><Icon name="chevron" /></button>
+        <aside id="assessment-sidebar" className={sidebarOpen ? 'sidebar-open' : ''}>
           <AssessmentsPanel assessments={assessments} targets={targets} selected={selected} onOpen={navigateAssessment} onDelete={deleteAssessment} onReset={resetWorkspace} />
-          <div className="pagination"><button className="secondary" disabled={!catalogPage} onClick={() => setCatalogPage(p => p - 1)}>Previous</button><span>{catalogPage + 1} / {Math.max(1, Math.ceil(catalogTotal / 30))}</span><button className="secondary" disabled={(catalogPage + 1) * 30 >= catalogTotal} onClick={() => setCatalogPage(p => p + 1)}>Next</button></div>
+          {catalogTotal > 30 && <div className="pagination"><button className="secondary" disabled={!catalogPage} onClick={() => setCatalogPage(p => p - 1)}>Previous</button><span>{catalogPage + 1} / {Math.ceil(catalogTotal / 30)}</span><button className="secondary" disabled={(catalogPage + 1) * 30 >= catalogTotal} onClick={() => setCatalogPage(p => p + 1)}>Next</button></div>}
+          <NewAssessmentPanel targets={targets} brief={brief} briefFilename={briefFilename} mode={assessmentMode} setMode={setAssessmentMode} assessment={assessment} setAssessment={setAssessment} requirementFile={requirementFile} setRequirementFile={setRequirementFile} promptTargetIds={promptTargetIds} togglePromptTarget={togglePromptTarget} promptText={promptText} setPromptText={setPromptText} onCreateFromLetter={event => startAssessment(event, createAssessment)} onCreateFromPrompt={event => startAssessment(event, createFromPrompt)} onNavigateTargets={() => setPage('Targets')} />
         </aside>
-        <section className="main-column">
-          {!selected && <section className="panel onboarding"><span className="eyebrow">START AN ASSESSMENT</span><h2>Define the scope. Review the plan. Run with approval.</h2><p>Import a client letter below, review its rules, and create an assessment. You can also register a target in Targets and write an objective.</p></section>}
-          {(!selected || tab === 'Overview') && <><LetterPanel brief={brief} briefFilename={briefFilename} targets={targets} onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }} onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={setupFromBrief} />{brief && <section className="panel"><h2>Review enforceable engagement rules</h2><p>Translate the letter?s exclusions and dates into these fields before registering targets. Prose restrictions still require your review.</p><ScopePolicy value={reviewedPolicy} onChange={setReviewedPolicy} /></section>}</>}
+        <section className="main-column" id="workspace-content" ref={assessmentView} tabIndex={-1} aria-label="Assessment workspace">
+          {!selected && <section className="onboarding"><span className="eyebrow">YOUR ENGAGEMENT STARTS HERE</span><h2>Scope. Approve. Discover.</h2><p>Turn a client letter into a controlled assessment, with a clear trail from every command to its evidence.</p><div className="onboarding-steps"><span><Icon name="reader" />Import the scope</span><Icon name="arrow" /><span><Icon name="shield" />Review & approve</span><Icon name="arrow" /><span><Icon name="reporter" />Deliver the evidence</span></div></section>}
           {selected && <>
-            <div className="assessment-heading"><div><span className="eyebrow">ASSESSMENT #{selected.id} ? PLAN v{selected.plan_version}</span><h2>{selectedTarget?.name}</h2><p>{selected.objective}</p></div><span className="tag">{selected.status.replaceAll('_', ' ')}</span></div>
-            <nav className="assessment-tabs" aria-label="Assessment sections">{['Overview', 'Plan', 'Findings', 'Activity', 'Report'].map(name => <button key={name} aria-current={tab === name ? 'page' : undefined} className={tab === name ? 'active' : 'secondary'} onClick={() => setTab(name)}>{name}{name === 'Findings' ? ` (${selected.finding_count || 0})` : ''}</button>)}</nav>
-            {planDirty && <div className="notice" role="status">Unsaved plan changes <button className="secondary compact" onClick={savePlan} disabled={busy || !planEditable}>Save plan</button></div>}
-            {runningStep !== null && <div className="run-banner" role="status">Step {runningStep + 1} {liveExec?.state || 'queued'} ? {liveElapsed}s <button className="secondary compact" onClick={() => setTab('Plan')}>View output</button><button className="danger compact" onClick={cancelExecution}>Cancel execution</button></div>}
-            {tab === 'Overview' && <PhasePipeline selected={selected} selectedTarget={selectedTarget} phases={phases} nextDraftable={nextDraftable} currentPhase={currentPhase} nextProposals={nextProposals} pickedCandidates={pickedCandidates} setPickedCandidates={setPickedCandidates} planEditable={planEditable} onDraftPhase={draftPhase} onPropose={proposeNextSteps} onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }} onAddPicked={addPickedCandidates} />}
+            <div className="assessment-heading panel"><div><span className="eyebrow">ASSESSMENT #{selected.id} · PLAN v{selected.plan_version}</span><h2>{selectedTarget?.name || 'Authorized assessment'}</h2><code className="assessment-address">{selectedTarget?.scope_domain_ip}</code><p>{selected.objective}</p></div><div className="assessment-meta"><span className={`status ${selected.status}`}>{selected.status.replaceAll('_', ' ')}</span><span className="muted">{PHASE_LABEL(currentPhase)}</span><span className="assessment-progress">{completedSteps.length}<small> / {enabledSteps.length} steps recorded</small></span><progress aria-label="Recorded command progress" value={completedSteps.length} max={enabledSteps.length || 1} /></div></div>
+            <nav className="assessment-tabs" aria-label="Assessment sections">{['Overview', 'Plan', 'Campaign', 'Findings', 'Activity', 'Report'].filter(name => name !== 'Campaign' || selectedTarget?.aggressive_lab).map(name => <button key={name} aria-current={tab === name ? 'page' : undefined} className={tab === name ? 'active' : 'secondary'} onClick={() => setTab(name)}>{name}{name === 'Findings' ? ` (${selected.finding_count || 0})` : ''}</button>)}</nav>
+            {planDirty && <div className="notice" role="status">Unsaved plan changes{tab !== 'Plan' && <button className="secondary compact" onClick={savePlan} disabled={busy || !planEditable}>Save plan</button>}</div>}
+            {runningStep !== null && <div className="run-banner" role="status"><Icon name="activity" />Step {runningStep + 1} {liveExec?.state || 'queued'} · {liveElapsed}s <button className="secondary compact" onClick={() => setTab('Plan')}>View output</button><button className="danger compact" onClick={cancelExecution} disabled={busy}>Cancel execution</button></div>}
+            {tab === 'Overview' && <PhasePipeline selected={selected} selectedTarget={selectedTarget} phases={phases} nextDraftable={nextDraftable} currentPhase={currentPhase} nextProposals={nextProposals} pickedCandidates={pickedCandidates} setPickedCandidates={setPickedCandidates} planEditable={planEditable} onDraftPhase={draftPhase} onPropose={proposeNextSteps} onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }} onAddPicked={addPickedCandidates} canAnalyze={canAnalyze} canReport={canReport} planDirty={planDirty} running={runningStep !== null} onReviewPlan={() => setTab('Plan')} onAnalyze={analyze} onReport={() => setTab('Report')} />}
             {tab === 'Plan' && <PlanEditor selected={selected} selectedTarget={selectedTarget} draftPlan={draftPlan} setDraftPlan={setDraftPlan} executionByStep={executionByStep} runningStep={runningStep} liveExec={liveExec} liveElapsed={liveElapsed} planLocked={planLocked} planEditable={planEditable} planDirty={planDirty} capabilities={capabilities} toolNames={toolNames} onSave={savePlan} onExecute={execute} />}
-            {(tab === 'Overview' || tab === 'Report') && <AnalysisPanel selected={selected} currentPhase={currentPhase} phaseSteps={phaseSteps} phaseCompleted={phaseCompleted} planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport} reportUrl={reportUrl} onAnalyze={analyze} onReport={report} onDownloadReport={downloadReport} />}
+            {tab === 'Report' && <AnalysisPanel selected={selected} currentPhase={currentPhase} phaseSteps={phaseSteps} phaseCompleted={phaseCompleted} planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport} reportUrl={reportUrl} onAnalyze={analyze} onReport={report} onDownloadReport={downloadReport} />}
+            {tab === 'Campaign' && <CampaignPanel key={selected.id} assessmentId={selected.id} aggressive={!!selectedTarget?.aggressive_lab} onChanged={async () => { await reloadAssessment(selected.id); await refresh() }} />}
             {tab === 'Findings' && <FindingsPanel key={selected.id} assessment={selected} assessments={assessments} />}
             {tab === 'Activity' && <><CrewPanel crew={crew} activeAgent={activeAgent} feed={feed} onClearFeed={() => setFeed([])} /><AuditTrailPanel assessmentId={selected.id} executions={selected.executions} /></>}
-            {tab === 'Report' && <ReportVersions assessmentId={selected.id} status={selected.status} />}
+            {tab === 'Report' && <ReportVersions assessmentId={selected.id} status={selected.status} revision={reportRevision} />}
           </>}
+          {(!selected || tab === 'Overview') && <LetterPanel collapsed={!!selected} brief={brief} briefFilename={briefFilename} targets={targets} onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }} onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={() => startAssessment(null, setupFromBrief)} rules={<><p>Review the letter’s exclusions and dates before registering targets.</p><ScopePolicy value={reviewedPolicy} onChange={setReviewedPolicy} /></>} />}
         </section>
       </div>}
       <footer>For authorized laboratory environments only · Human approval required before every command</footer>

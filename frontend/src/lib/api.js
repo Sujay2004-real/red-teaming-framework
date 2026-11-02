@@ -67,8 +67,8 @@ export const createRequest = (getKey, onUnauthorized) => async (path, options = 
   try {
     const res = await fetch(API + path, { headers, ...options, signal: controller.signal })
     if (res.status === 401) {
-      onUnauthorized()
-      throw new Error('The backend requires the operator API key — it was printed in the backend console on first start (or set REDTEAM_API_KEY). Enter it below.')
+      if (getKey() === apiKey) onUnauthorized()
+      throw Object.assign(new Error('The backend requires a valid operator API key. Enter the key from the backend console.'), { status: 401 })
     }
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(detailText(data.detail) || `Request failed (${res.status})`)

@@ -18,13 +18,16 @@ async def main():
         for attempt in range(60):
             try:
                 with engine.connect() as connection:
-                    if connection.execute(text('SELECT version_num FROM alembic_version')).scalar() == head:
+                    schema_ready = connection.execute(text('SELECT version_num FROM alembic_version')).scalar() == head
+                    evidence_ready = schema_ready and connection.execute(text(
+                        'SELECT COUNT(*) FROM assessments WHERE evidence_protected = false')).scalar() == 0
+                    if evidence_ready:
                         break
             except Exception:
                 pass
             await asyncio.sleep(1)
         else:
-            raise RuntimeError('Database migration did not complete')
+            raise RuntimeError('Database migration or evidence backfill did not complete')
     else:
         initialize_database()
 
