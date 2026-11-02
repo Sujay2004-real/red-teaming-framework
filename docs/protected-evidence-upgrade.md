@@ -3,7 +3,9 @@
 The November 2 backend fixes add migration `0005_protected_workflows`. Deploy
 the matching API and worker code together. Application startup runs the schema
 migration and evidence backfill before accepting traffic or starting embedded
-jobs. Keep the existing `REDTEAM_SECRET_KEY` or `data/.secret_key`; the same key
+jobs. External workers wait for both schema head and completion of that
+backfill before claiming work. Keep the existing `REDTEAM_SECRET_KEY` or
+`data/.secret_key`; the same key
 must be available to the API and every worker. Back up the database, report
 directory and key together before upgrading. This development validation used
 temporary databases; it did not upgrade the operator's active database.
@@ -42,8 +44,9 @@ The following operator-authenticated routes provide explicit original access:
 
 Each successful reveal first commits a durable `evidence_access` audit record
 in the recommendation history, then returns a response with `Cache-Control:
-no-store`. Authentication uses the existing operator key. Missing/wrong keys
-or unreadable ciphertext return 409 and never overwrite an original with an
+no-store`. Authentication uses the existing operator key; invalid operator keys
+return 401. Missing/wrong encryption keys or unreadable ciphertext return 409
+and never overwrite an original with an
 empty value. There is no separate role system in this single-operator app.
 
 ## Existing evidence and reports
@@ -76,3 +79,11 @@ Host promotion requires an owned host, host-wide permission within the parent
 scope and no overlap with exclusions. URL/path/port-only permission cannot
 authorize a child whose default recon plan scans the whole host. Promotion
 retains the parent's restrictions and refuses duplicate concurrent requests.
+
+## Deployment and verification
+
+See [deployment](deployment.md) for shared storage/key configuration and the
+[API reference](api-reference.md) for public and audited evidence routes.
+The [testing guide](testing.md) records the 412-test full backend run, the later
+59-test focused run, one passing worker-startup regression and 24 frontend
+tests. These checks used isolated storage, not the operator's live database.

@@ -1,5 +1,9 @@
 # Visual demo polish
 
+This document preserves the dated UI review record. For current setup and
+validation, see the [frontend guide](../frontend/README.md) and
+[testing guide](testing.md).
+
 The workspace keeps its dark navy and teal style, with clearer hierarchy,
 larger controls, consistent SVG icons, and restrained motion.
 
@@ -113,3 +117,16 @@ were exercised. Production build, lint, and frontend whitespace checks passed.
 All 24 frontend tests passed with `npm test -- --maxWorkers=1`. A concurrent
 run hit the existing 15-second timeout in one workflow test; the serial run
 passed without changing timeouts or assertions.
+
+## Protected-evidence integration - November 2, 2026
+
+Recorded and live execution output uses redacted evidence. Original access is
+an explicit audited API operation; ordinary report downloads remain redacted.
+The report panel identifies retired pre-upgrade versions, explains why their
+public downloads are unavailable and directs the operator to regenerate.
+An unchanged plan save preserves the current report; reason-only edits require
+regeneration. Later unexecuted command edits preserve earlier phase findings.
+
+See [upgrade notes](protected-evidence-upgrade.md) for original access and legacy
+report handling. The 24-test frontend result above includes the final UI checks;
+this documentation update does not assert another live browser run.

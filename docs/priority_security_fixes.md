@@ -1,9 +1,14 @@
 # Priority security fixes
 
+Updated November 2, 2026. See the [backend review](backend-review-2026-11-02.md)
+for the approved fixes and [upgrade notes](protected-evidence-upgrade.md) for
+deployment requirements.
+
 ## Container contents
 
-The backend image copies only its entrypoint, database/models modules and the
-`modules/` source tree, including report templates. Its build context excludes
+The backend image copies its API/worker entrypoints, database/models modules,
+migration configuration/tree and the `modules/` source tree, including report
+templates. Its build context excludes
 runtime data, encryption keys, environment files, reports, logs, virtual
 environments and pytest artifacts.
 
@@ -51,12 +56,35 @@ post-exploitation plans require a verified SQL-injection endpoint; there is no
 fallback to an unverified target. These rules apply to new analyses; historical
 stored findings and exported reports are not automatically reclassified.
 
+## Evidence and workflow publication
+
+Execution and attempt originals are encrypted. Ordinary output, provider input,
+findings and reports use redacted projections; explicit original/loot reveals
+commit durable access audits before returning no-store responses. Legacy public
+reports are retired, retaining their original encrypted bytes and digests.
+Redaction recognizes supported secret formats and known values, not arbitrary
+unlabelled secrets.
+
+Analysis, verification, campaign ingestion and phase advancement commit together.
+Slow report/provider results are revision-checked before publication. Reports
+use immutable versions and a committed current pointer. External workers wait
+for schema head and completion of protected-evidence backfill.
+
+Host promotion requires owned evidence and parent host-wide authorization,
+honors exclusions and preserves restrictions. URL/path/port-only permission
+cannot authorize a whole-host child. Concurrent duplicate promotion is rejected.
+
+Application routes require the operator key except `/health` and `/ready`.
+FastAPI schema/documentation routes are public. There is no separate role system.
+
 ## Validation
 
 The regression suite covers argument bypasses, unsafe destinations, literal SSH
 arguments, cross-host/cross-path verification mismatches, failed runs,
-AI-fabricated evidence and the API verification flow. Run from `backend/`:
+AI-fabricated evidence and the API verification flow. Additional coverage checks
+encryption/redaction, audited reveal, legacy adoption, promotion, rollback and
+concurrent publication.
 
-```powershell
-.\venv\Scripts\python.exe -m pytest -q
-```
+Use the isolated commands in [testing](testing.md). The November 2 record is
+412 full-suite backend tests, subsequent overlapping focused checks and
+24 frontend tests. Live scanner/VM validation remains a deployment task.

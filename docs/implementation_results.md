@@ -1,168 +1,143 @@
-# Implementation Results — material for the final project report
+# Implementation results
 
-This document collects the measured facts of the Phase-2 implementation, so the
-final report's chapters can cite numbers instead of assertions. Each section
-maps to the report chapter it belongs in.
+Updated November 2, 2026. This document supplies implementation facts for the
+final project report. Historical results are labeled with their original date;
+test counts are not measurements of live scanner coverage or detection accuracy.
 
-## Chapter 4/6 (architecture) — what was actually built
+## Architecture and implementation
 
-| Layer | Module | Lines | Responsibility |
-|---|---|---|---|
-| API | `main.py` | ~1,945 | 35 REST endpoints, phase lifecycle, execution approval, campaign & autopilot |
-| Workspace API | `modules/workspace_api.py` | 161 | 9 mounted endpoints: paginated catalog/snapshot, findings paging + review workflow, assessment compare, evidence, report versions |
-| Reliability | `modules/jobs.py`, `worker.py` | 184 + 34 | Durable background execution jobs, heartbeat-leased worker, reconnectable output |
-| Auth | `modules/api_auth.py` | 89 | Operator API-key gate (env-chosen or generated, digest-stored) |
-| Policy | `modules/policy_engine.py` | ~1,148 | Per-tool flag allowlists, scope/CIDR checks, letter-gated exploitation, `lab_only` campaign tool tier, msf script validation |
-| Execution | `modules/executor.py` | 161 | `create_subprocess_exec` (no shell), timeouts, output caps, env sandboxing |
-| VM engine | `modules/ssh_executor.py` | 434 | Kali VM over SSH + tmux, per-run attestation |
-| Campaign state | `modules/footholds.py` | 491 | Tool output → footholds, loot and discovered hosts; secrets Fernet-encrypted, never plaintext |
-| Campaign planning | `modules/planners.py` | 522 | Credential-validation / foothold / lateral-movement / impact planners; secrets masked as `$loot:<id>$` placeholders |
-| Semi-autonomy | `modules/auto_recommend.py` | 173 | Opt-in per-assessment autopilot: ingest evidence → draft next phase → record proposals; never approves or executes |
-| Analysis | `modules/analyzer.py` | ~850 | 9 deterministic tool parsers (incl. the OWASP ZAP passive baseline), scoring, dedup |
-| Planning | `modules/planner.py`, `exploit_planner.py` | 185 + 253 | Default/subnet plans; findings → verification steps |
-| Adaptivity | `modules/next_steps.py` | 503 | Bounded engagement-state digest → ranked, policy-checked proposals |
-| Reasoning | `modules/attack_paths.py` | 260 | Finding graph → attack paths; grounded AI narratives |
-| Reporting | `modules/reporter.py` + template | 33 + ~200 | Client HTML report with phases, verification, attack paths, audit trail |
-| Frontend | `src/App.jsx` + 15 components | ~1,320 | Single-page control center |
+| Area | Main source | Implemented responsibility |
+| --- | --- | --- |
+| API and workspace | `main.py`, `modules/workspace_api.py` | Authenticated workflows, paginated catalog, evidence, reviews and comparison |
+| Persistence | `database.py`, `migrations/` | 13 tables, Alembic migrations, foreign keys and workflow revisions |
+| Execution | `modules/jobs.py`, `worker.py`, executors | Durable bounded jobs, leased claims, cancellation, attempt archives and local/SSH execution |
+| Policy | `policy_engine.py`, `scope_rules.py`, `command_values.py` | Tool/argument allowlists, scope/exclusions, engagement windows and lab gates |
+| Planning | `planner.py`, `exploit_planner.py`, `planners.py` | Reconnaissance, verification and evidence-derived campaign steps |
+| Evidence | `evidence.py`, `secret_store.py`, `footholds.py` | Encrypted originals, redacted public text, recovered credentials and host inventory |
+| Analysis | `analyzer.py`, `verification.py`, `attack_paths.py` | Deterministic parsers, optional provider enrichment, scoring and grounded correlations |
+| Suggestions | `next_steps.py`, `auto_recommend.py` | Bounded policy-checked proposals and opt-in drafting |
+| Reports | `reporter.py`, `report_versions.py`, `workflow.py` | Staged rendering, immutable versions, provenance and revision-checked publication |
+| Frontend | `frontend/src/App.jsx`, components and hooks | Responsive workspace, plan editing, findings, campaigns, settings and reports |
 
-**Total: ~9,100 lines of backend Python excluding tests, ~1,320 lines of React (JS/JSX)
-plus ~2,080 lines of CSS, 377 backend tests and 6 frontend tests (all passing).**
+Source paths in this table are relative to `backend/` unless prefixed with
+`frontend/`. See the [technical reference](backend_technical_reference.md) and
+[API reference](api-reference.md) for the current details.
 
-## Chapter 6 (kill chain) — the campaign, as actually built
+## Authorized assessment lifecycle
 
-The Phase-1 report scoped the framework to recon + bounded verification. The
-implementation now carries the *complete* red-team chain for a target the
-operator owns, while the production-target posture is unchanged:
+The normal flow is scoping, recon, vulnerability analysis, exploitation,
+post-exploitation and reporting. Aggressive lab mode adds credential validation,
+lateral movement and impact before reporting. These phases represent implemented
+workflow support; they do not claim that every target or exploit is supported.
 
-```
-scoping → recon → vuln_analysis → exploitation → post_exploitation
-        → credential_validation → lateral_movement → impact → reporting
-```
+- Campaign operations require both `exploitation_authorized` and `aggressive_lab`.
+  Ordinary target restrictions continue to apply at drafting and execution.
+- Evidence ingestion creates only records recognized in observed output.
+  Discovery alone does not establish ownership or permit promotion.
+- Planners use `$$loot:<id>$$` references. Secrets are resolved immediately before
+  execution; encrypted originals preserve the executed command and output.
+  Ordinary evidence, provider inputs and reports use redacted projections.
+- Executable operator-authored plans are not a general secret vault. Redaction
+  recognizes supported secret formats and known recovered values; arbitrary
+  unlabelled strings may not be recognized.
+- Every command requires explicit operator approval and revalidation.
+  Autopilot can draft and propose, but cannot approve or execute.
+- Promoting an owned host requires parent host-wide permission, honors exclusions
+  and copies restrictions. URL/path/port-only scope cannot become a whole-host
+  child assessment. Concurrent duplicate promotion is rejected.
 
-- The three campaign phases are `lab_only`: unreachable unless the target is in
-  **aggressive lab mode** (`exploitation_authorized` **and** `aggressive_lab`),
-  and their tool tier (`hydra`, `nxc`, `smbclient`, `enum4linux-ng`,
-  `proxychains4`, `impacket-*`) is refused by the policy engine everywhere else.
-  The production allowlist is byte-identical to before.
-- **Evidence-gated drafting.** A phase is drafted only from what the engagement
-  actually obtained. `modules/footholds.py` parses `msfconsole`, `hydra`, `nxc`,
-  `ssh` and `nmap` output into footholds, loot and hosts — and invents nothing:
-  a parser that does not match produces no row.
-- **Secrets never enter the plan or the audit trail.** A planner writes a
-  `$loot:<id>$` placeholder; `resolve_references` substitutes the real value
-  (shell-quoted) only at execution time, and the *masked* form is what is
-  persisted and returned. Loot is Fernet-encrypted at rest, masked in every list
-  view, and readable only through an audited `/loot/{id}/reveal` call.
-- **Still human-in-the-loop.** Every campaign step is a per-step, explicit
-  approval, re-validated against scope and the letter at execution time.
-- **Semi-autonomy, not autonomy.** The opt-in autopilot
-  (`modules/auto_recommend.py`) ingests the evidence from the steps the operator
-  approved, drafts the next phase when the framework allows it, records fresh
-  proposals, and states the next human decision. It never approves and never
-  executes; it stops on a no-progress signature or a 25-iteration budget.
-- **Pivot without widening scope.** Promoting a compromised host spawns a child
-  assessment whose target scope is exactly that host — strictly narrower than its
-  parent — so lateral movement can never expand the authorized engagement.
+## Workflow correctness
 
-## Chapter 7 (methodology) — the loop, as actually implemented
+Executed steps keep their execution-bearing fields and position. Later
+unexecuted edits invalidate only the earliest changed phase and its dependents.
+An unchanged save preserves analysis and the current report; a rationale-only
+edit preserves analysis but requires a fresh report.
 
-The report's Chapter 4 promised "the planner recommends the next step only after the
-previous output has been reviewed." That promise is now implemented at two levels:
+Analysis publishes findings, verification, campaign ingestion, phase state and
+eligible automatic drafting in one transaction. Competing changes are rejected
+using the assessment revision. Report rendering stages a unique file and
+publishes an immutable version only if the captured revision remains current.
 
-1. **Level 1 — auto-draft on analysis.** When a phase's outputs are analyzed and the
-   analysis unlocks the next phase, the backend drafts that phase's plan immediately
-   (the same policy-gated drafting the button used to trigger). A refusal — e.g. the
-   letter not authorizing exploitation — is returned as a note with the reason,
-   surfaced in the UI feed.
-2. **Level 2 — automatic recommendation batches.** Every finished execution schedules
-   a proposal batch computed from the observed engagement state (bounded digest of
-   findings + audit trail). Batches persist as engagement evidence (`recommendations`
-   table), name the execution that triggered them, include the policy engine's
-   refusals with reasons, and are capped at 25 per engagement. A batch becomes plan
-   steps only through the ordinary plan-save path — the loop proposes; it never acts.
+Automatic recommendation batches are bounded and tied to the triggering
+execution/attempt. Opt-in autopilot has a 25-iteration bound and stops when no
+progress is possible. Its local transition commits atomically; subsequent
+advisory provider output is saved only against the same committed state.
 
-## Chapter 8 (evaluation) — how to produce the numbers
+## Evidence, authorization and governance
 
-`backend/eval_harness.py` runs the full phased flow N times per target and emits a
-JSON summary (mean/stdev/min/max per metric):
+| Control | Implemented behavior and limit |
+| --- | --- |
+| Authentication | Application routes require `X-API-Key`; `/health`, `/ready` and FastAPI schema/docs are public |
+| Policy | Explicit tool/flag/value rules; supported destinations and exclusions checked again at execution |
+| Scope | CIDR subnet containment, exact names or explicit wildcards, URL restrictions where applicable; promotion requires host-wide authority |
+| Exploitation | Letter permission, phase prerequisites and explicit per-step approval |
+| Scanner safety | Passive ZAP baseline; dangerous file/script/redirect options refused; no general egress firewall |
+| Evidence | Encrypted originals and attempts, redacted public projections, SHA-256 provenance |
+| Original access | Authenticated reveal, durable `evidence_access` audit record, `Cache-Control: no-store` |
+| Verification | Independent successful sqlmap proof with matching endpoint/parameter; banners and provider claims do not prove exploitation |
+| Reports | Immutable versions; pre-upgrade originals are restricted and require audited reveal |
+| Deployment | Shared API/worker storage and encryption key; schema/evidence backfill before jobs start |
 
-- wall-clock per phase (planning / execution / analysis / reporting)
-- commands drafted vs executed, failures
-- findings, severity mix, verification outcomes
-- policy refusals (count + reasons)
-- checklist recall against ground truth (`--checklist`, Metasploitable2 list included)
+See [priority fixes](priority_security_fixes.md) and
+[upgrade notes](protected-evidence-upgrade.md).
 
-The ablation (`--ablate`) runs the same arms twice — deterministic analyzer, then the
-configured AI provider — and reports the comparison (findings mean, wall-clock mean,
-recall mean per arm), in the shape of PentestGPT's Figure 8 ablation.
+## Recorded verification: November 2, 2026
 
-Suggested evaluation protocol for the report (3 targets × 3 runs):
+The full backend suite passed **412 tests** after the approved changes.
+A later **59-test focused run** and **one worker-startup regression** also passed.
+These runs overlap; do not add their counts into a claimed full-suite total.
+The frontend passed **24 tests**, lint and the production build.
 
-```
-# deterministic + AI arms, Metasploitable2 with its documented ground truth:
-venv\Scripts\python.exe eval_harness.py --targets "Meta2=192.168.56.101" --exploit \
-    --checklist checklists/metasploitable2.txt --runs 3 --ablate --out eval_meta2.json
-# the real application (letter-driven, no exploitation), e.g. against any
-# authorized self-hosted target:
-venv\Scripts\python.exe eval_harness.py --letter JuiceBox_Security_Assessment_Request.pdf --runs 3 --out eval_results.json
-```
+Browser review used intercepted synthetic responses at widths from 320 to
+1920 pixels. Backend regressions used isolated SQLite databases, mocked
+executors and injected failures/interleavings. They covered scope refusals,
+concurrent publication, rollback, original encryption, stream redaction, legacy
+backfill and UI request isolation.
 
-Run these once the lab VMs are up, and paste the `summary` / `comparison` blocks into
-Chapter 8 as tables — they replace the estimated comparison table with measurements.
+The [testing guide](testing.md) records commands, warnings and limits. CI defines
+tests, dependency audit, Compose validation and image builds. Workflow
+configuration alone is not evidence that a particular GitHub run succeeded.
 
-## Chapter 9 (safety & governance) — controls as implemented
+## Evaluation methodology for the final report
 
-| Control | Implementation |
-|---|---|
-| Operator authentication | `X-API-Key` on every route except `/health`; SHA-256 digest at rest; env override |
-| Command allowlist | Per-tool flag enumeration, fail-closed (13 tools incl. OWASP ZAP passive baseline) |
-| Scope enforcement | Hostname suffix / CIDR `subnet_of` membership; subnet sweeps bounded to 256 addresses |
-| Exploitation gate | Letter authorization required for sqlmap/msfconsole/curl-with-body, at plan, draft and approval time |
-| Active scanning | ZAP's active-scan, config-file and daemon-option flags refused by the allowlist by design |
-| Human-in-the-loop | Per-step `approved: true`; executed steps immutable; recommendation loop read-only |
-| Audit trail | Every command, output, attempt and attestation persisted; auto-recommendation batches kept as evidence |
-| Secrets | Fernet at rest; never returned by the API; no env-seeded credentials |
-| Prompt-injection | Tool output stripped of control chars, confined to untrusted blocks; authorization never depends on it |
-| Attack-path narratives | AI citations verified against real finding ids; hallucinated provenance falls back to deterministic text |
+`backend/eval_harness.py` measures phase durations, planned/executed commands,
+failures, findings, severity mix, policy refusals and ground-truth metrics.
+Its ablation compares deterministic analysis with the configured provider and
+restores provider configuration afterward.
 
-## Deviations from Phase 1, and the design argument for each
+For an authorized lab, use a reviewed target list and ground truth, repeat each
+arm, and retain the emitted JSON with tool versions, environment and engagement
+rules. The [testing guide](testing.md) describes harness use. Run
+`python eval_harness.py --help` from `backend/` for the supported arguments.
 
-1. **OWASP ZAP enters as the passive baseline, not the active scanner.** The report
-   named ZAP alongside Nmap and Nuclei. It is integrated — but as ZAP's own CI
-   baseline wrapper in passive mode, because passive crawling is reconnaissance
-   (audit what the application serves) while active scanning sends attack payloads,
-   which under this framework's own model is exploitation-grade and belongs behind
-   the letter's authorization. The active scanner's flags (`-a`, config files, `-z`
-   daemon options) are refused by the policy engine by design.
-2. **The recommendation loop is automatic in proposing, manual in acting.** Full
-   autonomy was rejected deliberately — every paper in the Phase-1 survey converges
-   on that line, and the framework's contribution is demonstrating that the loop can
-   get faster without crossing it.
+A title checklist supports recall only. Structured, explicitly complete ground
+truth also supports precision; verification accuracy uses matched entries with
+boolean expected verification. See the
+[formula reference](backend_algorithms_formulae_reference.md). Report mean,
+spread and failure counts from actual runs. No detection accuracy, speedup or
+successful live campaign is inferred from unit tests.
 
-## Verification performed (2026-10-07)
+## Historical record: October 7, 2026
 
-- pytest: **377 passed**; frontend: **6 passed**; production build clean.
-- The campaign suite drives the real API against an in-memory database with only
-  the executor mocked: the aggressive-lab gate, evidence ingestion into
-  footholds/loot (with the plaintext hash asserted absent from every response),
-  placeholder-masked plans, execution resolving the secret while persisting only
-  the mask, the audited reveal, child-assessment promotion, autopilot drafting
-  without executing, the report's post-exploitation section, and a full
-  credential-validation → lateral-movement → impact draft/advance walk.
-- A regression was found and fixed in the same pass: `invalidate_analysis` did
-  not know the campaign phases, so running a campaign-phase step fell through to
-  "every phase" and wiped the analysis the phase was drafted from — which then
-  blocked its own execution. It now uses the mode-aware phase order.
-- Live end-to-end smoke run (backend on Windows, no lab): full phased lifecycle
-  completed — letter import → 8-step recon plan (incl. `zap-baseline.py`) → execution →
-  analysis → **auto-drafted exploitation plan (2 steps)** → execution → analysis →
-  **auto-drafted post-exploitation plan (2 steps)** → execution → analysis → report;
-  7 automatic recommendation batches recorded, each tied to its trigger execution;
-  auth gate verified (401 without key, 200 with).
+The earlier implementation recorded **377 backend tests**, **6 frontend tests**
+and a clean frontend build. Its campaign suite drove the API with the executor
+mocked through lab gates, evidence ingestion, credential references, audited
+reveal, promotion, autopilot and the campaign phase walk.
 
-## Suggested citation corrections for the Phase-1 literature table
+A Windows workflow smoke run without a lab recorded letter import, an eight-step
+recon plan, analysis, two-step exploitation and post-exploitation drafts, report
+generation and seven recommendation batches. Authentication returned 401 without
+the key and 200 with it. This is historical workflow evidence, not a current
+strict scanner-success result.
 
-Verify every 2026-dated survey entry resolves on Google Scholar before submission;
-replace any that do not with verifiable 2024–2025 work (PentestGPT/Deng et al.,
-Happe & Cito, AutoPenBench/Xu et al., and the CAI framework/Mayoral-Vilches are all
-real and already adjacent to the table).
+That pass also fixed campaign-phase invalidation that had erased prerequisite
+analysis. The November review extended invalidation and evidence protection;
+older statements that credentials never appeared in output are superseded.
+
+## Report framing
+
+Describe the framework as human-approved execution with automatic suggestions.
+Use passive ZAP as implemented; active scanning is not part of that adapter.
+Describe attack paths as correlations, not proven compromise chains. Keep
+measured results separate from proposed evaluation and verify literature
+citations independently before submission.

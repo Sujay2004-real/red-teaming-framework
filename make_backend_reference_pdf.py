@@ -1,221 +1,238 @@
-# -*- coding: utf-8 -*-
-"""Compile docs/backend_technical_reference.md into a styled A4 PDF.
+"""Render the project's Markdown backend references with ReportLab.
 
-Derives the PDF from the Markdown source so the two cannot drift: this script
-handles the subset of Markdown the reference uses (ATX headings, paragraphs,
-bullet and numbered lists, fenced code blocks, pipe tables, horizontal rules,
-inline `code`). Styling mirrors make_client_request_pdf.py (brand navy/blue,
-header and footer rules, info/grid table helpers).
+Run from the repository root with ReportLab installed:
+    python make_backend_reference_pdf.py
 
-Run from the project root:
-    .venv\\Scripts\\python.exe make_backend_reference_pdf.py
+The other reference generators call build_pdf with their Markdown source.
+Importing this module does not write files.
 """
-import re
+from html import escape
 from pathlib import Path
+import re
+import textwrap
+from urllib.parse import quote, urljoin
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_JUSTIFY
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import (BaseDocTemplate, Frame, KeepTogether,
-                                 PageTemplate, Paragraph, Spacer, Table,
-                                 TableStyle)
+from reportlab.platypus import (
+    BaseDocTemplate, Frame, KeepTogether, LongTable, PageTemplate, Paragraph, Spacer, TableStyle,
+)
 
-SOURCE = Path(__file__).with_name('docs') / 'backend_technical_reference.md'
-OUT = SOURCE.with_suffix('.pdf')
-
-styles = getSampleStyleSheet()
-
-brand_navy = colors.HexColor('#1F3864')
-brand_blue = colors.HexColor('#2E74B5')
-brand_light = colors.HexColor('#DEEAF6')
-rule_grey = colors.HexColor('#BFBFBF')
-code_bg = colors.HexColor('#101828')
-
-h1 = ParagraphStyle('H1x', parent=styles['Heading1'], fontName='Helvetica-Bold',
-                    fontSize=18, leading=22, textColor=brand_navy, spaceAfter=8)
-h2 = ParagraphStyle('H2x', parent=styles['Heading2'], fontName='Helvetica-Bold',
-                    fontSize=13, leading=16, textColor=brand_blue, spaceBefore=14,
-                    spaceAfter=6)
-h3 = ParagraphStyle('H3x', parent=styles['Heading3'], fontName='Helvetica-Bold',
-                    fontSize=11, leading=14, textColor=brand_navy, spaceBefore=10,
-                    spaceAfter=4)
-body = ParagraphStyle('Bodyx', parent=styles['BodyText'], fontName='Helvetica',
-                      fontSize=9, leading=13, alignment=TA_JUSTIFY, spaceAfter=6)
-bullet = ParagraphStyle('Bulletx', parent=body, leftIndent=14, bulletIndent=4,
-                        spaceAfter=3)
-code = ParagraphStyle('Codex', fontName='Courier', fontSize=7.5, leading=10,
-                      textColor=colors.HexColor('#EAECF0'), spaceAfter=6)
-cell = ParagraphStyle('Cellx', parent=body, fontSize=8, leading=11,
-                      alignment=0, spaceAfter=0)
-cellh = ParagraphStyle('CellHx', parent=cell, fontName='Helvetica-Bold',
-                       textColor=colors.white)
-
-# ---------------------------------------------------------------- inline md
-BOLD = re.compile(r'\*\*(.+?)\*\*')
-ITALIC = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
-CODESPAN = re.compile(r'`([^`]+)`')
+ROOT = Path(__file__).resolve().parent
+SOURCE = ROOT / "docs" / "backend_technical_reference.md"
+OUT = SOURCE.with_suffix(".pdf")
+WIDTH = 174 * mm
+NAVY = colors.HexColor("#193853")
+BLUE = colors.HexColor("#176b80")
+PALE = colors.HexColor("#edf4f7")
+GREY = colors.HexColor("#cad6df")
+GITHUB = "https://github.com/Sujay2004-real/red-teaming-framework/blob/main/"
+BASE_STYLES = getSampleStyleSheet()
 
 
-def md_inline(text):
-    text = (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            .replace('&lt;br/&gt;', '<br/>'))
-    # Code spans are protected first: a '*' inside `--output*` is literal text,
-    # not emphasis, and Markdown itself never formats inside inline code.
+def style_set():
+    body = ParagraphStyle(
+        "ReferenceBody", parent=BASE_STYLES["BodyText"], fontName="Helvetica",
+        fontSize=9.4, leading=13.4, textColor=NAVY, spaceAfter=7,
+        splitLongWords=True,
+    )
+    return {
+        "body": body,
+        "h1": ParagraphStyle("ReferenceTitle", parent=body,
+                            fontName="Helvetica-Bold", fontSize=23, leading=27,
+                            textColor=NAVY, spaceAfter=16, keepWithNext=True),
+        "h2": ParagraphStyle("ReferenceSection", parent=body,
+                            fontName="Helvetica-Bold", fontSize=13, leading=17,
+                            textColor=BLUE, spaceBefore=14, spaceAfter=7,
+                            keepWithNext=True),
+        "h3": ParagraphStyle("ReferenceSubsection", parent=body,
+                            fontName="Helvetica-Bold", fontSize=10.5, leading=14,
+                            spaceBefore=10, keepWithNext=True),
+        "bullet": ParagraphStyle("ReferenceBullet", parent=body,
+                                leftIndent=13, bulletIndent=2, spaceAfter=5),
+        "code": ParagraphStyle("ReferenceCode", fontName="Courier",
+                              fontSize=7.6, leading=10.5, textColor=NAVY),
+        "cell": ParagraphStyle("ReferenceCell", parent=body,
+                              fontSize=8.5, leading=11.5, spaceAfter=0),
+        "head": ParagraphStyle("ReferenceCellHead", parent=body,
+                              fontName="Helvetica-Bold", textColor=colors.white,
+                              fontSize=8.5, leading=11.5, spaceAfter=0),
+    }
+
+
+def inline_markdown(value, source):
+    # Protect code and links so formatting cannot interpret their punctuation.
     saved = []
 
-    def stash(match):
-        saved.append(f'<font face="Courier" size="8">{match.group(1)}</font>')
-        return f'\x00{len(saved) - 1}\x00'
+    def stash(rendered):
+        saved.append(rendered)
+        return f"\x00{len(saved) - 1}\x00"
 
-    text = CODESPAN.sub(stash, text)
-    text = BOLD.sub(r'<b>\1</b>', text)
-    text = ITALIC.sub(r'<i>\1</i>', text)
-    return re.sub(r'\x00(\d+)\x00', lambda m: saved[int(m.group(1))], text)
+    value = re.sub(
+        r"\x60([^\x60]+)\x60",
+        lambda m: stash(f'<font face="Courier" size="8">{escape(m[1])}</font>'),
+        value,
+    )
+
+    def link(match):
+        label, target = match[1], match[2]
+        if not re.match(r"https?://", target):
+            relative = source.relative_to(ROOT).as_posix()
+            target = urljoin(GITHUB + quote(relative), quote(target, safe="/:#?=&%"))
+        return stash(f'<link href="{escape(target, quote=True)}" color="#176b80">'
+                     f'{escape(label)}</link>')
+
+    value = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, value)
+    value = escape(value)
+    value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
+    value = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", value)
+    # Links may contain a previously protected code span in their label.
+    for _ in range(2):
+        value = re.sub(r"\x00(\d+)\x00", lambda m: saved[int(m[1])], value)
+    return value
 
 
-def code_block(lines):
-    text = '<br/>'.join(line.replace('&', '&amp;').replace('<', '&lt;')
-                        .replace('>', '&gt;').replace(' ', '&nbsp;') for line in lines)
-    table = Table([[Paragraph(text, code)]], colWidths=[174 * mm])
+def code_block(lines, styles):
+    rows = []
+    for line in lines or [""]:
+        for part in textwrap.wrap(
+            line.expandtabs(4), width=98, replace_whitespace=False,
+            drop_whitespace=False, break_long_words=True, break_on_hyphens=False,
+        ) or [""]:
+            text = escape(part).replace(" ", "&nbsp;") or "&#160;"
+            rows.append([Paragraph(text, styles["code"])])
+    table = LongTable(rows, colWidths=[WIDTH], hAlign="LEFT")
     table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), code_bg),
-        ('LEFTPADDING', (0, 0), (-1, -1), 8),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, -1), PALE),
+        ("BOX", (0, 0), (-1, -1), 0.5, GREY),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, 0), 7),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 7),
+    ]))
+    return KeepTogether([table]) if len(rows) <= 30 else table
+
+
+def markdown_table(rows, source, styles):
+    columns = len(rows[0])
+    if any(len(row) != columns for row in rows):
+        raise ValueError(f"Unequal table columns in {source}")
+    data = [
+        [Paragraph(inline_markdown(value, source), styles["head" if index == 0 else "cell"])
+         for value in row]
+        for index, row in enumerate([rows[0], *rows[2:]])
+    ]
+    # Most references pair a short label/module with a longer explanation.
+    fractions = [0.42, 0.58] if columns == 2 else [1 / columns] * columns
+    table = LongTable(data, colWidths=[WIDTH * f for f in fractions],
+                      hAlign="LEFT", repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PALE]),
+        ("GRID", (0, 0), (-1, -1), 0.4, GREY),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     return table
 
 
-def md_table(rows):
-    header = [Paragraph(md_inline(cell_text), cellh) for cell_text in rows[0]]
-    data = [header]
-    for row in rows[2:]:
-        data.append([Paragraph(md_inline(cell_text), cell) for cell_text in row])
-    table = Table(data, colWidths=[174 * mm / len(rows[0])] * len(rows[0]),
-                  hAlign='LEFT', repeatRows=1)
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), brand_navy),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F2F6FB')]),
-        ('GRID', (0, 0), (-1, -1), 0.5, rule_grey),
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('LEFTPADDING', (0, 0), (-1, -1), 5),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 5),
-        ('TOPPADDING', (0, 0), (-1, -1), 3),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-    ]))
-    return table
+def markdown_story(source, styles):
+    lines = source.read_text(encoding="utf-8").splitlines()
+    story, index = [], 0
 
+    def block_start(line):
+        return bool(re.match(r"^\s*(#|\||\x60\x60\x60|---\s*$|[-*]\s+|\d+\.\s+)", line))
 
-def split_table_row(line):
-    return [part.strip() for part in line.strip().strip('|').split('|')]
-
-
-def on_page(canvas, doc):
-    canvas.saveState()
-    canvas.setStrokeColor(brand_navy)
-    canvas.setLineWidth(1.5)
-    canvas.line(18 * mm, 285 * mm, 192 * mm, 285 * mm)
-    canvas.setFont('Helvetica', 7.5)
-    canvas.setFillColor(colors.HexColor('#666666'))
-    canvas.drawString(18 * mm, 287.5 * mm, 'Red Teaming Framework — Backend Technical Reference')
-    canvas.drawRightString(192 * mm, 287.5 * mm, 'Confidential')
-    canvas.setStrokeColor(rule_grey)
-    canvas.setLineWidth(0.75)
-    canvas.line(18 * mm, 14 * mm, 192 * mm, 14 * mm)
-    canvas.drawString(18 * mm, 10.5 * mm, 'Semi-Autonomous Red Teaming Framework — technical documentation')
-    canvas.drawRightString(192 * mm, 10.5 * mm, f'Page {doc.page}')
-    canvas.restoreState()
-
-
-doc = BaseDocTemplate(str(OUT), pagesize=A4, leftMargin=18 * mm,
-                      rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=18 * mm,
-                      title='Red Teaming Framework — Backend Technical Reference',
-                      author='EPCET Security Research Laboratory')
-frame = Frame(18 * mm, 18 * mm, 174 * mm, 264 * mm, id='main')
-doc.addPageTemplates([PageTemplate(id='page', frames=[frame], onPage=on_page)])
-
-story = []
-lines = SOURCE.read_text(encoding='utf-8').splitlines()
-index = 0
-in_code, code_lines = False, []
-
-while index < len(lines):
-    line = lines[index]
-
-    if line.strip().startswith('```'):
-        if in_code:
-            story.append(code_block(code_lines))
-            story.append(Spacer(1, 4))
-            code_lines = []
-        in_code = not in_code
-        index += 1
-        continue
-    if in_code:
-        code_lines.append(line)
-        index += 1
-        continue
-
-    stripped = line.strip()
-    if not stripped:
-        index += 1
-        continue
-    if stripped == '---':
-        story.append(Spacer(1, 8))
-        index += 1
-        continue
-
-    if stripped.startswith('#'):
-        level = len(stripped) - len(stripped.lstrip('#'))
-        text = stripped.lstrip('#').strip()
-        if level == 1:
-            story.append(Paragraph(md_inline(text), h1))
-        elif level == 2:
-            story.append(Paragraph(md_inline(text), h2))
-        else:
-            story.append(Paragraph(md_inline(text), h3))
-        index += 1
-        continue
-
-    if stripped.startswith('|'):
-        rows = []
-        while index < len(lines) and lines[index].strip().startswith('|'):
-            rows.append(split_table_row(lines[index]))
-            index += 1
-        if len(rows) >= 2:
-            story.append(md_table(rows))
-            story.append(Spacer(1, 6))
-        continue
-
-    bullet_match = re.match(r'^(\s*)[-*]\s+(.*)$', line)
-    if bullet_match:
-        indent = len(bullet_match.group(1))
-        style = ParagraphStyle('b2', parent=bullet, leftIndent=14 + indent)
-        story.append(Paragraph(md_inline(bullet_match.group(2)), style,
-                               bulletText='•'))
-        index += 1
-        continue
-
-    numbered_match = re.match(r'^(\d+)\.\s+(.*)$', stripped)
-    if numbered_match:
-        story.append(Paragraph(md_inline(numbered_match.group(2)), bullet,
-                               bulletText=numbered_match.group(1) + '.'))
-        index += 1
-        continue
-
-    # Paragraph: merge soft-wrapped continuation lines.
-    paragraph = [stripped]
-    index += 1
     while index < len(lines):
-        nxt = lines[index].strip()
-        if (not nxt or nxt.startswith(('#', '|', '```', '---'))
-                or re.match(r'^\s*[-*]\s+', nxt) or re.match(r'^\d+\.\s+', nxt)):
-            break
-        paragraph.append(nxt)
+        line = lines[index].strip()
         index += 1
-    story.append(Paragraph(md_inline(' '.join(paragraph)), body))
+        if not line:
+            continue
+        if line.startswith("\x60\x60\x60"):
+            code_lines = []
+            while index < len(lines) and not lines[index].strip().startswith("\x60\x60\x60"):
+                code_lines.append(lines[index])
+                index += 1
+            if index == len(lines):
+                raise ValueError(f"Unclosed code fence in {source}")
+            index += 1
+            story.extend([code_block(code_lines, styles), Spacer(1, 8)])
+            continue
+        if line.startswith("|"):
+            rows = [line.strip("|").split("|")]
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                rows.append(lines[index].strip().strip("|").split("|"))
+                index += 1
+            rows = [[value.strip() for value in row] for row in rows]
+            story.extend([markdown_table(rows, source, styles), Spacer(1, 8)])
+            continue
+        if line == "---":
+            story.append(Spacer(1, 8))
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            level = min(3, len(heading[1]))
+            story.append(Paragraph(inline_markdown(heading[2], source), styles[f"h{level}"]))
+            continue
+        item = re.match(r"^(?:([-*])|(\d+)\.)\s+(.*)$", line)
+        text = item[3] if item else line
+        while index < len(lines) and lines[index].strip() and not block_start(lines[index]):
+            text += " " + lines[index].strip()
+            index += 1
+        if item:
+            marker = "\u2022" if item[1] else item[2] + "."
+            story.append(Paragraph(inline_markdown(text, source),
+                                   styles["bullet"], bulletText=marker))
+        else:
+            style = styles["body"]
+            if text.startswith(("Source:", "Sources:")):
+                style = ParagraphStyle("ReferenceSource", parent=style, keepWithNext=True)
+            story.append(Paragraph(inline_markdown(text, source), style))
+    return story
 
-doc.build(story)
-print('Wrote', OUT)
+
+def build_pdf(source=SOURCE, output=None, title="Backend technical reference"):
+    source = Path(source).resolve()
+    output = Path(output) if output else source.with_suffix(".pdf")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    styles = style_set()
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(BLUE)
+        canvas.setLineWidth(1.1)
+        canvas.line(18 * mm, 282 * mm, 192 * mm, 282 * mm)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(NAVY)
+        canvas.drawString(18 * mm, 286 * mm, "RED TEAM CONTROL CENTER")
+        canvas.drawRightString(192 * mm, 286 * mm, "Implementation reference")
+        canvas.setStrokeColor(GREY)
+        canvas.setLineWidth(0.5)
+        canvas.line(18 * mm, 15 * mm, 192 * mm, 15 * mm)
+        canvas.drawString(18 * mm, 10.5 * mm, title)
+        canvas.drawRightString(192 * mm, 10.5 * mm, f"{doc.page}")
+        canvas.restoreState()
+
+    doc = BaseDocTemplate(
+        str(output), pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=21 * mm, bottomMargin=21 * mm,
+        title=title, author="Red Team Control Center project",
+        pageCompression=1, invariant=1,
+    )
+    frame = Frame(18 * mm, 21 * mm, WIDTH, 255 * mm, id="main",
+                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+    doc.addPageTemplates([PageTemplate(id="reference", frames=[frame], onPage=on_page)])
+    doc.build(markdown_story(source, styles))
+    print(f"Wrote {output}")
+    return output
+
+
+if __name__ == "__main__":
+    build_pdf()

@@ -125,8 +125,10 @@ invalidation when new reconnaissance work is added.
 
 After the approved major changes, the full backend suite passed **412 tests**.
 A subsequent focused run passed **59 tests**, including malformed promotion
-scope handling. The external-worker backfill gate has a separate startup
-regression. New coverage in `backend/test_protected_workflows.py` exercises
+scope handling. The external-worker backfill gate has a separate passing
+startup regression (one test). These runs overlap; see the
+[testing guide](testing.md) for commands and validation scope.
+New coverage in `backend/test_protected_workflows.py` exercises
 concurrent promotion/drafting, stale analysis/report publication, analysis and
 autopilot rollback, encrypted retry originals, stream chunk boundaries,
 provider-input redaction, wrong keys, atomic key creation, legacy backfill and
