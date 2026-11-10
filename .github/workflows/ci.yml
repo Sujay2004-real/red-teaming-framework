@@ -43,9 +43,9 @@ jobs:
 
   docker-images:
     # Proves the production stack the README documents actually builds and its
-    # compose files are valid — the scanner image fetches nmap/nuclei/ZAP/
-    # exploitdb over the network at pinned revisions, so a moved release or a
-    # refused shallow-SHA fetch fails here instead of on first real deploy.
+    # compose files are valid — the scanner image fetches Nuclei, ZAP,
+    # Exploit-DB and NetExec from external sources, so an unavailable release or
+    # refused revision fetch fails here instead of on first real deploy.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

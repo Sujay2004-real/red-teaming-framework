@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG EXPLOITDB_REVISION=150aef0e7c4757c9dff33016c8352671cdc9b454
 ARG NUCLEI_TEMPLATES_REVISION=8e200457539ad6a70d0d94cf816935688ea65478
 ARG NUCLEI_VERSION=3.11.1
+ARG NETEXEC_REVISION=c7dc286ba65daf10402cdc470e531b84e6d3d911
 ARG ZAP_VERSION=2.17.0
 # Revision of zaproxy/zaproxy that ships the docker/ baseline scripts matching
 # the pinned ZAP release (commit touching docker/zap-baseline.py, 2026-07-06).
@@ -43,7 +44,7 @@ RUN wget -q https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_VERSION}
     && wget -q https://raw.githubusercontent.com/zaproxy/zaproxy/${ZAP_REVISION}/docker/zap-baseline.py -O /usr/local/bin/zap-baseline.py \
     && chmod +x /usr/local/bin/zap-baseline.py \
     && pip install --no-cache-dir setuptools==69.5.1 zaproxy==0.6.0 pyyaml==6.0.2
-RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","zap":"%s"}\n' "$NUCLEI_VERSION" "$NUCLEI_TEMPLATES_REVISION" "$EXPLOITDB_REVISION" "$ZAP_VERSION" > /opt/tool-versions.json
+RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","netexec_revision":"%s","zap":"%s"}\n' "$NUCLEI_VERSION" "$NUCLEI_TEMPLATES_REVISION" "$EXPLOITDB_REVISION" "$NETEXEC_REVISION" "$ZAP_VERSION" > /opt/tool-versions.json
 # Campaign tooling for the post-compromise kill chain. Every one is lab_only in
 # the policy engine, so installing them here cannot widen what a production
 # target permits. netexec provides nxc, impacket provides the impacket-* family,
@@ -52,5 +53,7 @@ RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","
 # msfconsole is deliberately NOT installed: it is VM-only and runs on the Kali
 # attacker VM over SSH, which is also where a real exploit module belongs.
 USER root
-RUN pip install --no-cache-dir impacket netexec enum4linux-ng
+RUN pip install --no-cache-dir \
+    "git+https://github.com/Pennyw0rth/NetExec.git@${NETEXEC_REVISION}" \
+    enum4linux-ng
 USER redteam
