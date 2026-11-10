@@ -54,11 +54,14 @@ RUN printf '{"nuclei":"%s","templates_revision":"%s","exploitdb_revision":"%s","
 # msfconsole is deliberately NOT installed: it is VM-only and runs on the Kali
 # attacker VM over SSH, which is also where a real exploit module belongs.
 USER root
-RUN git init /opt/enum4linux-ng && cd /opt/enum4linux-ng \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && git init /opt/enum4linux-ng && cd /opt/enum4linux-ng \
     && git remote add origin https://github.com/cddmp/enum4linux-ng.git \
     && git fetch --depth 1 origin ${ENUM4LINUX_NG_REVISION} && git checkout FETCH_HEAD \
     && pip install --no-cache-dir \
         "git+https://github.com/Pennyw0rth/NetExec.git@${NETEXEC_REVISION}" \
         /opt/enum4linux-ng \
-    && rm -rf /opt/enum4linux-ng/.git
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/* /opt/enum4linux-ng/.git
 USER redteam
