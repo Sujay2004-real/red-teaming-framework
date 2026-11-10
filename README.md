@@ -6,12 +6,26 @@ each command, analyze the evidence, and export a versioned HTML report. An
 optional AI provider assists planning and analysis; deterministic operation is
 available without one.
 
+Release 4.0.0 adds reusable, versioned scenarios with dependency branches,
+evidence objectives, campaign controls, cleanup review, detection telemetry,
+named team credentials and repeatable retests. See the
+[framework guide](docs/framework.md).
+
 Use only against systems covered by your authorization. Commands remain subject
 to scope, tool, phase and engagement-policy checks, including when an operator
 edits a plan or enables lab features.
 
 ## What is implemented
 
+- **Reusable scenarios:** seven versioned technique adapters, typed inputs,
+  immutable campaign plans, conditional dependencies, JSON import/export,
+  previews with tool availability, and comparisons between matching retests.
+- **Campaign governance:** pause/resume/stop, per-attempt cleanup review,
+  explicit completion, named viewer/operator/admin credentials, attributed
+  approvals, worker inventory and shared SSH execution leases.
+- **Objective and detection evidence:** SQL injection, database banner, HTTP
+  response and TCP service verification; imported telemetry tied to execution
+  attempts. Reports retain failed, skipped and unevaluated results.
 - **Engagement setup:** PDF, DOCX, Markdown and text import; reviewed targets,
   allowed/excluded scope, tool restrictions and asset criticality.
 - **Phased assessments:** recon, analysis, authorized exploitation,
@@ -52,8 +66,10 @@ typing new secrets into executable plan source.
 
 **Upgrading an existing installation:** migration
 `0005_protected_workflows` backfills evidence and retires legacy report
-downloads. Keep the existing encryption key and upgrade API and worker together.
-See [upgrade instructions](docs/protected-evidence-upgrade.md).
+downloads; `0006_framework` adds scenario, team and worker persistence.
+Keep the existing encryption key and upgrade API and worker together.
+See [upgrade instructions](docs/protected-evidence-upgrade.md) and
+[framework startup](docs/framework.md#start-and-upgrade).
 
 ## Quick start
 
@@ -88,7 +104,7 @@ cd backend
 python -m venv venv
 # macOS/Linux
 . venv/bin/activate
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -115,18 +131,16 @@ operator authentication, encryption-key handling, networking and SSH setup.
 1. Enter the operator key. Optionally configure your provider and execution VM.
 2. Import the engagement letter or register an authorized target manually.
 3. Review scope, exclusions, restrictions and exploitation permission.
-4. Create an assessment and save the plan. Executed steps retain their position,
-   tool, command, phase and enabled state; other steps remain editable when idle.
+4. Choose a version in **Scenarios**, review its bindings and commands, and create
+   a campaign. Alternatively, create an adaptive assessment and save its plan.
+   Scenario plans stay fixed; adaptive plans permit edits to unexecuted work.
 5. Approve enabled steps in the active phase. Inspect outcomes and redacted
    output; cancellation and failed attempts remain visible.
 6. Analyze once every enabled step in the phase has finished. Failures are
    disclosed separately from findings. Review any automatically drafted work.
-7. Review findings and campaign evidence, then generate a report when the
-   assessment is analyzed. Report history retains previous public versions.
-
-The included [sample engagement letter](JuiceBox_Security_Assessment_Request.pdf)
-is a template with environment-specific addresses. Its presence in this
-repository does not grant permission to test those systems.
+7. Review findings and campaign evidence. For scenarios, record cleanup in
+   **Workflow**, complete the campaign, and publish its report. Report history
+   retains previous public versions. Create a retest to repeat a scenario.
 
 ## Architecture
 
@@ -150,31 +164,27 @@ The policy layer checks supported command arguments and destinations. It is
 not a general network egress firewall or a sandbox for every behavior of an
 installed scanner. See [security controls and limits](docs/priority_security_fixes.md).
 
-## Validation
+## Verification
 
-The November 2 implementation pass recorded **412 passing backend tests**,
-followed by **59 passing focused checks** and **one passing worker-startup
-regression**. These runs overlap and must not be added as independent coverage.
-The frontend recorded **24 passing tests**, plus successful lint and production
-build checks. See [validation details](docs/testing.md).
-
-CI is configured for backend tests, frontend lint/tests/audit/build, Compose
-validation and production image builds. A configured job is not proof that the
-latest run succeeded: check [GitHub Actions](https://github.com/Sujay2004-real/red-teaming-framework/actions).
+Run backend tests, frontend tests/lint/build and Compose validation before a
+deployment. The exact commands are in [testing](docs/testing.md). GitHub Actions
+also builds the API, scanner and production frontend images; check the current
+[workflow run](https://github.com/Sujay2004-real/red-teaming-framework/actions)
+for release evidence.
 
 ## Documentation
 
 | Guide | Purpose |
 | --- | --- |
-| [Documentation index](docs/README.md) | Current guides, PDFs and historical review records |
+| [Documentation index](docs/README.md) | Maintained operator and developer guides |
+| [Framework operation](docs/framework.md) | Scenarios, roles, controls, telemetry, retests and extension APIs |
 | [Deployment](docs/deployment.md) | Setup, configuration, VM execution and recovery |
 | [API reference](docs/api-reference.md) | Routes, authentication, examples and conflicts |
 | [Backend reference](docs/backend_technical_reference.md) | Modules, persistence, workflow and limits |
 | [Evidence upgrade](docs/protected-evidence-upgrade.md) | Migration, legacy reports and audited reveal |
 | [Security controls](docs/priority_security_fixes.md) | Enforced checks and practical boundaries |
-| [Testing](docs/testing.md) | Checks, recorded results and live evaluation |
+| [Testing](docs/testing.md) | Automated verification commands and limits |
 | [Frontend guide](frontend/README.md) | UI architecture, development and behavior |
-| [Implementation results](docs/implementation_results.md) | Evidence for the project report |
-| [Completion checklist](docs/implementation-checklist.md) | Review work and deployment follow-ups |
+| [Changelog](CHANGELOG.md) | Release history |
 
 Licensed under the [MIT License](LICENSE).

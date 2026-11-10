@@ -46,7 +46,7 @@ def create_assessment(client):
         'target_id': target['id'],
         'objective': 'Inspect the lab',
         'plan': [
-            {'tool': 'nmap', 'command': 'nmap -sV juice-shop'},
+            {'tool': 'nmap', 'command': 'nmap -sV -Pn -p 3000 juice-shop'},
             {'tool': 'curl', 'command': 'curl -I http://juice-shop:3000'},
         ],
     })
@@ -163,7 +163,9 @@ def test_prompt_mode_creates_one_assessment_per_picked_target(client):
     # The restricted target loses exactly its restricted steps; the
     # unrestricted one loses none.
     assert assessments[0]['restricted_steps_dropped'] == 0
-    assert assessments[1]['restricted_steps_dropped'] == 4
+    # Host-wide tools were already removed by port-scope policy. This count
+    # covers only the remaining tools removed by explicit letter restrictions.
+    assert assessments[1]['restricted_steps_dropped'] == 2
     assert all(step['tool'] not in ('traceroute', 'dig', 'sslscan', 'nuclei')
                for step in assessments[1]['plan'])
 

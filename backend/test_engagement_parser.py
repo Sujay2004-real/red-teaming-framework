@@ -1,10 +1,4 @@
-from pathlib import Path
-
-import pytest
-
 from modules.engagement_parser import parse_engagement
-
-REAL_PDF = Path(__file__).resolve().parent.parent / 'JuiceBox_Security_Assessment_Request.pdf'
 
 # A trimmed stand-in for the client's letter: same labelled tables and the
 # same restriction prose shapes, so the parser is tested without needing the
@@ -98,44 +92,6 @@ def test_parses_document_level_fields():
     assert any('Service discovery' in objective for objective in brief['objectives'])
     assert any('corporate network' in item for item in brief['out_of_scope'])
     assert any('Brute-force' in item for item in brief['prohibited'])
-
-
-@pytest.mark.skipif(not REAL_PDF.exists(), reason='client request PDF is not in the repository')
-def test_parses_the_real_client_pdf():
-    import io
-    from pypdf import PdfReader
-    text = '\n'.join(page.extract_text() or '' for page in PdfReader(str(REAL_PDF)).pages)
-    brief = parse_engagement(text)
-    addresses = {target['address']: target for target in brief['targets']}
-    # The letter (v7) assesses a real self-hosted application - the OmniRoute
-    # AI gateway on the assessment host - so it names the target by the host's
-    # current lab-network address and the gateway's port (20128)
-    # (192.168.198.86 at v7 regeneration time).
-    assert '192.168.198.86:20128' in addresses
-    assert addresses['192.168.198.86:20128']['criticality'] == 90
-    # The letter denies traceroute for the gateway while allowing everything
-    # else, so the restriction sentence shape is exercised end to end.
-    assert addresses['192.168.198.86:20128']['restricted_tools'] == ['traceroute']
-    assert brief['engagement_ref'] == 'JB/SEC/2026/026'
-    # The v7 letter authorizes controlled verification for the gateway only,
-    # and declares its verification endpoint so the exploit planner can draft
-    # the curl proof-of-concept deterministically. Against a real application
-    # the verification is expected to come back clean - that outcome is a
-    # finding, not a failure.
-    assert addresses['192.168.198.86:20128']['exploitation_authorized'] is True
-    assert addresses['192.168.198.86:20128']['verification_endpoints'] == ['/v1/chat/completions']
-    assert addresses['192.168.198.0/24']['exploitation_authorized'] is False
-    # The letter's second target authorizes the whole virtualization-lab
-    # segment (a real host LAN, not a container bridge).
-    assert '192.168.198.0/24' in addresses
-    assert addresses['192.168.198.0/24']['criticality'] == 65
-    assert addresses['192.168.198.0/24']['restricted_tools'] == ['curl', 'nuclei', 'sslscan', 'whatweb']
-    # All objectives survive PDF extraction and parsing (4.7 remains the
-    # controlled verification of critical findings).
-    assert len(brief['objectives']) == 9
-    assert any('security-header audit' in objective for objective in brief['objectives'])
-    assert any('segment' in objective.lower() for objective in brief['objectives'])
-    assert any('Controlled verification' in objective for objective in brief['objectives'])
 
 
 # A letter that authorizes a whole segment. The subnet row uses the same

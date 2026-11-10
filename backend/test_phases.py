@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
 
 from database import Base, get_db
 from main import app
@@ -41,7 +42,7 @@ def create_authorized_target(client, exploitation=False, address='192.168.56.10:
     return client.post('/targets/', json={
         'name': 'Exploit lab',
         'scope_domain_ip': address,
-        'authorized_scopes': [address],
+        'authorized_scopes': [urlsplit('//' + address).hostname],
         'criticality': 80,
         'exploitation_authorized': exploitation,
     }).json()

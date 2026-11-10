@@ -11,6 +11,7 @@ the sync unit the scheduler offloads to a thread) and then read it back
 through the endpoint.
 """
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,7 +53,7 @@ def client(monkeypatch):
 def _target(client, address='juice-shop:3000', exploit=False):
     return client.post('/targets/', json={
         'name': 'Lab', 'scope_domain_ip': address,
-        'authorized_scopes': [address], 'criticality': 70,
+        'authorized_scopes': [urlsplit('//' + address).hostname], 'criticality': 70,
         'exploitation_authorized': exploit,
     }).json()
 

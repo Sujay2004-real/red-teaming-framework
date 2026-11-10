@@ -87,6 +87,8 @@ class Assessment(Base):
     # the brief the operator reviewed is the same one the planner, analyzer and
     # report act on - not a re-parse of raw text that can drift.
     engagement_brief = Column(JSON, default=None)
+    scenario = Column(JSON, default=None)
+    framework_state = Column(JSON, default=dict)
     approval_required = Column(Boolean, default=True)
     # Which analyzer produced the current findings ('ai-provider' or
     # 'deterministic-fallback'). The client letter requires the report to
@@ -345,6 +347,53 @@ class EngagementHost(Base):
     child_assessment_id = Column(Integer, default=None)
     notes = Column(Text, default='')
     created_at = Column(DateTime, default=utcnow)
+
+class ScenarioVersion(Base):
+    __tablename__ = 'scenario_versions'
+    __table_args__ = (UniqueConstraint('scenario_id', 'version'),)
+    id = Column(Integer, primary_key=True)
+    scenario_id = Column(String, nullable=False)
+    version = Column(String, nullable=False)
+    digest = Column(String, nullable=False)
+    definition = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class OperatorCredential(Base):
+    __tablename__ = 'operator_credentials'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    key_hash = Column(String, nullable=False, unique=True)
+    role = Column(String, nullable=False)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class FrameworkEvent(Base):
+    __tablename__ = 'framework_events'
+    id = Column(Integer, primary_key=True)
+    assessment_id = Column(Integer, ForeignKey('assessments.id'), nullable=False, index=True)
+    kind = Column(String, nullable=False)
+    actor = Column(String, default='operator')
+    payload = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class WorkerRegistration(Base):
+    __tablename__ = 'worker_registrations'
+    id = Column(String, primary_key=True)
+    hostname = Column(String, nullable=False)
+    capabilities = Column(JSON, default=list)
+    heartbeat_at = Column(DateTime, nullable=False)
+
+
+class ExecutionLease(Base):
+    __tablename__ = 'execution_leases'
+    resource = Column(String, primary_key=True)
+    worker_id = Column(String, nullable=False)
+    execution_id = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
 
 def _encrypt_stored_secrets():
     """Bring an existing settings row in line with the no-defaults policy.

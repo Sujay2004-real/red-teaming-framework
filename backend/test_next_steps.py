@@ -12,7 +12,9 @@ from modules.next_steps import (
 # path to be attempted has to supply all three.
 PROVIDER = {'api_key': 'test-key', 'base_url': 'https://provider.example/v1', 'model_name': 'test-model'}
 
-SCOPES = ['app:20128']
+# These proposal tests cover a host-wide engagement; port-only scope is
+# exercised separately and must filter host-wide discovery tools.
+SCOPES = ['app']
 
 
 def finding(finding_id, **overrides):
@@ -84,7 +86,7 @@ def test_state_digest_is_bounded_on_every_axis():
 
 def test_already_executed_command_is_never_proposed_again():
     """The negative-knowledge ledger: the audit trail is the memory."""
-    executed = 'nmap -sV --version-light --max-rate 30 -p 20128 app'
+    executed = 'nmap -sV --version-light --max-rate 30 -Pn -p 20128 app'
     candidates, refused, source, notes = propose(
         plan=[{'tool': 'nmap', 'command': executed, 'phase': 'recon'}],
         executions=[execution(executed)],

@@ -312,6 +312,18 @@ progress::-moz-progress-bar { background: var(--accent); }
 .findings-placeholder span:nth-child(2) { width: 75%; }
 .findings-placeholder span:last-child { width: 45%; }
 .provider-fields { padding: 18px; border-radius: 10px; gap: 16px; }
+.provider-fields > label { margin-bottom: -10px; }
+.provider-fields > small { margin-top: -10px; }
+.provider-hint { padding: 12px 14px; border: 1px solid #315447; border-radius: 8px; background: #132b25; color: #c6ded5; font-size: 13px; line-height: 1.6; }
+.provider-key-link { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 20px; }
+.provider-key-link a { color: #80e4d0; white-space: nowrap; }
+.provider-endpoint { border-top: 1px solid var(--line); padding-top: 14px; }
+.provider-endpoint summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.provider-endpoint summary::before { content: '+'; color: var(--accent); }
+.provider-endpoint[open] summary::before { content: '−'; }
+.provider-endpoint summary span { font-size: 12px; font-weight: 400; color: var(--muted); }
+.provider-endpoint > label { margin: 16px 0 6px; }
+.provider-endpoint > small { display: block; margin-top: 6px; }
 .report-version code { font-size: 12px; }
 .download-link { color: #80e4d0; font-size: 14px; }
 button.download-link { background: #163b33; border: 1px solid #3c7265; padding: 10px 14px; border-radius: 8px; }

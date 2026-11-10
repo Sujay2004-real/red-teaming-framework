@@ -1,6 +1,6 @@
 import ipaddress
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -156,6 +156,23 @@ def _checked_plan_step_phase(step: Dict[str, Any]) -> None:
         raise ValueError(f'plan step phase must be one of recon / exploitation / post_exploitation, not {phase!r}')
 
 
+class SuccessCriterion(BaseModel):
+    model_config = {'extra': 'forbid'}
+    kind: Literal['sql_injection', 'database_banner']
+    endpoint: str = Field(min_length=1, max_length=1000)
+    parameter: str = Field(min_length=1, max_length=120)
+
+    _strip_values = field_validator('endpoint', 'parameter')(_required_text)
+
+    @model_validator(mode='after')
+    def supported_endpoint(self):
+        from modules.campaign_objectives import criterion_key
+        parsed = urlparse(self.endpoint)
+        if parsed.fragment or any(c.isspace() for c in self.endpoint) or criterion_key(self.model_dump()) is None:
+            raise ValueError('Success criteria need an unambiguous HTTP(S) endpoint without credentials or fragments')
+        return self
+
+
 class AssessmentCreate(BaseModel):
     target_id: int
     objective: str = Field(min_length=1, max_length=1000)
@@ -189,6 +206,16 @@ class AssessmentCreate(BaseModel):
                 raise ValueError(f'engagement brief field "{key}" cannot hold more than {MAX_BRIEF_ITEMS} items')
         if len(str(value)) > MAX_BRIEF_CHARS:
             raise ValueError(f'engagement brief must be {MAX_BRIEF_CHARS} characters or fewer')
+        if 'success_criteria' in value:
+            criteria = value['success_criteria']
+            if not isinstance(criteria, list) or len(criteria) > 10:
+                raise ValueError('Provide at most 10 structured success criteria')
+            from modules.objective_adapters import validate_criterion
+            normalized = [validate_criterion(item) for item in criteria]
+            keys = [str(sorted(item.items())) for item in normalized]
+            if len(set(keys)) != len(keys):
+                raise ValueError('Success criteria must be unique')
+            value = {**value, 'success_criteria': normalized}
         return value
 
 
@@ -207,6 +234,11 @@ class SettingsUpdate(BaseModel):
     ssh_fingerprint: Optional[str] = Field(default=None, max_length=100)
     ssh_private_key: Optional[str] = Field(default=None, max_length=20000)
     ssh_key_passphrase: Optional[str] = Field(default=None, max_length=1000)
+
+    @field_validator('gemini_api_key', 'model_name')
+    @classmethod
+    def _strip_provider_text(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator('api_base_url')
     @classmethod

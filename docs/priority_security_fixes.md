@@ -1,8 +1,7 @@
 # Priority security fixes
 
-Updated November 2, 2026. See the [backend review](backend-review-2026-11-02.md)
-for the approved fixes and [upgrade notes](protected-evidence-upgrade.md) for
-deployment requirements.
+Updated for release 4.0.0. See the
+[upgrade notes](protected-evidence-upgrade.md) for deployment requirements.
 
 ## Container contents
 
@@ -74,8 +73,10 @@ Host promotion requires owned evidence and parent host-wide authorization,
 honors exclusions and preserves restrictions. URL/path/port-only permission
 cannot authorize a whole-host child. Concurrent duplicate promotion is rejected.
 
-Application routes require the operator key except `/health` and `/ready`.
-FastAPI schema/documentation routes are public. There is no separate role system.
+Application routes require an operator credential except `/health` and
+`/ready`. FastAPI schema/documentation routes are public. Named viewer,
+operator and administrator credentials share one workspace; the bootstrap key
+remains an administrator.
 
 ## Validation
 
@@ -85,6 +86,5 @@ AI-fabricated evidence and the API verification flow. Additional coverage checks
 encryption/redaction, audited reveal, legacy adoption, promotion, rollback and
 concurrent publication.
 
-Use the isolated commands in [testing](testing.md). The November 2 record is
-412 full-suite backend tests, subsequent overlapping focused checks and
-24 frontend tests. Live scanner/VM validation remains a deployment task.
+Use the isolated commands in [testing](testing.md). Live scanner, VM, provider
+and target validation remain deployment tasks.

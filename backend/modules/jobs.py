@@ -13,6 +13,7 @@ from modules.executor import live_registry
 from modules.outcomes import outcome
 from modules.evidence import protect_execution, redact, known_secrets, original
 from modules.workflow import claim
+from modules import worker_resources
 
 logger = logging.getLogger(__name__)
 WORKER_ID = uuid.uuid4().hex
@@ -40,6 +41,7 @@ def _tick(sessions, execution_id):
         if snapshot:
             row.live_output, row.output_cursor = snapshot['output'], snapshot['cursor']
         row.heartbeat_at = utcnow()
+        worker_resources.renew(db, WORKER_ID, execution_id)
         cancel = bool(row.cancel_requested)
         db.commit()
         return cancel
@@ -74,6 +76,11 @@ async def run_execution(execution_id, sessions=None):
             settings = api.get_settings_row(db)
             proxy = api.proxy_environment(settings)
             remote = api.remote_execution_settings(settings)
+            if not worker_resources.reserve(db, remote, WORKER_ID, execution_id):
+                row.state, row.worker_id, row.heartbeat_at = 'queued', '', None
+                db.commit()
+                return None
+            db.commit()
         except Exception as exc:
             result = {'stdout': '', 'stderr': f'Execution policy no longer permits this job: {getattr(exc, "detail", type(exc).__name__)}', 'return_code': -1, 'duration_ms': 0}
             proxy = remote = None
@@ -114,7 +121,9 @@ async def run_execution(execution_id, sessions=None):
         live_registry.finish(execution_id)
     with sessions() as db:
         assessment = db.get(Assessment, assessment_id)
+        worker_resources.release(db, WORKER_ID, execution_id)
         if assessment is None:
+            db.commit()
             return redact(result, secrets)
         claim(db, assessment, allow_running=True)
         row = db.get(ToolExecution, execution_id)
@@ -136,6 +145,7 @@ async def run_execution(execution_id, sessions=None):
         row.output_cursor = len(row.live_output)
         archive_attempt(db, row)
         api.refresh_assessment_status(db, assessment)
+        is_scenario = bool(assessment.scenario)
         db.commit()
     if final_state not in {'interrupted', 'cancelled'}:
         # Everything this run proved about the campaign is ingested immediately
@@ -143,7 +153,8 @@ async def run_execution(execution_id, sessions=None):
         # or a manual draft sees the new footholds and loot as soon as they are
         # real. The ingest is idempotent.
         await asyncio.to_thread(api.ingest_execution_evidence_in_session, assessment_id, execution_id, sessions)
-        api.schedule_auto_recommendations(assessment_id, execution_id, sessions=sessions)
+        if not is_scenario:
+            api.schedule_auto_recommendations(assessment_id, execution_id, sessions=sessions)
     return {**redact(result, secrets), 'tool': tool, 'command': redact(masked_command, secrets), 'outcome': final_state}
 
 
@@ -197,6 +208,7 @@ def pending_jobs(sessions, capacity):
     """Recover dead leases; late workers cannot overwrite the interrupted attempt."""
     import main as api
     with sessions() as db:
+        worker_resources.heartbeat(db, WORKER_ID)
         expired = or_(ToolExecution.heartbeat_at < utcnow() - timedelta(seconds=60), ToolExecution.heartbeat_at.is_(None))
         stale = db.query(ToolExecution).filter(ToolExecution.state == 'running', expired).all()
         for row in stale:

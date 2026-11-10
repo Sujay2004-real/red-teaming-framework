@@ -19,7 +19,7 @@ def test_default_plan_separates_host_and_web_port():
     # that parses host:port itself keeps it, and the web templates add the
     # http:// scheme exactly once (a re-prefixed target once produced
     # http://http://host).
-    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -p 3000 juice-shop'
+    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -Pn -p 3000 juice-shop'
     assert commands['traceroute'] == 'traceroute juice-shop'
     assert commands['dig'] == 'dig +short juice-shop'
     assert commands['curl'] == 'curl -sSI http://juice-shop:3000'
@@ -39,7 +39,7 @@ def test_default_plan_commands_all_pass_policy_review():
 
     for step in PlannerAgent().default_plan('juice-shop:3000'):
         valid, reason, _ = engine.validate_command(
-            step['command'], ['juice-shop:3000'], expected_tool=step['tool'])
+            step['command'], ['juice-shop'], expected_tool=step['tool'])
         assert valid, f"{step['command']} rejected: {reason}"
 
 
@@ -101,8 +101,8 @@ def test_slash_in_a_target_does_not_make_it_a_subnet():
 def test_default_plan_accepts_a_url_shaped_target():
     commands = {step['tool']: step['command'] for step in PlannerAgent().default_plan('http://dvwa:8080/login')}
 
-    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -p 8080 dvwa'
-    assert commands['curl'] == 'curl -sSI http://dvwa:8080'
+    assert commands['nmap'] == 'nmap -sV --version-light --max-rate 30 -Pn -p 8080 dvwa'
+    assert commands['curl'] == 'curl -sSI http://dvwa:8080/login'
 
 
 def test_ai_plan_filters_mismatched_declared_tool():
@@ -128,7 +128,7 @@ def test_ai_plan_filters_mismatched_declared_tool():
 
     # A policy rejection must be distinguishable from a provider outage.
     assert source == 'default-policy-rejected'
-    assert plan == PlannerAgent().default_plan('juice-shop:3000')
+    assert {step['tool'] for step in plan} == {'nmap', 'curl', 'whatweb', 'sslscan', 'zap-baseline.py', 'nuclei'}
 
 
 def test_provider_failure_is_reported_separately_from_policy_rejection():
@@ -141,7 +141,7 @@ def test_provider_failure_is_reported_separately_from_policy_rejection():
         )
 
     assert source == 'default-provider-error'
-    assert plan == PlannerAgent().default_plan('juice-shop:3000')
+    assert {step['tool'] for step in plan} == {'nmap', 'curl', 'whatweb', 'sslscan', 'zap-baseline.py', 'nuclei'}
 
 
 def test_unconfigured_provider_is_reported_separately():

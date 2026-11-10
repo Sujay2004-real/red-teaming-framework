@@ -27,6 +27,10 @@ import AnalysisPanel from './components/AnalysisPanel'
 import FindingsPanel from './components/FindingsPanel'
 import AuditTrailPanel from './components/AuditTrailPanel'
 import CampaignPanel from './components/CampaignPanel'
+import ObjectiveEvidence from './components/ObjectiveEvidence'
+import ScenarioLibrary from './components/ScenarioLibrary'
+import WorkflowPanel from './components/WorkflowPanel'
+import TeamPanel from './components/TeamPanel'
 import Icon from './components/Icon'
 
 // The single-page control center. App owns the shared state and the request
@@ -73,9 +77,9 @@ function App() {
   const [promptText, setPromptText] = useState('')
   // The parsed client engagement letter: what the agent was asked to do.
   const [brief, setBrief] = useState(null), [briefFilename, setBriefFilename] = useState(''), [briefText, setBriefText] = useState('')
-  // Blank, not pre-filled: the operator chooses their own provider endpoint and
-  // model. The input placeholders show the expected shape without submitting it.
+  // AI stays off until the operator chooses a preset or a custom provider.
   const [settings, setSettings] = useState({ gemini_api_key: '', api_base_url: '', model_name: '', proxy_url: '', proxy_username: '', proxy_password: '', gemini_configured: false, proxy_configured: false, proxy_password_configured: false, provider_ready: false, execution_mode: 'local', ssh_host: '', ssh_port: 22, ssh_username: '', ssh_password: '', ssh_password_configured: false })
+  const [savedProviderBaseUrl, setSavedProviderBaseUrl] = useState('')
   // The last "Test connection" result against the Kali attacker VM: the
   // machine's real identity (OS, kernel, SSH host key) and tool inventory,
   // shown so the operator — and an audience — can see which box will run
@@ -136,8 +140,10 @@ function App() {
     const previousSettings = savedSettings.current
     savedSettings.current = s
     setSavedExecutionMode(s.execution_mode || 'local')
+    setSavedProviderBaseUrl(s.api_base_url || '')
     setSettings(values => {
       const next = { ...values, ...s }
+      if (replaceSettings) delete next.provider_preset
       if (!replaceSettings) for (const key of Object.keys(s)) {
         if (key in previousSettings && values[key] !== previousSettings[key]) next[key] = values[key]
       }
@@ -404,7 +410,7 @@ function App() {
   // already analyzed, and later phases have not been drafted yet.
   const currentPhase = selected?.current_phase || 'recon'
   const phaseSteps = useMemo(() => enabledSteps.filter(({ step }) => (step.phase || 'recon') === currentPhase), [enabledSteps, currentPhase])
-  const phaseCompleted = useMemo(() => phaseSteps.filter(({ index }) => executionByStep.get(index)?.complete), [phaseSteps, executionByStep])
+  const phaseCompleted = useMemo(() => phaseSteps.filter(({ index }) => executionByStep.get(index)?.complete || selected?.framework?.nodes?.some(node => node.index === index && node.status === 'skipped')), [phaseSteps, executionByStep, selected])
   const planLocked = (selected?.executions?.length || 0) > 0
   // What is actually frozen is the executed prefix, not the plan: an executed
   // step is an audit fact and keeps its tool, command and position, while an
@@ -413,10 +419,10 @@ function App() {
   // plan-update endpoint enforces, and the reason a proposal can be accepted
   // in a phase that is already under way. Any change to the frozen prefix is
   // refused here and refused again by the backend.
-  const planEditable = !selected?.executions?.some(e => { const old = selected.plan?.[e.step_index], next = draftPlan[e.step_index]; return !next || ['tool', 'command', 'phase', 'enabled'].some(k => old?.[k] !== next?.[k]) })
+  const planEditable = !selected?.scenario && !selected?.executions?.some(e => { const old = selected.plan?.[e.step_index], next = draftPlan[e.step_index]; return !next || ['tool', 'command', 'phase', 'enabled'].some(k => old?.[k] !== next?.[k]) })
   const planDirty = !!selected && !samePlan(draftPlan, selected.plan)
   const selectedTarget = useMemo(() => targets.find(t => t.id === selected?.target_id), [targets, selected])
-  const canAnalyze = !!selected && !planDirty && phaseSteps.length > 0 && phaseCompleted.length === phaseSteps.length
+  const canAnalyze = !!selected && selected.framework_state?.control !== 'completed' && !planDirty && phaseSteps.length > 0 && phaseCompleted.length === phaseSteps.length
   const canReport = selected?.status === 'analyzed' || selected?.status === 'reported'
 
   // The engagement phases the stepper visualises. Each phase reads only
@@ -612,8 +618,9 @@ function App() {
       {notice && <div className="notice workspace-notice" role="status"><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice('')}><Icon name="close" /></button></div>}
       <section className="stats" aria-label="Workspace totals"><div><Icon name="target" /><b>{targets.length}</b><span>Authorized targets</span></div><div><Icon name="planner" /><b>{catalogTotal}</b><span>Assessments</span></div><div><Icon name="reporter" /><b>{reportedTotal ?? '—'}</b><span>Reports completed</span></div><div><Icon name="analyst" /><b>{settings.provider_ready ? 'AI' : 'Local'}</b><span>{settings.provider_ready ? 'Provider configured' : 'Deterministic analyzer'}</span></div></section>
 
-      <nav className="workspace-nav" aria-label="Workspace">{['Assessments', 'Targets', 'Settings'].map(name => <button key={name} aria-current={page === name ? 'page' : undefined} className={page === name ? 'active' : 'secondary'} onClick={() => setPage(name)}><Icon name={name === 'Assessments' ? 'planner' : name === 'Targets' ? 'target' : 'settings'} />{name}</button>)}<span className="nav-context">{savedExecutionMode === 'kali_vm' ? 'Kali VM engine' : 'Local execution engine'}<span>Human approval required</span></span></nav>
-      {page === 'Settings' && <div className="settings-layout" id="workspace-content" tabIndex={-1}><ConfigurationPanel settings={settings} setSettings={value => { setSettings(value); setSshTest(null) }} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} /></div>}
+      <nav className="workspace-nav" aria-label="Workspace">{['Assessments', 'Scenarios', 'Targets', 'Settings'].map(name => <button key={name} aria-current={page === name ? 'page' : undefined} className={page === name ? 'active' : 'secondary'} onClick={() => setPage(name)}><Icon name={name === 'Assessments' ? 'planner' : name === 'Targets' ? 'target' : 'settings'} />{name}</button>)}<span className="nav-context">{savedExecutionMode === 'kali_vm' ? 'Kali VM engine' : 'Local execution engine'}<span>Human approval required</span></span></nav>
+      {page === 'Scenarios' && <div className="settings-layout" id="workspace-content" tabIndex={-1}><ScenarioLibrary targets={targets} onCreated={async id => { await refresh(); await openWorkspaceAssessment(id) }} /></div>}
+      {page === 'Settings' && <div className="settings-layout" id="workspace-content" tabIndex={-1}><ConfigurationPanel settings={settings} setSettings={value => { setSettings(value); setSshTest(null) }} savedProviderBaseUrl={savedProviderBaseUrl} sshTest={sshTest} onSave={saveSettings} onTestSsh={testSshConnection} /><TeamPanel /></div>}
       {page === 'Targets' && <div className="settings-layout targets-layout" id="workspace-content" tabIndex={-1}>
         <section className="target-inventory"><div className="panel-title"><div><span className="eyebrow">AUTHORIZED SCOPE</span><h2>Registered targets</h2></div><span className="tag">{targets.length} total</span></div><p className="muted">Review each target’s scope and rules before creating an assessment.</p>
           {!targets.length && <div className="empty"><Icon name="target" /><b>No targets registered yet</b><span>Add your first target using the form below, or import an engagement letter in Assessments.</span></div>}
@@ -631,16 +638,18 @@ function App() {
           {!selected && <section className="onboarding"><span className="eyebrow">YOUR ENGAGEMENT STARTS HERE</span><h2>Scope. Approve. Discover.</h2><p>Turn a client letter into a controlled assessment, with a clear trail from every command to its evidence.</p><div className="onboarding-steps"><span><Icon name="reader" />Import the scope</span><Icon name="arrow" /><span><Icon name="shield" />Review & approve</span><Icon name="arrow" /><span><Icon name="reporter" />Deliver the evidence</span></div></section>}
           {selected && <>
             <div className="assessment-heading panel"><div><span className="eyebrow">ASSESSMENT #{selected.id} · PLAN v{selected.plan_version}</span><h2>{selectedTarget?.name || 'Authorized assessment'}</h2><code className="assessment-address">{selectedTarget?.scope_domain_ip}</code><p>{selected.objective}</p></div><div className="assessment-meta"><span className={`status ${selected.status}`}>{selected.status.replaceAll('_', ' ')}</span><span className="muted">{PHASE_LABEL(currentPhase)}</span><span className="assessment-progress">{completedSteps.length}<small> / {enabledSteps.length} steps recorded</small></span><progress aria-label="Recorded command progress" value={completedSteps.length} max={enabledSteps.length || 1} /></div></div>
-            <nav className="assessment-tabs" aria-label="Assessment sections">{['Overview', 'Plan', 'Campaign', 'Findings', 'Activity', 'Report'].filter(name => name !== 'Campaign' || selectedTarget?.aggressive_lab).map(name => <button key={name} aria-current={tab === name ? 'page' : undefined} className={tab === name ? 'active' : 'secondary'} onClick={() => setTab(name)}>{name}{name === 'Findings' ? ` (${selected.finding_count || 0})` : ''}</button>)}</nav>
+            <nav className="assessment-tabs" aria-label="Assessment sections">{['Overview', 'Plan', 'Workflow', 'Campaign', 'Findings', 'Activity', 'Report'].filter(name => name !== 'Campaign' || selectedTarget?.aggressive_lab).map(name => <button key={name} aria-current={tab === name ? 'page' : undefined} className={tab === name ? 'active' : 'secondary'} onClick={() => setTab(name)}>{name}{name === 'Findings' ? ` (${selected.finding_count || 0})` : ''}</button>)}</nav>
             {planDirty && <div className="notice" role="status">Unsaved plan changes{tab !== 'Plan' && <button className="secondary compact" onClick={savePlan} disabled={busy || !planEditable}>Save plan</button>}</div>}
             {runningStep !== null && <div className="run-banner" role="status"><Icon name="activity" />Step {runningStep + 1} {liveExec?.state || 'queued'} · {liveElapsed}s <button className="secondary compact" onClick={() => setTab('Plan')}>View output</button><button className="danger compact" onClick={cancelExecution} disabled={busy}>Cancel execution</button></div>}
             {tab === 'Overview' && <PhasePipeline selected={selected} selectedTarget={selectedTarget} phases={phases} nextDraftable={nextDraftable} currentPhase={currentPhase} nextProposals={nextProposals} pickedCandidates={pickedCandidates} setPickedCandidates={setPickedCandidates} planEditable={planEditable} onDraftPhase={draftPhase} onPropose={proposeNextSteps} onDismissProposals={() => { setNextProposals(null); setPickedCandidates(new Set()) }} onAddPicked={addPickedCandidates} canAnalyze={canAnalyze} canReport={canReport} planDirty={planDirty} running={runningStep !== null} onReviewPlan={() => setTab('Plan')} onAnalyze={analyze} onReport={() => setTab('Report')} />}
             {tab === 'Plan' && <PlanEditor selected={selected} selectedTarget={selectedTarget} draftPlan={draftPlan} setDraftPlan={setDraftPlan} executionByStep={executionByStep} runningStep={runningStep} liveExec={liveExec} liveElapsed={liveElapsed} planLocked={planLocked} planEditable={planEditable} planDirty={planDirty} capabilities={capabilities} toolNames={toolNames} onSave={savePlan} onExecute={execute} />}
             {tab === 'Report' && <AnalysisPanel selected={selected} currentPhase={currentPhase} phaseSteps={phaseSteps} phaseCompleted={phaseCompleted} planDirty={planDirty} canAnalyze={canAnalyze} canReport={canReport} reportUrl={reportUrl} onAnalyze={analyze} onReport={report} onDownloadReport={downloadReport} />}
+            {tab === 'Workflow' && <WorkflowPanel key={selected.id} assessment={selected} onChanged={async () => { await reloadAssessment(selected.id); await refresh() }} onRetest={async id => { await refresh(); await openWorkspaceAssessment(id) }} onReviewPlan={() => setTab('Plan')} />}
             {tab === 'Campaign' && <CampaignPanel key={selected.id} assessmentId={selected.id} aggressive={!!selectedTarget?.aggressive_lab} onChanged={async () => { await reloadAssessment(selected.id); await refresh() }} />}
             {tab === 'Findings' && <FindingsPanel key={selected.id} assessment={selected} assessments={assessments} />}
             {tab === 'Activity' && <><CrewPanel crew={crew} activeAgent={activeAgent} feed={feed} onClearFeed={() => setFeed([])} /><AuditTrailPanel assessmentId={selected.id} executions={selected.executions} /></>}
             {tab === 'Report' && <ReportVersions assessmentId={selected.id} status={selected.status} revision={reportRevision} />}
+            {(tab === 'Overview' || tab === 'Report') && <ObjectiveEvidence result={selected.objective_result} />}
           </>}
           {(!selected || tab === 'Overview') && <LetterPanel collapsed={!!selected} brief={brief} briefFilename={briefFilename} targets={targets} onClear={() => { setBrief(null); setBriefFilename(''); setBriefText('') }} onImport={importBrief} onRegisterTarget={registerBriefTarget} onSetup={() => startAssessment(null, setupFromBrief)} rules={<><p>Review the letter’s exclusions and dates before registering targets.</p><ScopePolicy value={reviewedPolicy} onChange={setReviewedPolicy} /></>} />}
         </section>

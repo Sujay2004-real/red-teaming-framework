@@ -22,7 +22,7 @@ def atomic_write(path, content):
 
 
 def provenance(assessment, executions):
-    return {'application_version': '3.0', 'plan_version': assessment.plan_version, 'workflow_revision': assessment.workflow_revision,
+    return {'application_version': '4.0.0', 'plan_version': assessment.plan_version, 'workflow_revision': assessment.workflow_revision,
             'analysis': assessment.analysis_metadata or {},
             'executions': [{'id': e.id, 'attempt': e.attempt, 'tool': e.tool_name,
                 'command': e.command, 'state': e.state, 'execution_host': e.execution_host,

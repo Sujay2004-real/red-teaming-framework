@@ -7,7 +7,7 @@ def test_authorized_single_label_host_is_a_valid_target():
     policy = PolicyEngine()
 
     valid, _, _ = policy.validate_command(
-        'nmap -sV juice-shop',
+        'nmap -sV -Pn -p 3000 juice-shop',
         ['juice-shop:3000'],
     )
 
@@ -72,7 +72,7 @@ def test_attached_output_flag_is_blocked():
     'sslscan --starttls-imap juice-shop',
 ])
 def test_correctly_classified_flags_keep_their_target(command):
-    valid, reason, _ = PolicyEngine().validate_command(command, ['juice-shop:3000'])
+    valid, reason, _ = PolicyEngine().validate_command(command, ['juice-shop'])
 
     assert valid, reason
 

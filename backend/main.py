@@ -20,6 +20,9 @@ from models import AssessmentCreate, AutopilotUpdate, ExecuteRequest, PlanUpdate
 from modules.analyzer import DEFAULT_ASSET_CRITICALITY, analyzer_agent, extract_nmap_hosts, match_verification
 from modules.api_auth import API_KEY_ENV_VAR, ensure_operator_key, verify_operator_key
 from modules.attack_paths import derive_paths, narrate_paths
+from modules.campaign_objectives import objective_result
+from modules import framework
+from database import FrameworkEvent
 from modules.engagement_parser import parse_engagement
 from modules.executor import EXECUTION_TIMEOUT_SECONDS, executor, live_registry
 from modules.exploit_planner import exploit_planner
@@ -66,7 +69,7 @@ async def lifespan(app):
         if recommendation_tasks:
             await asyncio.gather(*list(recommendation_tasks), return_exceptions=True)
 
-app = FastAPI(title='Red Teaming Framework API', version='3.0', lifespan=lifespan)
+app = FastAPI(title='Red Teaming Framework API', version='4.0.0', lifespan=lifespan)
 
 
 @app.exception_handler(StaleDataError)
@@ -113,7 +116,7 @@ def serialize_target(row):
 
 
 def serialize_assessment(row):
-    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'plan_version': row.plan_version or 1, 'analysis_metadata': row.analysis_metadata or {}, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'current_phase': row.current_phase or 'recon', 'analyzed_phases': row.analyzed_phases or [], 'created_at': row.created_at, 'completed_at': row.completed_at}
+    return {'id': row.id, 'target_id': row.target_id, 'objective': row.objective, 'status': row.status, 'plan': row.plan or [], 'engagement_brief': row.engagement_brief, 'plan_version': row.plan_version or 1, 'analysis_metadata': row.analysis_metadata or {}, 'approval_required': row.approval_required, 'analysis_mode': row.analysis_mode or '', 'current_phase': row.current_phase or 'recon', 'analyzed_phases': row.analyzed_phases or [], 'created_at': row.created_at, 'completed_at': row.completed_at, 'scenario': row.scenario, 'framework_state': row.framework_state or {}, 'workflow_revision': row.workflow_revision}
 
 
 def discovered_hosts_for(executions):
@@ -489,7 +492,7 @@ def refresh_assessment_status(db, row, extra_executed=()):
     executed = {
         execution.step_index
         for execution in db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id, ToolExecution.return_code.is_not(None)).all()
-    } | set(extra_executed)
+    } | set(extra_executed) | framework.skipped_indices(db, row)
     # 'running' must not stick between steps: once a command returns, the
     # assessment is idle again and waiting on the next human approval. Scope
     # is the CURRENT phase only: later phases are drafted later, and an
@@ -648,6 +651,14 @@ def get_settings(db: Session = Depends(get_db)):
 @app.put('/settings', dependencies=PROTECTED)
 def update_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
     row = get_settings_row(db)
+    if payload.api_base_url is not None:
+        previous_url = (row.api_base_url or '').strip().rstrip('/')
+        next_url = payload.api_base_url.strip().rstrip('/')
+        # A saved credential belongs to its endpoint. Switching presets (or
+        # disabling the provider) must never forward the old key elsewhere.
+        # The loop below can install a new key in the same transaction.
+        if next_url != previous_url or not next_url:
+            row.gemini_api_key = ''
     host_changed = (payload.ssh_host is not None and payload.ssh_host != row.ssh_host) or (payload.ssh_port is not None and payload.ssh_port != row.ssh_port)
     if host_changed:
         row.ssh_fingerprint = ''
@@ -756,6 +767,14 @@ def create_assessment(payload: AssessmentCreate, db: Session = Depends(get_db)):
     target = db.query(Target).filter(Target.id == payload.target_id).first()
     if not target:
         raise HTTPException(404, 'Target not found')
+    for criterion in (payload.engagement_brief or {}).get('success_criteria', []):
+        endpoint = criterion['endpoint']
+        if criterion['kind'] == 'tcp_service':
+            endpoint = f"[{endpoint}]:{criterion['port']}" if ':' in endpoint else f"{endpoint}:{criterion['port']}"
+        if not policy_engine.validate_target(endpoint, authorized_scopes_for(target)):
+            raise HTTPException(403, 'The success criterion endpoint is outside the authorized scope')
+        if any(scopes_overlap(endpoint, excluded) for excluded in (target.engagement_policy or {}).get('excluded_scopes', [])):
+            raise HTTPException(403, 'The success criterion endpoint is excluded by the engagement')
     settings = get_settings_row(db)
     restricted = restricted_tools_for(target)
     # The structured brief leads and the raw letter text follows it, so the
@@ -855,6 +874,7 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     result['executions'] = [serialize_execution(execution) for execution in executions]
     result['discovered_hosts'] = discovered_hosts_for(executions)
     result['findings'] = [serialize_finding(finding) for finding in findings]
+    result['objective_result'] = objective_result(db, row)
     return result
 
 
@@ -882,7 +902,7 @@ def delete_assessment_rows(db, row):
         {'child_assessment_id': None}, synchronize_session=False)
     for version in db.query(ReportVersion).filter_by(assessment_id=row.id).all():
         Path(version.path).unlink(missing_ok=True)
-    for model in (ExecutionAttempt, FindingReview, ReportVersion, RecommendationTask):
+    for model in (FrameworkEvent, ExecutionAttempt, FindingReview, ReportVersion, RecommendationTask):
         db.query(model).filter(model.assessment_id == row.id).delete(synchronize_session=False)
     db.query(Finding).filter(Finding.assessment_id == row.id).delete(synchronize_session=False)
     db.query(ToolExecution).filter(ToolExecution.assessment_id == row.id).delete(synchronize_session=False)
@@ -929,6 +949,8 @@ def update_plan(assessment_id: int, payload: PlanUpdate, db: Session = Depends(g
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
         raise HTTPException(404, 'Assessment not found')
+    if row.scenario:
+        raise HTTPException(409, 'Scenario plans are immutable; publish a new scenario version or create a retest')
     # The freeze is per step now that phases append: an executed step is an
     # audit fact and keeps its tool, command, and position, while unexecuted
     # steps (including whole not-yet-run phases) stay fully editable. This is
@@ -1015,6 +1037,8 @@ def try_draft_phase(db, row, target, phase):
     ever draft the base phases, so the extended kill chain is unreachable for a
     production engagement exactly like the tools it drives.
     """
+    if row.scenario:
+        return None, 'Scenario plans are immutable; their next phase is already defined', 'order'
     aggressive = aggressive_lab(target)
     phases = plan_phases(aggressive)
     phase = validate_phase(phase, aggressive)
@@ -1411,12 +1435,17 @@ def enforce_engagement(db, assessment, target, step_index, command, tool):
     changed since, and approval is not a licence to run something the letter no
     longer permits.
     """
+    framework.enforce_node(db, assessment, step_index)
     step = assessment.plan[step_index]
     current = assessment.current_phase or 'recon'
     if step.get('phase', 'recon') != current:
         raise HTTPException(409, 'Only steps in the active phase may execute')
     aggressive = aggressive_lab(target)
     prerequisite = preceding_plan_phase(current, aggressive)
+    if assessment.scenario:
+        phases = list(dict.fromkeys(s['phase'] for s in assessment.plan))
+        position = phases.index(current)
+        prerequisite = phases[position - 1] if position else None
     if prerequisite and prerequisite not in (assessment.analyzed_phases or []):
         raise HTTPException(409, 'Analyze the preceding phase before executing this phase')
     policy = target.engagement_policy or {}
@@ -1506,6 +1535,8 @@ async def execute_step(assessment_id: int, payload: ExecuteRequest, db: Session 
     execution.state, execution.cancel_requested = 'queued', False
     execution.live_output, execution.output_cursor = '', 0
     execution.plan_version = row.plan_version or 1
+    framework.event(db, row, 'approval', {'step_index': payload.step_index, 'attempt': execution.attempt,
+                                        'plan_version': execution.plan_version})
     invalidate_analysis(db, assessment_id, phase=step.get('phase', 'recon'))
     try:
         db.commit()
@@ -1572,16 +1603,19 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
         raise HTTPException(404, 'Assessment not found')
+    if (row.framework_state or {}).get('control') == 'completed':
+        raise HTTPException(409, 'Completed campaigns are immutable; create a retest')
     current = row.current_phase or 'recon'
     phase_indices = set(phase_steps(row))
     executions = db.query(ToolExecution).filter(ToolExecution.assessment_id == assessment_id, ToolExecution.return_code.is_not(None)).all()
     if not executions:
         raise HTTPException(400, 'Execute at least one approved plan step first')
+    skipped = framework.skipped_indices(db, row)
     enabled_steps = {index for index in phase_steps(row) if (row.plan or [])[index].get('enabled', True)}
     executed_steps = {execution.step_index for execution in executions}
     if not enabled_steps:
         raise HTTPException(409, 'The current phase has no enabled steps to analyze; draft the next phase plan first')
-    if not enabled_steps.issubset(executed_steps):
+    if not enabled_steps.issubset(executed_steps | skipped):
         raise HTTPException(409, 'Execute every enabled step of the current phase before analysis')
     target = db.query(Target).filter(Target.id == row.target_id).first()
     # Only the current phase's executions feed this analysis run: recon
@@ -1668,7 +1702,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
         analyzed_phases = analyzed_phases + [current]
     row.analyzed_phases = analyzed_phases
     aggressive = bool(target and aggressive_lab(target))
-    advances_to = analysis_advances_to(current, aggressive)
+    advances_to = framework.next_scenario_phase(row, current) if row.scenario else analysis_advances_to(current, aggressive)
     if advances_to and (row.current_phase or 'recon') == current:
         row.current_phase = advances_to
     row.status = 'analyzed'
@@ -1687,7 +1721,7 @@ def analyze_assessment(assessment_id: int, db: Session = Depends(get_db)):
     # about the engagement, worth showing, not worth failing the analysis.
     auto_drafted = {'phase': None, 'steps': 0, 'note': ''}
     next_phase = next_draftable_phase(row.current_phase or '', aggressive)
-    if next_phase:
+    if next_phase and not row.scenario:
         steps, notes, refusal = try_draft_phase(db, row, target, next_phase)
         if steps:
             row.plan = normalize_plan(list(row.plan or []) + steps)
@@ -1726,6 +1760,7 @@ def get_campaign(assessment_id: int, db: Session = Depends(get_db)):
         'autopilot': bool(row.autopilot),
         'autopilot_iteration_budget': AUTOPILOT_MAX_ITERATIONS,
         'autopilot_state': autopilot_state(row),
+        'objective_result': objective_result(db, row),
         **campaign_evidence(db, assessment_id),
     }
 
@@ -1741,6 +1776,8 @@ def set_autopilot(assessment_id: int, payload: AutopilotUpdate, db: Session = De
     row = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not row:
         raise HTTPException(404, 'Assessment not found')
+    if row.scenario:
+        raise HTTPException(409, 'Scenario campaigns follow their versioned workflow')
     target = db.query(Target).filter(Target.id == row.target_id).first()
     if payload.enabled and not (target and aggressive_lab(target)):
         raise HTTPException(403, 'Autopilot drives the lab-only kill chain, so it requires a target in '
@@ -1937,6 +1974,8 @@ def generate_report(assessment_id: int, db: Session = Depends(get_db)):
             attack_paths=redact(paths, secrets),
             provenance=source,
             campaign=redact(campaign, secrets),
+            objective_result=objective_result(db, row),
+            framework_report=redact(framework.snapshot(db, row), secrets),
         )
         claim_workflow(db, row, revision_at_start)
         version = archive_report(db, assessment_id, path, source)
@@ -2017,7 +2056,7 @@ def reset_workspace(db: Session = Depends(get_db)):
         report_path(row.id).unlink(missing_ok=True)
     for version in db.query(ReportVersion).all():
         Path(version.path).unlink(missing_ok=True)
-    for model in (Loot, Foothold, EngagementHost, ExecutionAttempt, RecommendationTask, FindingReview, ReportVersion):
+    for model in (FrameworkEvent, Loot, Foothold, EngagementHost, ExecutionAttempt, RecommendationTask, FindingReview, ReportVersion):
         db.query(model).delete(synchronize_session=False)
     deleted_findings = db.query(Finding).delete(synchronize_session=False)
     deleted_executions = db.query(ToolExecution).delete(synchronize_session=False)
@@ -2042,3 +2081,7 @@ def reset_workspace(db: Session = Depends(get_db)):
 
 from modules.workspace_api import router as workspace_router
 app.include_router(workspace_router)
+from modules.framework_api import router as framework_router
+app.include_router(framework_router)
+from modules.team_api import router as team_router
+app.include_router(team_router)

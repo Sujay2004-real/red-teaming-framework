@@ -1,9 +1,10 @@
 import { useRef, useState } from 'react'
 import { useApp } from '../lib/AppContext'
+import ProviderFields from './ProviderFields'
 
 // Provider / proxy / execution-engine configuration. Secrets are write-only:
 // the form blanks them after a save and shows only whether one is stored.
-export default function ConfigurationPanel({ settings, setSettings, sshTest, onSave, onTestSsh }) {
+export default function ConfigurationPanel({ settings, setSettings, savedProviderBaseUrl, sshTest, onSave, onTestSsh }) {
   const { busy, request, run, setNotice } = useApp()
   const [discovered, setDiscovered] = useState(null)
   const form = useRef(null)
@@ -29,12 +30,7 @@ export default function ConfigurationPanel({ settings, setSettings, sshTest, onS
     </div>
     <form ref={form} onSubmit={onSave}>
       <fieldset className="config-fields" disabled={busy}>
-      <fieldset className="provider-fields config-section"><legend>AI provider</legend>
-        <label>Base URL<input type="url" placeholder="https://your-provider.example/v1" value={settings.api_base_url || ''} onChange={e => setSettings({ ...settings, api_base_url: e.target.value })} /><small>Your own OpenAI-compatible endpoint. No provider is assumed.</small></label>
-        <label>Model name<input placeholder="your-model-name" value={settings.model_name || ''} onChange={e => setSettings({ ...settings, model_name: e.target.value })} /></label>
-        <label>API key<input type="password" placeholder={settings.gemini_configured ? 'Configured ••••••••' : 'Enter your own API key'} value={settings.gemini_api_key || ''} onChange={e => setSettings({ ...settings, gemini_api_key: e.target.value })} /><small>{settings.gemini_configured ? 'Leave blank to keep the stored key.' : 'Encrypted before storage and never returned by the API.'}</small></label>
-      </fieldset>
-      <small className="plan-note">All three are needed for AI planning and analysis. Leave them blank to run entirely on the local deterministic analyzer.</small>
+      <ProviderFields settings={settings} setSettings={setSettings} savedProviderBaseUrl={savedProviderBaseUrl} />
       <fieldset className="config-section"><legend>Proxy · optional</legend>
       <label>HTTP/S proxy<input placeholder="http://proxy:8080" value={settings.proxy_url || ''} onChange={e => setSettings({ ...settings, proxy_url: e.target.value })} /><small>Clearing this also clears the credentials below.</small></label>
       <div className="split">

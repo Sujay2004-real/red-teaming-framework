@@ -39,11 +39,11 @@ export default function PhasePipeline({
     {/* Proposing is available in the phase the assessment is working in,
         because that is the only phase whose new steps can be analyzed as a
         unit. The bookend phases own no steps, so they offer nothing. */}
-    {selected && PLAN_PHASES.includes(currentPhase) && <details className="proposal-options"><summary>Explore adaptive next steps<Icon name="chevron" /></summary><div className="phase-draft proposal-draft">
+    {selected && !selected.scenario && PLAN_PHASES.includes(currentPhase) && <details className="proposal-options"><summary>Explore adaptive next steps<Icon name="chevron" /></summary><div className="phase-draft proposal-draft">
       <button className="secondary" onClick={onPropose} disabled={busy || selected.status === 'running'}>{agentBusy('planner') ? 'Proposing…' : 'Propose next steps'}</button>
       <small>Proposals use the recorded findings and audit trail. Each candidate is policy-checked and requires approval.</small>
     </div></details>}
-    {nextProposals && <div className="proposals">
+    {nextProposals && !selected?.scenario && <div className="proposals">
       <div className="proposal-head">
         <div><b>Proposed next steps</b>{nextProposals.origin === 'auto' && <span className="tag good auto-tag">automatic</span>}<small>{nextProposals.candidates.length} for {PHASE_LABEL(nextProposals.phase).toLowerCase()} · {String(nextProposals.source).replaceAll('-', ' ')} · from {nextProposals.state.findings} finding{nextProposals.state.findings !== 1 ? 's' : ''} and {nextProposals.state.executed_steps} recorded step{nextProposals.state.executed_steps !== 1 ? 's' : ''}</small></div>
         <button className="secondary compact" onClick={onDismissProposals} disabled={busy}>Dismiss</button>

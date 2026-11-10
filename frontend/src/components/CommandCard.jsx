@@ -12,12 +12,13 @@ function RecordedOutput({ assessmentId, execution }) {
 }
 
 export default function CommandCard({ index, step, execution, live, elapsed, assessmentId, targetName,
-  capabilities, toolNames, busy, planDirty, saved, currentPhase, assessmentRunning, canRemove, onPatch, onRemove, onExecute }) {
+  capabilities, toolNames, busy, planDirty, saved, currentPhase, assessmentRunning, canRemove, onPatch, onRemove, onExecute, scenarioLocked = false, workflowNode, campaignControl = 'active' }) {
   const { setNotice } = useApp()
   const [outputOpen, setOutputOpen] = useState(false)
   const running = !!execution && !execution.complete
   const executed = !!execution?.complete
-  const locked = running || executed
+  const locked = running || executed || scenarioLocked
+  const workflowBlocked = campaignControl !== 'active' || (workflowNode && !['ready', 'failed'].includes(workflowNode.status))
   const retryable = !!execution?.retryable
   const successful = executed && ['completed', 'completed_with_findings'].includes(execution.state)
   const inFlight = !!live || running
@@ -31,6 +32,8 @@ export default function CommandCard({ index, step, execution, live, elapsed, ass
     <div className="command-card-head"><span className="step-number">{index + 1}</span><b>{step.tool || 'New command'}</b><span className={`command-state ${successful ? 'step-complete' : executed ? 'step-failed' : ''}`}>{successful && <Icon name="check" />}{state}</span></div>
     <code className="command-preview">{step.command || 'Add a command in the editor below.'}</code>
     <p className="command-purpose">{step.reason || 'Review this command and confirm it is within the authorized scope.'}</p>
+    {workflowNode && <p className="muted">{workflowNode.reason}</p>}
+    {campaignControl !== 'active' && <p className="muted">Campaign {campaignControl}</p>}
     <div className="command-tags">{step.risk && <span className={`tag risk-${String(step.risk).toLowerCase()}`}>{step.risk} risk</span>}{step.capability && <span className="tag">{String(step.capability).replaceAll('_', ' ')}</span>}{execution?.execution_host && <span className="vm-badge">Ran on Kali · {execution.execution_host.user}@{execution.execution_host.host}</span>}</div>
     <details className="command-edit" open={!step.command}>
       <summary><Icon name="settings" />{locked ? 'Recorded command details' : 'Edit command'}<Icon name="chevron" /></summary>
@@ -47,6 +50,6 @@ export default function CommandCard({ index, step, execution, live, elapsed, ass
     </details>
     {live && <div className="live-terminal" role="region" aria-label="Live command output"><div className="terminal-bar"><span className="terminal-dot" /><span className="terminal-title">{targetName} · live</span><span className="terminal-status">{live.running ? `Running · ${elapsed}s` : 'Finishing…'}</span></div><pre className="terminal-body"><span className="terminal-prompt">$ {step.command}</span>{'\n'}{live.output || 'Waiting for command output…'}</pre></div>}
     {executed && !live && <div className="recorded-output"><button type="button" className="text-button" aria-expanded={outputOpen} onClick={() => setOutputOpen(v => !v)}><Icon name="activity" />{outputOpen ? 'Hide recorded output' : 'Show recorded output'}<Icon name="chevron" /></button>{outputOpen && <RecordedOutput assessmentId={assessmentId} execution={execution} />}</div>}
-    <div className="step-actions"><button type="button" className="secondary compact" onClick={copy} disabled={!step.command}>Copy command</button><button type="button" disabled={busy || step.enabled === false || inFlight || (executed && !retryable) || planDirty || !saved || assessmentRunning || !step.command || (step.phase || 'recon') !== currentPhase} onClick={onExecute}>{!executed && !inFlight && <Icon name="shield" />}{buttonLabel}</button></div>
+    <div className="step-actions"><button type="button" className="secondary compact" onClick={copy} disabled={!step.command}>Copy command</button><button type="button" disabled={workflowBlocked || busy || step.enabled === false || inFlight || (executed && !retryable) || planDirty || !saved || assessmentRunning || !step.command || (step.phase || 'recon') !== currentPhase} onClick={onExecute}>{!executed && !inFlight && <Icon name="shield" />}{buttonLabel}</button></div>
   </div>
 }

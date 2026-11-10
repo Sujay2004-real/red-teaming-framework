@@ -26,10 +26,10 @@ import hashlib
 import os
 import secrets
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from database import AppSettings, get_db
+from database import AppSettings, OperatorCredential, get_db
 
 API_KEY_ENV_VAR = 'REDTEAM_API_KEY'
 KEY_HEADER = 'X-API-Key'
@@ -70,6 +70,7 @@ def ensure_operator_key(db):
 
 
 def verify_operator_key(
+    request: Request = None,
     x_api_key: str = Header(default='', alias=KEY_HEADER),
     db: Session = Depends(get_db),
 ):
@@ -78,10 +79,28 @@ def verify_operator_key(
     Applied to every route except /health, so the UI's reachability banner
     keeps working while nothing else is reachable anonymously.
     """
+    def accept(name, role):
+        if request is not None:
+            path, method = request.url.path, request.method
+            if role == 'viewer' and (method not in ('GET', 'HEAD', 'OPTIONS') or path.endswith('/reveal')):
+                raise HTTPException(403, 'Viewer credentials are read-only')
+            if role != 'admin' and (path.startswith('/team/credentials') or path.endswith('/reveal')
+                    or path == '/workspace/reset' or (path.startswith('/settings') and method not in ('GET', 'HEAD'))):
+                raise HTTPException(403, 'This action requires an administrator')
+            request.state.principal = {'name': name, 'role': role}
+        principal = {'name': name, 'role': role}
+        if db is not None:
+            db.info['principal'] = principal
+        return principal
+
     expected = (os.getenv(API_KEY_ENV_VAR) or '').strip()
     if expected:
         if secrets.compare_digest(_digest(expected), _digest(x_api_key or '')):
-            return
+            return accept('bootstrap', 'admin')
+    credential = db.query(OperatorCredential).filter_by(key_hash=_digest(x_api_key or ''), active=True).first() if db is not None else None
+    if credential:
+        return accept(credential.name, credential.role)
+    if expected:
         raise HTTPException(401, 'The operator API key is missing or wrong. '
                                  f'Send it in the {KEY_HEADER} header.')
     row = db.query(AppSettings).filter(AppSettings.id == 1).first()
@@ -91,7 +110,7 @@ def verify_operator_key(
         raise HTTPException(503, 'No operator API key is configured; restart '
                                  'the backend to generate one.')
     if secrets.compare_digest(stored, _digest(x_api_key or '')):
-        return
+        return accept('bootstrap', 'admin')
     raise HTTPException(401, 'The operator API key is missing or wrong. '
                              f'Send it in the {KEY_HEADER} header '
                              f'(printed in the backend console on first start, '

@@ -66,6 +66,26 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
   {% endif %}
 </div>
 
+{% if objective_result.criteria %}
+<section>
+  <h2>Campaign objective evidence</h2>
+  <p><b>Outcome:</b> {{ objective_result.status|replace('_', ' ') }}.</p>
+  <p class="meta">{{ objective_result.scope_note }}</p>
+  {% for criterion in objective_result.criteria %}
+  <div class="summary">
+    <p><b>{{ criterion.label }}:</b> {{ criterion.status|replace('_', ' ') }}</p>
+    <p><code>{{ criterion.endpoint }}</code> · Parameter: <code>{{ criterion.parameter }}</code></p>
+    <p>{{ criterion.reason }}</p>
+    {% for proof in criterion.evidence %}
+    <p class="meta">Execution #{{ proof.execution_id }}, attempt {{ proof.attempt }} · {{ proof.phase }} · {{ proof.tool }}</p>
+    <pre>{{ proof.excerpt }}</pre>
+    <p class="meta">Original evidence SHA-256: <code>{{ proof.evidence_sha256 }}</code></p>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
 {% if engagement.client_name or engagement.engagement_ref or engagement.test_window %}
 <div class="summary">
   <b>Engagement</b>
@@ -213,7 +233,7 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 {% endfor %}
 
 <h2>Audit trail</h2>
-<p class="meta">Every command below was individually approved by the human operator before it ran. Output excerpts are shown; the full output is retained in the framework database.</p>
+<p class="meta">Execution requires an individual approval recorded through the authenticated API. Approval may be submitted through the UI or a client; the record alone does not establish a human click. Output excerpts are shown; full output is retained in the framework database.</p>
 {% for e in executions %}
 <div class="execution">
   <b>{{ e.tool_name }}</b> · {% if e.return_code is none %}no exit status recorded{% else %}exit {{ e.return_code }}{% endif %} · {{ e.duration_ms or 0 }} ms · attempt {{ e.attempt or 1 }}<br>
@@ -226,7 +246,24 @@ summary{cursor:pointer;font-weight:600;color:var(--accent);font-size:13px}
 </div>
 {% endfor %}
 
-<div class="footer-note">This report was produced by a semi-autonomous framework: commands were proposed automatically, reviewed against an allowlist policy engine and scope rules, and executed only after explicit human approval. Exploitation-phase commands were additionally gated on the client letter's controlled-verification authorization, and the post-exploitation kill-chain phases on the separate aggressive-lab authorization for a lab engagement. For authorized laboratory and contractually permitted engagements only.</div>
+<div class="footer-note">Commands are checked against an allowlist policy engine and engagement scope, and execution requires explicit authenticated approval. Exploitation phases additionally require the saved exploitation permission; aggressive campaign phases require the separate lab authorization. These controls and the captured evidence define this report's scope.</div>
 <section><h2>Evidence provenance</h2><p>Report content is versioned. Hashes identify the captured evidence for each attempt; missing tool versions are not inferred.</p><pre>{{ provenance | tojson(indent=2) }}</pre></section>
+{% if framework.scenario %}
+<section>
+  <h2>Scenario campaign</h2>
+  <p><b>{{ framework.scenario.name }}</b> v{{ framework.scenario.version }} · {{ framework.control }}</p>
+  <p class="meta">Scenario ID: {{ framework.scenario.id }}<br>Scenario SHA-256: {{ framework.scenario.digest }}</p>
+  <table><thead><tr><th>Step / technique</th><th>Dependencies</th><th>Result</th></tr></thead><tbody>
+  {% for node in framework.nodes %}<tr><td>{{ node.id }}<br>{{ node.technique }}</td><td>{% for dependency in node.depends_on %}{{ dependency.step }}: {{ dependency.condition }}<br>{% endfor %}</td><td>{{ node.status }}<br>{{ node.reason }}</td></tr>{% endfor %}
+  </tbody></table>
+  <h3>Detection evidence</h3><p>{{ framework.detection.note }}</p>
+  <p>{{ framework.detection.alerted }} executions with imported alerts; {{ framework.detection.evaluated }} evaluated of {{ framework.detection.total }} recorded.</p>
+  <table><thead><tr><th>Execution / attempt</th><th>Telemetry result</th><th>Source</th><th>First alert delay (s)</th></tr></thead><tbody>
+  {% for item in framework.detection['items'] %}<tr><td>{{ item.execution_id }} / {{ item.attempt }}</td><td>{{ item.status }}</td><td>{{ item.sources|join(', ') }}</td><td>{{ item.first_alert_delay_seconds if item.first_alert_delay_seconds is not none else 'Not evaluated' }}</td></tr>{% endfor %}
+  </tbody></table>
+  <h3>Cleanup review</h3><p>These records are operator attestations for the recorded attempt.</p>
+  {% for item in framework.cleanup %}<p><b>{{ item.node_id }}:</b> {{ item.status }}{% if item.record %} — {{ item.record.note }}{% endif %}</p>{% endfor %}
+</section>
+{% endif %}
 </body>
 </html>

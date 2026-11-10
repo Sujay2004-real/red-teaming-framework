@@ -147,19 +147,23 @@ def scope_contains(target, scope):
         matched = host == allowed
     if not matched:
         return False
+    candidate = _split(target)
+    if permitted.port is not None:
+        default_port = {'http': 80, 'https': 443, 'ssh': 22, 'ftp': 21, 'smb': 445}.get(candidate.scheme)
+        if (candidate.port or default_port) != permitted.port:
+            return False
     if permitted.scheme:
-        candidate = _split(target)
         if candidate.scheme != permitted.scheme:
             return False
         default = 443 if permitted.scheme == 'https' else 80
         if (candidate.port or default) != (permitted.port or default):
             return False
-        prefix = unquote(permitted.path).rstrip('/')
-        path = unquote(candidate.path)
-        if any(segment in {'.', '..'} for segment in path.split('/')):
-            return False
-        if prefix and path != prefix and not path.startswith(prefix + '/'):
-            return False
+    prefix = unquote(permitted.path).rstrip('/')
+    path = unquote(candidate.path)
+    if any(segment in {'.', '..'} for segment in path.split('/')):
+        return False
+    if prefix and path != prefix and not path.startswith(prefix + '/'):
+        return False
     return True
 
 def check_window(policy, now=None):

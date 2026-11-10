@@ -393,7 +393,7 @@ class PolicyEngine:
                         '--is-dba', '--hostname',
                     },
                     'value_flags': {
-                        '--data', '--cookie', '--user-agent', '-v', '--verbose',
+                        '-p', '--data', '--cookie', '--user-agent', '-v', '--verbose',
                         '--referer', '--headers', '--timeout', '--retries',
                         '--delay', '--threads', '--risk', '--level',
                         '--technique', '--dbms', '--method', '--time-sec',
@@ -1128,7 +1128,26 @@ class PolicyEngine:
                         raise ValueError('URL expansion')
                 except ValueError:
                     return False, 'Targets must be HTTP(S) URLs without credentials or URL expansion.', rules
-        outside = [target for target in targets if not self.validate_target(target, authorized_scopes)]
+        def target_authorized(target):
+            if self.validate_target(target, authorized_scopes):
+                return True
+            # A port-scoped permission can authorize an explicit TCP port
+            # scan, but never a default scan, discovery sweep, or host-wide probe.
+            if tool != 'nmap' or '-Pn' not in flags_present or any(
+                    flag in flags_present for flag in ('-sn', '-sP', '-sU', '-O', '--traceroute')):
+                return False
+            port_values = [value for flag, value in arguments if flag in ('-p', '--ports')]
+            if len(port_values) != 1:
+                return False
+            host = f'[{target}]' if ':' in target else target
+            for part in port_values[0].split(','):
+                limits = [int(value) for value in part.split('-')]
+                for port in range(limits[0], limits[-1] + 1):
+                    if not self.validate_target(f'{host}:{port}', authorized_scopes):
+                        return False
+            return True
+        flags_present = {flag for flag, _ in arguments}
+        outside = [target for target in targets if not target_authorized(target)]
         if outside:
             return False, f'A command target is outside the authorized scope: {outside[0]}.', rules
         unapproved = [resolver for resolver in resolvers if not self.validate_resolver(resolver, authorized_scopes)]

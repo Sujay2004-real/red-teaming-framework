@@ -1,9 +1,7 @@
 # Backend technical reference
 
-Updated November 2, 2026 for schema `0005_protected_workflows`.
-This guide explains the implemented behavior. The
-[algorithm reference](backend_algorithms_reference.md) provides pseudocode and
-the [formula reference](backend_algorithms_formulae_reference.md) defines scores.
+Updated November 10, 2026 for release 4.0.0 and schema `0006_framework`.
+This guide explains the implemented behavior.
 
 ## 1. What the backend does
 
@@ -36,6 +34,9 @@ are bookkeeping states rather than separate scanner plans.
 | `next_steps.py`, `auto_recommend.py` | Bounded proposals and opt-in autopilot |
 | `attack_paths.py`, `provider.py` | Finding correlations and provider transport |
 | `reporter.py`, `report_versions.py` | HTML rendering, immutable files and provenance |
+| `scenarios.py`, `techniques.py`, `framework_api.py` | Versioned scenario compilation and campaign APIs |
+| `framework.py`, `campaign_objectives.py`, `objective_adapters.py` | Campaign state, dependencies and objective evidence |
+| `team_api.py`, `worker_resources.py` | Named roles, worker inventory and execution leases |
 | `observability.py`, `logging_config.py` | Request timing and structured logging |
 
 See the [API reference](api-reference.md) for all application routes. Health and
@@ -64,6 +65,11 @@ steps in a transaction need generated IDs or new evidence.
 | `footholds` | Evidence-derived sessions/logins and their state |
 | `loot` | Encrypted credentials, fingerprints and account/service metadata |
 | `engagement_hosts` | Discovered/owned hosts and child-assessment links |
+| `scenario_versions` | Immutable workspace scenario definitions and digests |
+| `operator_credentials` | Named credential digests and roles |
+| `framework_events` | Campaign controls, approvals, cleanup and telemetry history |
+| `worker_registrations` | Worker heartbeats, tools and active-job counts |
+| `execution_leases` | Shared SSH resource ownership |
 
 An assessment has both `plan_version` and `workflow_revision`. The former
 coordinates operator plan review; the latter protects state publication across
@@ -73,10 +79,10 @@ public report. `evidence_protected` records completion of legacy backfill.
 ## 4. Startup and upgrades
 
 FastAPI lifespan runs database initialization before serving requests. Alembic
-adopts older schemas and upgrades through `0005_protected_workflows`; settings
-secret migration and evidence backfill follow. A standalone external worker
-waits for the expected schema and for all legacy assessment evidence to be
-adopted before taking jobs.
+adopts older schemas and upgrades through `0006_framework`; settings secret
+migration and evidence backfill follow. A standalone external worker waits for
+the expected schema and for all legacy assessment evidence to be adopted before
+taking jobs.
 
 Existing execution and attempt originals become encrypted, while derived
 public text is redacted. Legacy report bytes and digests are retained behind

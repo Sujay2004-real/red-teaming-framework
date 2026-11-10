@@ -85,7 +85,30 @@ Provider key, base URL, model, proxy and SSH credentials are configured through
 the UI or `PUT /settings`, not provider environment variables. Secret fields
 are encrypted; endpoint/model/host settings are ordinary configuration.
 A provider needs key, HTTP(S) endpoint and model. Empty secret inputs retain
-stored values.
+stored values while the provider endpoint stays the same. Changing or clearing
+the endpoint removes the old provider key; submit a new key for a new endpoint.
+Trailing slashes do not count as an endpoint change.
+
+### Provider presets in the UI
+
+Open **Settings → AI provider**, choose a provider, paste its API key and click
+**Save configuration**. The UI supplies a default model and endpoint. The model
+is editable; **Endpoint settings** exposes the base URL. Existing custom
+endpoints and saved model choices are preserved on load.
+
+| Preset | Default model | Endpoint reference |
+| --- | --- | --- |
+| OpenAI (ChatGPT) | `gpt-5.4-mini` | [OpenAI model documentation](https://developers.openai.com/api/docs/models/gpt-5.4-mini) |
+| Anthropic (Claude) | `claude-sonnet-4-6` | [Claude OpenAI compatibility](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk) |
+| Google Gemini | `gemini-3.8-flash` | [Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) |
+| OpenRouter | `openrouter/auto` | [OpenRouter developer platform](https://openrouter.ai/developers) |
+| Groq | `openai/gpt-oss-120b` | [Groq OpenAI compatibility](https://console.groq.com/docs/openai) |
+
+Each preset links to its provider's key page. For Anthropic, use a workspace API
+key. Model access and API usage depend on the provider account. Choose
+**Custom / OpenAI-compatible** for a gateway or another service. Choosing
+**Local only (no API key)** and saving clears the provider connection and its
+stored key. Presets do not make external requests until an AI feature is used.
 
 The operator key controls application access; the Fernet key decrypts credentials
 and evidence. Changing one does not rotate the other.
@@ -145,7 +168,6 @@ For `/ready` 503, inspect startup/migration logs and heartbeat. For raw-reveal
 ## CI and deployment evidence
 
 [CI](../.github/workflows/ci.yml) configures Python 3.12 tests, frontend checks on
-Node 22, Compose validation and API/scanner/frontend image builds. It does not
-run the live lab smoke test. Check the actual Actions run before claiming an
-image build succeeded. The November 2 local review did not run Docker images,
-live scanners, SSH or provider calls.
+Node 22, Compose validation and API/scanner/frontend image builds. Check the
+actual Actions run before claiming an image build succeeded. Live scanners,
+SSH, provider connectivity and target reachability remain deployment checks.

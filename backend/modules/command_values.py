@@ -113,6 +113,8 @@ def validate_argument_values(tool, arguments):
             return 'Redirects require separate destination review; use --follow-redirect never'
         if tool == 'sqlmap' and flag == '--technique' and value != 'B':
             return 'Only bounded boolean-based sqlmap verification (--technique B) is permitted'
+        if tool == 'sqlmap' and flag == '-p' and not re.fullmatch(r'[A-Za-z0-9_.-]{1,120}', value):
+            return 'Select one SQL query parameter with -p'
         if tool in {'whatweb', 'nuclei', 'sqlmap'} and flag in {'-H', '--header', '-header', '--headers'}:
             if value.startswith('@') or not re.match(r'^[A-Za-z0-9-]+\s*:', value):
                 return f'{flag} requires an inline HTTP header'

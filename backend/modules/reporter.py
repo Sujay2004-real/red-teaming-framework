@@ -6,7 +6,7 @@ class Reporter:
         self.template_dir = os.path.join(os.path.dirname(__file__), 'templates')
         self.env = Environment(loader=FileSystemLoader(self.template_dir), autoescape=select_autoescape(['html']))
 
-    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode='', current_phase='recon', phase_summary=None, attack_paths=None, provenance=None, campaign=None):
+    def generate_html_report(self, target, objective, findings, executions, output_path, engagement_brief=None, analysis_mode='', current_phase='recon', phase_summary=None, attack_paths=None, provenance=None, campaign=None, objective_result=None, framework_report=None):
         template = self.env.get_template('report_template.html')
         severity_counts = {level: sum(1 for f in findings if f.get('severity') == level) for level in ('Critical','High','Medium','Low')}
         verified_counts = {
@@ -33,7 +33,7 @@ class Reporter:
             key: [row for row in (evidence.get(key) or []) if isinstance(row, dict)]
             for key in ('footholds', 'loot', 'hosts', 'children')
         }
-        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, verified_counts=verified_counts, engagement=engagement, analysis_mode=analysis_mode or '', current_phase=current_phase or 'recon', phase_summary=phase_summary or [], attack_paths=attack_paths or [], provenance=provenance or {}, post_exploitation=post_exploitation)
+        html = template.render(target=target, objective=objective, findings=findings, executions=executions, total_findings=len(findings), severity_counts=severity_counts, verified_counts=verified_counts, engagement=engagement, analysis_mode=analysis_mode or '', current_phase=current_phase or 'recon', phase_summary=phase_summary or [], attack_paths=attack_paths or [], provenance=provenance or {}, post_exploitation=post_exploitation, objective_result=objective_result or {}, framework=framework_report or {})
         from modules.report_versions import atomic_write
         atomic_write(output_path, html.encode('utf-8'))
         return output_path

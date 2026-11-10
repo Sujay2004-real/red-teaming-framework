@@ -1,0 +1,12 @@
+.objective-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.objective-heading h2, .objective-heading h3 { margin: 0; }
+.objective-list { display: grid; gap: 16px; }
+.objective-list article { padding: 16px; border: 1px solid var(--line, #cbd5e1); border-radius: 12px; min-width: 0; }
+.objective-list p, .objective-digest { overflow-wrap: anywhere; }
+.objective-status { padding: 4px 10px; border-radius: 20px; font-size: 12px; background: rgba(100, 116, 139, .12); }
+.objective-status.achieved { color: #16734f; background: rgba(22, 163, 74, .1); }
+.objective-status.inconclusive { color: #94551a; background: rgba(217, 119, 6, .12); }
+.objective-list details { margin-top: 12px; }
+.objective-list summary { cursor: pointer; }
+.objective-list pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.objective-digest { display: block; margin-top: 4px; font-size: 12px; }

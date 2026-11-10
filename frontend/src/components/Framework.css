@@ -1,0 +1,13 @@
+.framework-library,.framework-workflow{display:grid;gap:20px;min-width:0}
+.scenario-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:12px;margin:18px 0}
+.scenario-choice{display:flex!important;flex-direction:column;align-items:flex-start!important;gap:10px;text-align:left;white-space:normal!important;height:100%;padding:20px!important}
+.scenario-choice b{font-size:1rem}.scenario-choice span{font-weight:400;line-height:1.6}.scenario-choice small{margin-top:auto}
+.scenario-choice.selected{outline:2px solid var(--accent,#67d8bb);outline-offset:2px}
+.framework-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:16px;align-items:end}
+.framework-form>button{min-height:42px}.scenario-preview{margin:24px 0}.scenario-preview li{padding:12px 0}.scenario-preview code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.scenario-preview p{margin:8px 0}
+.framework-actions{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}.workflow-nodes{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,235px),1fr));gap:12px}
+.workflow-node{border:1px solid #394650;border-radius:12px;padding:16px;min-width:0;border-top:3px solid #657788}.workflow-node.completed{border-top-color:#62d7a8}.workflow-node.failed{border-top-color:#efaa83}.workflow-node.skipped{border-top-style:dashed}.workflow-node>div{display:flex;justify-content:space-between;gap:8px}.workflow-node small{display:block;overflow-wrap:anywhere;margin:8px 0}.workflow-node p{font-size:.9rem}
+.framework-table{overflow-x:auto;margin:16px 0}.framework-table table{width:100%;border-collapse:collapse}.framework-table th,.framework-table td{padding:12px;text-align:left;border-bottom:1px solid #394650;white-space:nowrap}
+.cleanup-item{padding:16px 0;border-top:1px solid #394650}.framework-history{padding-left:20px}.framework-history li{padding:8px 0}.framework-history small{display:block;margin:5px 0}.framework-history pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;font-size:.8rem}
+.framework-library summary,.framework-workflow summary{cursor:pointer;font-weight:600;padding:8px 0}.framework-library textarea,.framework-workflow textarea{font-family:monospace;min-height:150px}.framework-workflow>.panel>button{margin-top:14px}
+@media(max-width:600px){.framework-actions>*{width:100%}.workflow-nodes{grid-template-columns:1fr}.framework-form{grid-template-columns:1fr}}

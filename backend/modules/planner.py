@@ -103,10 +103,12 @@ class PlannerAgent:
         # Web tool templates already carry the http:// scheme, so a host:port
         # target must not be re-prefixed or curl gets http://http://host:3000.
         endpoint = f'{host}:{port}' if port else host
+        web_target = target if '://' in target else f'http://{endpoint}'
         return [
-            {**step, 'command': step['command'].format(
+            {**step, 'command': step['command'].replace('http://{target}', '{web_target}').format(
+                web_target=web_target,
                 target=host if step['tool'] in HOST_ONLY_TOOLS else endpoint,
-                ports=f'-p {port} ' if port else '')}
+                ports=f'-Pn -p {port} ' if port else '')}
             for step in DEFAULT_PLAN
         ]
 
@@ -130,10 +132,16 @@ class PlannerAgent:
         # use, or steps aimed at legitimately authorized secondary scopes get
         # dropped at plan time and silently reappear as a "default" plan.
         scopes = [scope for scope in (authorized_scopes or []) if scope] or [target]
+        def fallback():
+            steps = self.default_plan(target)
+            if policy_engine is None:
+                return steps
+            return [step for step in steps if policy_engine.validate_command(
+                step['command'], scopes, expected_tool=step['tool'])[0]]
         # All three are required: there is no default endpoint or model to fall
         # back on, so a half-filled configuration plans locally.
         if not (api_key and base_url and model_name):
-            return self.default_plan(target), 'default-unconfigured'
+            return fallback(), 'default-unconfigured'
         try:
             prompt = f'''Generate an authorized, non-destructive security assessment plan.
 Target: {target}
@@ -164,7 +172,7 @@ Return only a JSON list with tool, command, reason, and enabled. Every command m
             if not isinstance(plan, list) or not plan:
                 raise ValueError('Empty plan')
         except Exception:
-            return self.default_plan(target), 'default-provider-error'
+            return fallback(), 'default-provider-error'
 
         safe, rejected = [], 0
         for step in plan:
@@ -190,7 +198,7 @@ Return only a JSON list with tool, command, reason, and enabled. Every command m
                 break
         if safe:
             return safe, 'ai-filtered'
-        return self.default_plan(target), 'default-policy-rejected'
+        return fallback(), 'default-policy-rejected'
 
 
 planner_agent = PlannerAgent()

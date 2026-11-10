@@ -20,8 +20,8 @@ Vite serves port 5173. `VITE_API_URL` selects the browser API base, defaulting t
 origins, configure API `CORS_ALLOW_ORIGINS`. Neither setting replaces the
 operator key.
 
-The November 2 review recorded 24 passing UI tests, lint and production build.
-Tests mock backend responses and do not execute scanners.
+Tests mock backend responses and do not execute scanners. Use the current CI
+run for release evidence rather than relying on a dated local count.
 
 ## Source map
 
@@ -32,6 +32,8 @@ Tests mock backend responses and do not execute scanners.
 | Requests and polling | `useResource.js`, `useAssessment.js`, `useExecution.js`, `useRecommendations.js` |
 | Assessment setup | `LetterPanel.jsx`, `NewAssessmentPanel.jsx`, `AssessmentsPanel.jsx`, `TargetPanel.jsx` |
 | Plan and phase controls | `PlanEditor.jsx`, `CommandCard.jsx`, `PhasePipeline.jsx`, `ScopePolicy.jsx` |
+| Scenarios and workflow | `ScenarioLibrary.jsx`, `WorkflowPanel.jsx`, `Framework.css` |
+| Team and workers | `TeamPanel.jsx` |
 | Analysis and evidence | `AnalysisPanel.jsx`, `FindingsPanel.jsx`, `CampaignPanel.jsx`, `AuditTrailPanel.jsx` |
 | Settings and reports | `ConfigurationPanel.jsx`, `ReportVersions.jsx`, `CrewPanel.jsx` |
 | Presentation | `src/App.css`, `src/interface.css`, `src/components/Icon.jsx` |
@@ -40,21 +42,33 @@ Component names are under `src/components/`; hooks are under `src/lib/`.
 
 ## Operator behavior
 
+- Scenarios supports version selection, input bindings, policy/tool previews,
+  creation and reusable JSON definitions. Scenario plans are immutable.
+- Workflow shows dependency results, pause/resume/stop, cleanup, telemetry,
+  completion and fresh retests with matching-baseline comparisons. Settings
+  provides named credentials and worker visibility. See the
+  [framework guide](../docs/framework.md).
+- Settings offers OpenAI (ChatGPT), Anthropic (Claude), Gemini, OpenRouter and
+  Groq presets. Choose one and paste its API key; endpoint and model are filled
+  automatically. Custom endpoints and local-only operation remain available.
+  Switching endpoints requires a new key; saved keys are never returned to the
+  browser. See [provider setup](../docs/deployment.md#provider-presets-in-the-ui).
 - The operator key stays in memory unless the user chooses to remember it.
   Requests attach `X-API-Key`. An obsolete request's 401 must not invalidate a
   subsequently replaced key.
 - Unsaved plans and executed-step locks are visible. Executed work keeps its
   tool, command, position, phase and enabled state. Other steps remain editable
-  while idle. Plan saves and approvals use the plan version.
+  while idle in adaptive assessments. Plan saves and approvals use the plan
+  version.
 - Approvals create durable background jobs. Reloading or losing the browser
   connection does not cancel them. Polling reconnects using execution IDs and
   cursors; explicit cancellation is separate.
 - Live output and execution details are redacted. Raw evidence requires the
   authenticated, audited reveal API in the
   [upgrade guide](../docs/protected-evidence-upgrade.md).
-- Campaign features are for aggressive-lab targets. Autopilot drafts and
-  proposes, never approves or executes. Promotion may be refused by backend
-  ownership, scope or exclusion checks.
+- The original aggressive campaign features require lab targets. Autopilot
+  drafts and proposes, never approves or executes. Promotion may be refused by
+  backend ownership, scope or exclusion checks.
 - Findings use paginated reads, filters and review state. Empty, loading and
   error states distinguish no findings from an unfinished or failed request.
 - Downloads fetch protected resources with the key and use object URLs.
@@ -71,5 +85,4 @@ Display constants reflect backend phase ordering but do not authorize actions.
 The API remains authoritative for scope, prerequisites, approval, conflicts and
 report availability. A 409 requires reloading and reviewing the latest state.
 
-See [UI review history](../docs/visual-demo-polish.md) and
-[testing documentation](../docs/testing.md).
+See the [testing documentation](../docs/testing.md).

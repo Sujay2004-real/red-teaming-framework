@@ -1,8 +1,12 @@
 # API reference
 
-The API version is 3.0. Paths below are relative to the backend base URL
+The API version is 4.0.0. Paths below are relative to the backend base URL
 (`http://localhost:8000` for development, `http://localhost:8080/api` behind
 production Nginx).
+
+The [framework API reference](framework.md#api-reference) documents scenario
+versions, previews, controls, cleanup, telemetry, retests, workers and team
+credentials added in 4.0. The assessment routes below remain available.
 
 ## Authentication and transport
 
@@ -10,6 +14,11 @@ Application routes require `X-API-Key: <operator-key>`, except **GET /health**
 and **GET /ready**, which are unauthenticated probes. FastAPI's default
 `/docs`, `/redoc` and `/openapi.json` are schema/documentation endpoints and
 also do not carry the operator dependency. `/capabilities` is protected.
+
+Named credentials use this same header. Viewer credentials are read-only;
+operators cannot administer keys, change settings, reset the workspace or
+reveal originals. The bootstrap key remains an administrator. Roles share one
+workspace rather than separate tenant data.
 
 Use JSON for structured requests and multipart form data with field `file`
 for uploads. Uploads are bounded to 5 MiB. For the exact request schemas and

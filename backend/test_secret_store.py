@@ -137,6 +137,54 @@ def test_blank_secret_submission_keeps_the_stored_value(client, key):
     assert payload['model_name'] == 'changed-model'
 
 
+@pytest.mark.parametrize('destination', ['https://another.example/v1', 'https://p.example/other/v1', ''])
+@pytest.mark.parametrize('secret_fields', [{}, {'gemini_api_key': ''}, {'gemini_api_key': None}])
+def test_changing_provider_endpoint_removes_its_old_key(client, session_factory, key, destination, secret_fields):
+    client.put('/settings', json={'gemini_api_key': API_KEY, 'api_base_url': 'https://p.example/v1', 'model_name': 'm'})
+
+    response = client.put('/settings', json={'api_base_url': destination, **secret_fields})
+
+    assert response.status_code == 200
+    assert response.json()['gemini_configured'] is False
+    assert response.json()['provider_ready'] is False
+    with session_factory() as db:
+        assert db.query(AppSettings).first().gemini_api_key == ''
+
+
+def test_switching_provider_installs_only_the_new_key_and_preserves_proxy(client, session_factory, key):
+    client.put('/settings', json={
+        'gemini_api_key': API_KEY, 'api_base_url': 'https://api.openai.com/v1', 'model_name': 'm',
+        'proxy_url': 'http://proxy.example:8080', 'proxy_password': PROXY_PASSWORD,
+    })
+
+    response = client.put('/settings', json={
+        'api_base_url': 'https://api.anthropic.com/v1', 'model_name': '  claude-sonnet-4-6  ',
+        'gemini_api_key': '  new-provider-secret  ',
+    })
+
+    assert response.status_code == 200
+    assert response.json()['provider_ready'] is True
+    assert response.json()['model_name'] == 'claude-sonnet-4-6'
+    assert API_KEY not in response.text
+    assert 'new-provider-secret' not in response.text
+    with session_factory() as db:
+        row = db.query(AppSettings).first()
+        assert is_encrypted(row.gemini_api_key)
+        assert decrypt_secret(row.gemini_api_key) == 'new-provider-secret'
+        assert decrypt_secret(row.proxy_password) == PROXY_PASSWORD
+
+
+def test_provider_url_trailing_slash_and_model_edits_keep_the_stored_key(client, session_factory, key):
+    client.put('/settings', json={'gemini_api_key': API_KEY, 'api_base_url': 'https://p.example/v1', 'model_name': 'm'})
+
+    response = client.put('/settings', json={'api_base_url': ' https://p.example/v1/ ', 'model_name': 'new-model', 'gemini_api_key': '  '})
+
+    assert response.status_code == 200
+    assert response.json()['provider_ready'] is True
+    with session_factory() as db:
+        assert decrypt_secret(db.query(AppSettings).first().gemini_api_key) == API_KEY
+
+
 def test_no_environment_variable_can_seed_a_credential(client, monkeypatch, key):
     """The operator's own key is the only way a provider gets configured."""
     for name in ('GEMINI_API_KEY', 'API_BASE_URL', 'MODEL_NAME'):

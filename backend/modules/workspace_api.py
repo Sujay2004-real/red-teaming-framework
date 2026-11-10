@@ -8,6 +8,7 @@ from sqlalchemy import or_, func
 from sqlalchemy.orm import Session, defer
 from database import Assessment, Finding, FindingReview, ReportVersion, ToolExecution, get_db, utcnow
 from modules.api_auth import verify_operator_key
+from modules.campaign_objectives import objective_result
 
 router = APIRouter(dependencies=[Depends(verify_operator_key)])
 
@@ -48,6 +49,9 @@ def snapshot(assessment_id: int, db: Session = Depends(get_db)):
     # for weight, so pull just the nmap rows (few) with their output loaded.
     host_executions = db.query(ToolExecution).filter_by(assessment_id=assessment_id, tool_name='nmap').all()
     result['discovered_hosts'] = discovered_hosts_for(host_executions)
+    result['objective_result'] = objective_result(db, row)
+    from modules.framework import snapshot as framework_snapshot
+    result['framework'] = framework_snapshot(db, row) if row.scenario or row.framework_state else None
     return result
 
 
