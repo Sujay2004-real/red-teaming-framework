@@ -123,10 +123,10 @@ and evidence. Changing one does not rotate the other.
   bridge-network/port settings rather than simply appending it.
 - Scope checks do not replace a network firewall.
 
-The Dockerfile pins Nuclei, its templates, ZAP, Exploit-DB and NetExec source
-revisions. APT packages, `enum4linux-ng` and NetExec's transitive dependencies
-are not all pinned to immutable versions. Verify image builds and live
-compatibility for the actual deployment.
+The Dockerfile pins Nuclei, its templates, ZAP, Exploit-DB, NetExec and
+`enum4linux-ng` source revisions. APT packages and Python transitive
+dependencies are not all pinned to immutable versions. Verify image builds and
+live compatibility for the actual deployment.
 
 ## Kali VM execution
 
